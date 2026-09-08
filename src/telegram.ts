@@ -1,44 +1,67 @@
 import type { Env } from "./index";
 import { reportAfterNotification } from "./reporting";
 
-async function sendTelegram(env: Env, text: string): Promise<void> {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    console.warn("Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured");
-    return;
-  }
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, disable_web_page_preview: true })
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`Telegram notification failed: ${response.status} ${body.slice(0, 300)}`);
-  }
+type TelegramApiResponse = {
+  ok?: boolean;
+  description?: string;
+  error_code?: number;
+  result?: unknown;
+};
+
+function telegramUrl(env: Env, method: string): string {
+  return `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN!.trim()}/${method}`;
 }
 
-export async function testTelegram(env: Env): Promise<{ ok: boolean; status?: number; error?: string }> {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" };
+async function telegramRequest(env: Env, method: string, body?: Record<string, unknown>): Promise<TelegramApiResponse> {
+  if (!env.TELEGRAM_BOT_TOKEN?.trim()) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
+  const response = await fetch(telegramUrl(env, method), {
+    method: body ? "POST" : "GET",
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const raw = await response.text().catch(() => "");
+  let payload: TelegramApiResponse = {};
+  try { payload = raw ? JSON.parse(raw) as TelegramApiResponse : {}; } catch {}
+  if (!response.ok || payload.ok !== true) {
+    throw new Error(`Telegram ${method} failed: HTTP ${response.status}; code=${payload.error_code ?? "unknown"}; ${payload.description ?? raw.slice(0, 500)}`);
+  }
+  return payload;
+}
+
+async function sendTelegram(env: Env, text: string): Promise<void> {
+  const token = env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = env.TELEGRAM_CHAT_ID?.trim();
+  if (!token || !chatId) {
+    throw new Error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured");
+  }
+  if (!text.trim()) throw new Error("Telegram message text is empty");
+  if (text.length > 4096) throw new Error(`Telegram message is too long: ${text.length} characters`);
+  await telegramRequest(env, "sendMessage", {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true
+  });
+}
+
+export async function testTelegram(env: Env): Promise<{ ok: boolean; bot?: string; chatConfigured?: boolean; error?: string }> {
+  if (!env.TELEGRAM_BOT_TOKEN?.trim() || !env.TELEGRAM_CHAT_ID?.trim()) {
+    return { ok: false, chatConfigured: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" };
   }
   try {
-    await sendTelegram(env, "🔌 Ciel Telegram test\nTelegram credentials are configured and the Worker can reach Telegram.");
-    return { ok: true };
+    const me = await telegramRequest(env, "getMe");
+    const username = (me.result as { username?: string } | undefined)?.username;
+    await sendTelegram(env, "🔌 Ciel Telegram test\nTelegram Bot API authentication and message delivery are working.");
+    return { ok: true, bot: username ? `@${username}` : undefined, chatConfigured: true };
   } catch (error) {
-    return { ok: false, error: String(error).slice(0, 500) };
+    return { ok: false, chatConfigured: true, error: String(error).slice(0, 800) };
   }
 }
 
 export async function notifyTelegram(env: Env, text: string): Promise<void> {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    console.warn("Telegram notification skipped: required secrets are missing");
-    return;
-  }
   try {
     await sendTelegram(env, text);
     await reportAfterNotification(env, text, sendTelegram);
   } catch (error) {
-    console.error(`Telegram notification failed: ${String(error).slice(0, 500)}`);
+    console.error(`Telegram notification failed: ${String(error).slice(0, 800)}`);
   }
 }
