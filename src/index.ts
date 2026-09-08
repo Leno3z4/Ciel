@@ -55,7 +55,7 @@ async function runHoldingCheck(env: Env) {
     await env.CIEL_STATE.put("last_holding_check", String(Date.now()));
     return;
   }
-  const rows = await env.DB.prepare("SELECT token_address, quantity, entry_price_usd, last_price_usd, decimals FROM positions JOIN tokens USING(token_address) WHERE quantity > 0").all<{ token_address: string; quantity: string; entry_price_usd: number; last_price_usd: number; decimals: number }>();
+  const rows = await env.DB.prepare("SELECT p.token_address, p.quantity, p.entry_price_usd, p.last_price_usd, t.decimals FROM positions p LEFT JOIN tokens t ON t.address=p.token_address WHERE CAST(p.quantity AS INTEGER) > 0").all<{ token_address: string; quantity: string; entry_price_usd: number; last_price_usd: number; decimals: number }>();
   for (const p of rows.results ?? []) {
     try {
       const token = p.token_address as `0x${string}`;
