@@ -1,218 +1,232 @@
 name: One-time Telegram monitor patch
-
-on:
-  push:
-    branches: [main]
-
+on: push
 permissions:
   contents: write
-
 jobs:
   patch:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Patch runtime monitoring
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('src/index.ts')
-          s = p.read_text()
-          replacements = [
-          ('''type RuntimeState = {
-            lastHoldingCheck?: number;
-            lastMarketCycle?: number;
-            lastModelMaintenance?: number;
-            lastModelAnalyzed?: number;
-            monUsd?: number;
-            paperUnrealizedPnlUsd?: number;
-            paperFailureCount?: number;
-            paperCircuitOpen?: boolean;
-          };''', '''type RuntimeState = {
-            lastHoldingCheck?: number;
-            lastMarketCycle?: number;
-            lastModelMaintenance?: number;
-            lastModelAnalyzed?: number;
-            lastModelError?: string;
-            lastMarketCycleError?: string;
-            monUsd?: number;
-            paperUnrealizedPnlUsd?: number;
-            paperFailureCount?: number;
-            paperCircuitOpen?: boolean;
-          };'''),
-          ('''async function runHoldingCheck(env: Env) {
-            const state = await readRuntimeState(env);
-            const monUsd = Number(state.monUsd || await env.CIEL_STATE.get("mon_usd"));
-            if (!(monUsd > 0)) return;
-            if (env.PAPER_TRADING === "true" && env.TRADING_ENABLED !== "true") await runPaperPositionMonitoring(env, monUsd);
-            const address = walletAddress(env.WALLET_PRIVATE_KEY);
-            if (!address) return;
-            const native = await publicClient(env.NAD_RPC_URL).getBalance({ address });
-            if (native === 0n) return;
-            const tokens = await env.DB.prepare("SELECT address,decimals FROM tokens WHERE graduated=1").all<{ address: string; decimals: number }>();
-            for (const row of tokens.results || []) {
-              const balance = await tokenBalance(publicClient(env.NAD_RPC_URL), row.address as `0x${string}`, address);
-              if (balance > 0n) {
-                const quote = await quoteSell(publicClient(env.NAD_RPC_URL), row.address as `0x${string}`, balance);
-                if (quote > 0n) {
-                  const valueUsd = Number(quote) / 1e18 * monUsd;
-                  if (valueUsd > 0) await writeRuntimeState(env, { lastHoldingCheck: Date.now(), paperUnrealizedPnlUsd: undefined });
-                }
-              }
-            }
-            await writeRuntimeState(env, { lastHoldingCheck: Date.now() });
-          }''', '''async function runHoldingCheck(env: Env) {
-            const checkedAt = Date.now();
-            try {
-              await ensureDatabaseSchema(env);
+      - name: Patch main directly
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const path = 'src/index.ts';
+            const branch = 'main';
+            const file = await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path, ref: branch });
+            if (Array.isArray(file.data)) throw new Error('Expected a file');
+            const sha = file.data.sha;
+            let source = Buffer.from(file.data.content, 'base64').toString('utf8');
+            const replacements = [
+              [
+                `type RuntimeState = {
+              lastHoldingCheck?: number;
+              lastMarketCycle?: number;
+              lastModelMaintenance?: number;
+              lastModelAnalyzed?: number;
+              monUsd?: number;
+              paperUnrealizedPnlUsd?: number;
+              paperFailureCount?: number;
+              paperCircuitOpen?: boolean;
+            };`,
+                `type RuntimeState = {
+              lastHoldingCheck?: number;
+              lastMarketCycle?: number;
+              lastModelMaintenance?: number;
+              lastModelAnalyzed?: number;
+              lastModelError?: string;
+              lastMarketCycleError?: string;
+              monUsd?: number;
+              paperUnrealizedPnlUsd?: number;
+              paperFailureCount?: number;
+              paperCircuitOpen?: boolean;
+            };`
+              ],
+              [
+                `async function runHoldingCheck(env: Env) {
               const state = await readRuntimeState(env);
               const monUsd = Number(state.monUsd || await env.CIEL_STATE.get("mon_usd"));
-              if (!(monUsd > 0)) {
-                await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
-                return;
-              }
+              if (!(monUsd > 0)) return;
               if (env.PAPER_TRADING === "true" && env.TRADING_ENABLED !== "true") await runPaperPositionMonitoring(env, monUsd);
               const address = walletAddress(env.WALLET_PRIVATE_KEY);
-              if (!address) {
-                await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
-                return;
-              }
+              if (!address) return;
               const native = await publicClient(env.NAD_RPC_URL).getBalance({ address });
-              if (native === 0n) {
-                await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
-                return;
-              }
+              if (native === 0n) return;
               const tokens = await env.DB.prepare("SELECT address,decimals FROM tokens WHERE graduated=1").all<{ address: string; decimals: number }>();
               for (const row of tokens.results || []) {
-                const balance = await tokenBalance(publicClient(env.NAD_RPC_URL), row.address as `0x${string}`, address);
+                const balance = await tokenBalance(publicClient(env.NAD_RPC_URL), row.address as \`0x\${string}\`, address);
                 if (balance > 0n) {
-                  const quote = await quoteSell(publicClient(env.NAD_RPC_URL), row.address as `0x${string}`, balance);
+                  const quote = await quoteSell(publicClient(env.NAD_RPC_URL), row.address as \`0x\${string}\`, balance);
                   if (quote > 0n) {
                     const valueUsd = Number(quote) / 1e18 * monUsd;
-                    if (valueUsd > 0) await writeRuntimeState(env, { lastHoldingCheck: checkedAt, paperUnrealizedPnlUsd: undefined });
+                    if (valueUsd > 0) await writeRuntimeState(env, { lastHoldingCheck: Date.now(), paperUnrealizedPnlUsd: undefined });
                   }
                 }
               }
-              await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
-            } catch (error) {
-              await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
-              console.error(`Holding check failed: ${String(error).slice(0, 1000)}`);
-            }
-          }'''),
-          ('''async function runMarketCycle(env: Env) {
-            await ensureDatabaseSchema(env);
-            const result = await indexNadFun(env);
-            await writeRuntimeState(env, { lastMarketCycle: Date.now() });
-            if (result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\\nSnapshots: ${result.snapshots}\\nTokens: ${result.tokens}`);
-            await runPaperSignalCycle(env);
-          }''', '''async function runMarketCycle(env: Env) {
-            const cycleAt = Date.now();
-            try {
+              await writeRuntimeState(env, { lastHoldingCheck: Date.now() });
+            }`,
+                `async function runHoldingCheck(env: Env) {
+              const checkedAt = Date.now();
+              try {
+                await ensureDatabaseSchema(env);
+                const state = await readRuntimeState(env);
+                const monUsd = Number(state.monUsd || await env.CIEL_STATE.get("mon_usd"));
+                if (!(monUsd > 0)) {
+                  await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
+                  return;
+                }
+                if (env.PAPER_TRADING === "true" && env.TRADING_ENABLED !== "true") await runPaperPositionMonitoring(env, monUsd);
+                const address = walletAddress(env.WALLET_PRIVATE_KEY);
+                if (!address) {
+                  await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
+                  return;
+                }
+                const native = await publicClient(env.NAD_RPC_URL).getBalance({ address });
+                if (native === 0n) {
+                  await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
+                  return;
+                }
+                const tokens = await env.DB.prepare("SELECT address,decimals FROM tokens WHERE graduated=1").all<{ address: string; decimals: number }>();
+                for (const row of tokens.results || []) {
+                  const balance = await tokenBalance(publicClient(env.NAD_RPC_URL), row.address as \`0x\${string}\`, address);
+                  if (balance > 0n) {
+                    const quote = await quoteSell(publicClient(env.NAD_RPC_URL), row.address as \`0x\${string}\`, balance);
+                    if (quote > 0n) {
+                      const valueUsd = Number(quote) / 1e18 * monUsd;
+                      if (valueUsd > 0) await writeRuntimeState(env, { lastHoldingCheck: checkedAt, paperUnrealizedPnlUsd: undefined });
+                    }
+                  }
+                }
+                await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
+              } catch (error) {
+                await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
+                console.error(\`Holding check failed: \${String(error).slice(0, 1000)}\`);
+              }
+            }`
+              ],
+              [
+                `async function runMarketCycle(env: Env) {
               await ensureDatabaseSchema(env);
               const result = await indexNadFun(env);
-              await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: undefined });
-              if (result && result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\\nSnapshots: ${result.snapshots}`);
+              await writeRuntimeState(env, { lastMarketCycle: Date.now() });
+              if (result.snapshots > 0) await notifyTelegram(env, \`📡 Ciel indexer\\nSnapshots: \${result.snapshots}\\nTokens: \${result.tokens}\`);
               await runPaperSignalCycle(env);
-            } catch (error) {
-              const message = String(error).slice(0, 1000);
-              await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: message });
-              console.error(`Market cycle failed: ${message}`);
-            }
-          }'''),
-          ('''async function runModelMaintenance(env: Env) {
-            await ensureDatabaseSchema(env);
-            const result = await env.DB.prepare("SELECT * FROM signals ORDER BY ts_ms DESC LIMIT 50").all();
-            const rows = (result.results || []) as unknown as Snapshot[];
-            const baseline = buildBaseline(rows);
-            const last = rows[0];
-            if (last) deviationScore(last, baseline);
-            await writeRuntimeState(env, { lastModelMaintenance: Date.now() });
-            const analysis = await askGemini(env, rows);
-            if (analysis) {
-              await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
-              await notifyTelegram(env, `🧠 Ciel model\\n${analysis.slice(0, 3000)}`);
-            }
-          }''', '''async function runModelMaintenance(env: Env) {
-            const maintenanceAt = Date.now();
-            try {
+            }`,
+                `async function runMarketCycle(env: Env) {
+              const cycleAt = Date.now();
+              try {
+                await ensureDatabaseSchema(env);
+                const result = await indexNadFun(env);
+                await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: undefined });
+                if (result && result.snapshots > 0) await notifyTelegram(env, \`📡 Ciel indexer\\nSnapshots: \${result.snapshots}\`);
+                await runPaperSignalCycle(env);
+              } catch (error) {
+                const message = String(error).slice(0, 1000);
+                await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: message });
+                console.error(\`Market cycle failed: \${message}\`);
+              }
+            }`
+              ],
+              [
+                `async function runModelMaintenance(env: Env) {
               await ensureDatabaseSchema(env);
               const result = await env.DB.prepare("SELECT * FROM signals ORDER BY ts_ms DESC LIMIT 50").all();
               const rows = (result.results || []) as unknown as Snapshot[];
               const baseline = buildBaseline(rows);
               const last = rows[0];
               if (last) deviationScore(last, baseline);
-              await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: undefined });
+              await writeRuntimeState(env, { lastModelMaintenance: Date.now() });
               const analysis = await askGemini(env, rows);
               if (analysis) {
                 await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
-                await notifyTelegram(env, `🧠 Ciel model\\n${analysis.slice(0, 3000)}`);
+                await notifyTelegram(env, \`🧠 Ciel model\\n\${analysis.slice(0, 3000)}\`);
               }
-            } catch (error) {
-              const message = String(error).slice(0, 1000);
-              await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message });
-              console.error(`Model maintenance failed: ${message}`);
+            }`,
+                `async function runModelMaintenance(env: Env) {
+              const maintenanceAt = Date.now();
+              try {
+                await ensureDatabaseSchema(env);
+                const result = await env.DB.prepare("SELECT * FROM signals ORDER BY ts_ms DESC LIMIT 50").all();
+                const rows = (result.results || []) as unknown as Snapshot[];
+                const baseline = buildBaseline(rows);
+                const last = rows[0];
+                if (last) deviationScore(last, baseline);
+                await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: undefined });
+                const analysis = await askGemini(env, rows);
+                if (analysis) {
+                  await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
+                  await notifyTelegram(env, \`🧠 Ciel model\\n\${analysis.slice(0, 3000)}\`);
+                }
+              } catch (error) {
+                const message = String(error).slice(0, 1000);
+                await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message });
+                console.error(\`Model maintenance failed: \${message}\`);
+              }
+            }`
+              ],
+              [
+                `async function status(env: Env) {
+              const indexerRaw = await env.CIEL_STATE.get("indexer_state");
+              let indexerState: { lastRunMs?: number } = {};
+              try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
+              const state = await readRuntimeState(env);
+              return {
+                tradingEnabled: env.TRADING_ENABLED === "true",
+                paperTrading: env.PAPER_TRADING === "true",
+                telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+                paperBalanceMon: await getPaperBalance(env),
+                paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"),
+                paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
+                paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
+                lastHoldingCheck: state.lastHoldingCheck || null,
+                lastMarketCycle: indexerState.lastRunMs || null,
+                lastModelMaintenance: state.lastModelMaintenance || null,
+                lastModelAnalyzed: state.lastModelAnalyzed || null
+              };
+            }`,
+                `async function status(env: Env) {
+              const indexerRaw = await env.CIEL_STATE.get("indexer_state");
+              let indexerState: { lastRunMs?: number } = {};
+              try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
+              const telegramRaw = await env.CIEL_STATE.get("ciel_telegram_runtime");
+              let telegramState: { lastAttemptAt?: number; lastSuccessAt?: number; lastFailureAt?: number; lastError?: string; lastTestAt?: number; lastTestSuccess?: boolean } = {};
+              try { if (telegramRaw) telegramState = JSON.parse(telegramRaw); } catch {}
+              const state = await readRuntimeState(env);
+              return {
+                tradingEnabled: env.TRADING_ENABLED === "true",
+                paperTrading: env.PAPER_TRADING === "true",
+                telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+                telegramLastAttemptAt: telegramState.lastAttemptAt || null,
+                telegramLastSuccessAt: telegramState.lastSuccessAt || null,
+                telegramLastFailureAt: telegramState.lastFailureAt || null,
+                telegramLastError: telegramState.lastError || null,
+                telegramLastTestAt: telegramState.lastTestAt || null,
+                telegramLastTestSuccess: telegramState.lastTestSuccess ?? null,
+                paperBalanceMon: await getPaperBalance(env),
+                paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"),
+                paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
+                paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
+                lastHoldingCheck: state.lastHoldingCheck || null,
+                lastMarketCycle: state.lastMarketCycle || indexerState.lastRunMs || null,
+                lastMarketCycleError: state.lastMarketCycleError || null,
+                lastModelMaintenance: state.lastModelMaintenance || null,
+                lastModelAnalyzed: state.lastModelAnalyzed || null,
+                lastModelError: state.lastModelError || null
+              };
+            }`
+              ]
+            ];
+            for (const [oldText, newText] of replacements) {
+              if (!source.includes(oldText)) throw new Error('Expected source block not found');
+              source = source.replace(oldText, newText);
             }
-          }'''),
-          ('''async function status(env: Env) {
-            const indexerRaw = await env.CIEL_STATE.get("indexer_state");
-            let indexerState: { lastRunMs?: number } = {};
-            try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
-            const state = await readRuntimeState(env);
-            return {
-              tradingEnabled: env.TRADING_ENABLED === "true",
-              paperTrading: env.PAPER_TRADING === "true",
-              telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
-              paperBalanceMon: await getPaperBalance(env),
-              paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"),
-              paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
-              paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
-              lastHoldingCheck: state.lastHoldingCheck || null,
-              lastMarketCycle: indexerState.lastRunMs || null,
-              lastModelMaintenance: state.lastModelMaintenance || null,
-              lastModelAnalyzed: state.lastModelAnalyzed || null
-            };
-          }''', '''async function status(env: Env) {
-            const indexerRaw = await env.CIEL_STATE.get("indexer_state");
-            let indexerState: { lastRunMs?: number } = {};
-            try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
-            const telegramRaw = await env.CIEL_STATE.get("ciel_telegram_runtime");
-            let telegramState: { lastAttemptAt?: number; lastSuccessAt?: number; lastFailureAt?: number; lastError?: string; lastTestAt?: number; lastTestSuccess?: boolean } = {};
-            try { if (telegramRaw) telegramState = JSON.parse(telegramRaw); } catch {}
-            const state = await readRuntimeState(env);
-            return {
-              tradingEnabled: env.TRADING_ENABLED === "true",
-              paperTrading: env.PAPER_TRADING === "true",
-              telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
-              telegramLastAttemptAt: telegramState.lastAttemptAt || null,
-              telegramLastSuccessAt: telegramState.lastSuccessAt || null,
-              telegramLastFailureAt: telegramState.lastFailureAt || null,
-              telegramLastError: telegramState.lastError || null,
-              telegramLastTestAt: telegramState.lastTestAt || null,
-              telegramLastTestSuccess: telegramState.lastTestSuccess ?? null,
-              paperBalanceMon: await getPaperBalance(env),
-              paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"),
-              paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
-              paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
-              lastHoldingCheck: state.lastHoldingCheck || null,
-              lastMarketCycle: state.lastMarketCycle || indexerState.lastRunMs || null,
-              lastMarketCycleError: state.lastMarketCycleError || null,
-              lastModelMaintenance: state.lastModelMaintenance || null,
-              lastModelAnalyzed: state.lastModelAnalyzed || null,
-              lastModelError: state.lastModelError || null
-            };
-          }''')]
-          for old, new in replacements:
-              if old not in s:
-                  raise SystemExit('Expected source block not found')
-              s = s.replace(old, new, 1)
-          p.write_text(s)
-          PY
+            await github.rest.repos.createOrUpdateFileContents({ owner: context.repo.owner, repo: context.repo.repo, path, message: 'fix: add runtime monitoring and scheduler diagnostics', content: Buffer.from(source).toString('base64'), sha, branch });
 
-      - name: Commit changes directly to main
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/index.ts .github/workflows/one-time-telegram-monitor-patch.yml .telegram-monitor-patch-trigger
-          git commit -m 'fix: add runtime monitoring and scheduler diagnostics'
-          git push origin main
+      - name: Remove one-time patch workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const path = '.github/workflows/one-time-telegram-monitor-patch.yml';
+            const file = await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path, ref: 'main' });
+            if (!Array.isArray(file.data)) {
+              await github.rest.repos.deleteFile({ owner: context.repo.owner, repo: context.repo.repo, path, message: 'chore: remove one-time monitor patch workflow', sha: file.data.sha, branch: 'main' });
+            }
