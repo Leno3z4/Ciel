@@ -453,7 +453,8 @@ async function runMarketCycle(env: Env) {
     await ensureDatabaseSchema(env);
     const result = await indexNadFun(env);
     await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: undefined });
-    if (result && result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\nSnapshots: ${result.snapshots}`);
+    if (result && result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer
+Snapshots: ${result.snapshots}`);
     await runPaperSignalCycle(env);
   } catch (error) {
     const message = String(error).slice(0, 1000);
@@ -484,7 +485,8 @@ async function runModelMaintenance(env: Env) {
     const analysis = await askGemini(env, rows);
     if (analysis) {
       await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
-      await notifyTelegram(env, `🧠 Ciel model\n${analysis.slice(0, 3000)}`);
+      await notifyTelegram(env, `🧠 Ciel model
+${analysis.slice(0, 3000)}`);
     }
   } catch (error) {
     const message = String(error).slice(0, 1000);
