@@ -11,6 +11,8 @@ const PAPER_REALIZED_PNL_KEY = "paper_realized_pnl_usd";
 const PAPER_FAILURE_COUNT_KEY = "paper_execution_failure_count";
 const PAPER_CIRCUIT_KEY = "paper_execution_circuit_open";
 const RUNTIME_STATE_KEY = "ciel_runtime_state";
+const DB_SCHEMA_VERSION_KEY = "ciel_db_schema_version";
+const DB_SCHEMA_VERSION = "3";
 const RUNTIME_TELEMETRY_INTERVAL_MS = 10 * 60 * 1000;
 
 type PaperState = "CREATED" | "RISK_CHECKED" | "QUOTED" | "BALANCE_RESERVED" | "FILLED" | "POSITION_UPDATED" | "CONSUMED" | "REJECTED" | "FAILED";
@@ -25,6 +27,140 @@ type RuntimeState = {
   paperFailureCount?: number;
   paperCircuitOpen?: boolean;
 };
+
+async function ensureDatabaseSchema(env: Env): Promise<void> {
+  if (await env.CIEL_STATE.get(DB_SCHEMA_VERSION_KEY) === DB_SCHEMA_VERSION) return;
+
+  const existing = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
+  const tables = new Set((existing.results ?? []).map(row => row.name));
+  const statements: D1PreparedStatement[] = [];
+
+  if (!tables.has("tokens")) {
+    statements.push(env.DB.prepare(`CREATE TABLE IF NOT EXISTS tokens (
+      address TEXT PRIMARY KEY,
+      symbol TEXT,
+      name TEXT,
+      market_cap_usd REAL,
+      liquidity_usd REAL,
+      first_seen_ms INTEGER NOT NULL,
+      last_seen_ms INTEGER NOT NULL,
+      total_supply TEXT,
+      decimals INTEGER NOT NULL DEFAULT 18,
+      quote_token TEXT,
+      pair_address TEXT,
+      graduated INTEGER NOT NULL DEFAULT 0,
+      created_at_block INTEGER
+    )`));
+  }
+  if (!tables.has("market_snapshots")) {
+    statements.push(env.DB.prepare(`CREATE TABLE IF NOT EXISTS market_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_address TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL,
+      price_usd REAL,
+      market_cap_usd REAL,
+      liquidity_usd REAL,
+      volume_5m_usd REAL,
+      buys_5m INTEGER,
+      sells_5m INTEGER,
+      holders INTEGER,
+      quote_token TEXT,
+      buy_volume_usd REAL,
+      sell_volume_usd REAL,
+      source_block INTEGER
+    )`));
+    statements.push(env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_snapshots_token_ts ON market_snapshots(token_address, ts_ms)"));
+  }
+  if (!tables.has("signals")) {
+    statements.push(env.DB.prepare(`CREATE TABLE IF NOT EXISTS signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_address TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      confidence REAL,
+      expected_low REAL,
+      expected_high REAL,
+      anomaly_score REAL,
+      model TEXT,
+      rationale TEXT,
+      consumed_ts_ms INTEGER
+    )`));
+    statements.push(env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_signals_unconsumed ON signals(consumed_ts_ms, ts_ms)"));
+  }
+  if (!tables.has("trades")) {
+    statements.push(env.DB.prepare(`CREATE TABLE IF NOT EXISTS trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_address TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL,
+      side TEXT NOT NULL,
+      quantity TEXT,
+      price_usd REAL,
+      tx_hash TEXT,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      execution_key TEXT
+    )`));
+    statements.push(env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_execution_key ON trades(execution_key) WHERE execution_key IS NOT NULL"));
+  }
+  if (!tables.has("positions")) {
+    statements.push(env.DB.prepare(`CREATE TABLE IF NOT EXISTS positions (
+      token_address TEXT PRIMARY KEY,
+      quantity TEXT NOT NULL,
+      entry_price_usd REAL,
+      entry_ts_ms INTEGER,
+      last_price_usd REAL,
+      updated_ts_ms INTEGER NOT NULL
+    )`));
+  }
+  if (!tables.has("paper_executions")) {
+    statements.push(env.DB.prepare(`CREATE TABLE IF NOT EXISTS paper_executions (
+      signal_id INTEGER PRIMARY KEY,
+      execution_key TEXT NOT NULL UNIQUE,
+      token_address TEXT NOT NULL,
+      side TEXT NOT NULL,
+      state TEXT NOT NULL,
+      balance_before_mon REAL,
+      balance_after_mon REAL,
+      quantity TEXT,
+      quote_out TEXT,
+      fill_price_usd REAL,
+      realized_pnl_usd REAL,
+      position_quantity_after TEXT,
+      error TEXT,
+      created_ts_ms INTEGER NOT NULL,
+      updated_ts_ms INTEGER NOT NULL
+    )`));
+    statements.push(env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_paper_executions_state ON paper_executions(state, updated_ts_ms)"));
+  }
+
+  await env.DB.batch(statements);
+
+  const columns = await env.DB.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('tokens','market_snapshots','signals','trades')").all<{ name: string; sql: string }>();
+  const sqlByTable = new Map((columns.results ?? []).map(row => [row.name, row.sql || ""]));
+  const addColumn = (table: string, column: string, definition: string) => {
+    const sql = sqlByTable.get(table) || "";
+    if (!new RegExp(`(?:^|[,(\\s])${column}(?:[\\s,)]|$)`, "i").test(sql)) statements.push(env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`));
+  };
+
+  addColumn("tokens", "total_supply", "TEXT");
+  addColumn("tokens", "decimals", "INTEGER NOT NULL DEFAULT 18");
+  addColumn("tokens", "quote_token", "TEXT");
+  addColumn("tokens", "pair_address", "TEXT");
+  addColumn("tokens", "graduated", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("tokens", "created_at_block", "INTEGER");
+  addColumn("market_snapshots", "quote_token", "TEXT");
+  addColumn("market_snapshots", "buy_volume_usd", "REAL");
+  addColumn("market_snapshots", "sell_volume_usd", "REAL");
+  addColumn("market_snapshots", "source_block", "INTEGER");
+  addColumn("signals", "consumed_ts_ms", "INTEGER");
+  addColumn("trades", "execution_key", "TEXT");
+  statements.push(env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_signals_unconsumed ON signals(consumed_ts_ms, ts_ms)"));
+  statements.push(env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_execution_key ON trades(execution_key) WHERE execution_key IS NOT NULL"));
+
+  if (statements.length) await env.DB.batch(statements);
+  await env.CIEL_STATE.put(DB_SCHEMA_VERSION_KEY, DB_SCHEMA_VERSION);
+}
 
 async function readRuntimeState(env: Env): Promise<RuntimeState> {
   const raw = await env.CIEL_STATE.get(RUNTIME_STATE_KEY);
@@ -205,15 +341,12 @@ async function executePaperSignal(env: Env, signalId: number) {
       if (!gate.allowed) return consumeSignal(env, signalId, `paper SELL blocked: ${gate.reasons.join(", ")}`, true);
       const pnlUsd = (fillPriceUsd - Number(position.entry_price_usd || fillPriceUsd)) * quantityUnits;
       const expectedAfter = balance + proceedsMon;
-      await setPaperState(env, signalId, "QUOTED", { balance_before_mon: balance, balance_after_mon: expectedAfter, position_quantity_after: "0", realized_pnl_usd: pnlUsd });
+      await setPaperState(env, signalId, "QUOTED", { balance_before_mon: balance, balance_after_mon: expectedAfter, quote_out: quoteOut.toString(), fill_price_usd: fillPriceUsd, realized_pnl_usd: pnlUsd, position_quantity_after: "0" });
       const currentBalance = await getPaperBalance(env);
-      if (Math.abs(currentBalance - expectedAfter) > 1e-9) {
-        if (Math.abs(currentBalance - balance) < 1e-9) await env.CIEL_STATE.put(PAPER_BALANCE_KEY, String(expectedAfter));
-        else throw new Error("paper balance changed unexpectedly during SELL reservation");
-      }
+      if (Math.abs(currentBalance - balance) > 1e-9) throw new Error("paper balance changed unexpectedly during SELL reservation");
+      await env.CIEL_STATE.put(PAPER_BALANCE_KEY, String(expectedAfter));
+      await env.CIEL_STATE.put(PAPER_REALIZED_PNL_KEY, String(Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0") + pnlUsd));
       await setPaperState(env, signalId, "BALANCE_RESERVED", {});
-      const realized = Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0") + pnlUsd;
-      await env.CIEL_STATE.put(PAPER_REALIZED_PNL_KEY, String(realized));
       await env.DB.prepare("INSERT OR IGNORE INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error,execution_key) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(token, Date.now(), "SELL", quantity.toString(), fillPriceUsd, null, "paper", "filled", null, execution.key).run();
       await setPaperState(env, signalId, "FILLED", {});
       await env.DB.prepare("UPDATE positions SET quantity='0',last_price_usd=?,updated_ts_ms=? WHERE token_address=?").bind(fillPriceUsd, Date.now(), token).run();
@@ -294,6 +427,7 @@ async function runPaperPositionMonitoring(env: Env, monUsd: number) {
 }
 
 async function runMarketCycle(env: Env) {
+  await ensureDatabaseSchema(env);
   const result = await indexNadFun(env);
   await writeRuntimeState(env, { lastMarketCycle: Date.now() });
   if (result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\nSnapshots: ${result.snapshots}\nTokens: ${result.tokens}`);
@@ -310,6 +444,7 @@ async function runPaperSignalCycle(env: Env) {
 }
 
 async function runModelMaintenance(env: Env) {
+  await ensureDatabaseSchema(env);
   const result = await env.DB.prepare("SELECT * FROM signals ORDER BY ts_ms DESC LIMIT 50").all();
   const rows = (result.results || []) as unknown as Snapshot[];
   const baseline = buildBaseline(rows);
