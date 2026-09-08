@@ -5,7 +5,7 @@
   "compatibility_date": "2026-09-08",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "triggers": { "crons": ["*/2 * * * *", "*/5 * * * *", "0 * * * *"] },
+  "triggers": { "crons": ["*/2 * * * *", "*/3 * * * *", "0 * * * *"] },
   "vars": {
     "TRADING_ENABLED": "false",
     "PAPER_TRADING": "true",
@@ -25,5 +25,5 @@
   "d1_databases": [{ "binding": "DB", "database_name": "ciel", "database_id": "REPLACE_WITH_D1_ID" }],
   "r2_buckets": [{ "binding": "MARKET_DATA", "bucket_name": "ciel-market-data" }],
   "durable_objects": { "bindings": [{ "name": "TRADING_ENGINE", "class_name": "TradingEngine" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TradingEngine"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TradingEngine"] }
 }
