@@ -18,6 +18,18 @@ async function sendTelegram(env: Env, text: string): Promise<void> {
   }
 }
 
+export async function testTelegram(env: Env): Promise<{ ok: boolean; status?: number; error?: string }> {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" };
+  }
+  try {
+    await sendTelegram(env, "🔌 Ciel Telegram test\nTelegram credentials are configured and the Worker can reach Telegram.");
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error).slice(0, 500) };
+  }
+}
+
 export async function notifyTelegram(env: Env, text: string): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.warn("Telegram notification skipped: required secrets are missing");
