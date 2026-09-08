@@ -5,7 +5,6 @@ import { riskGate } from "./risk";
 import { notifyTelegram } from "./telegram";
 
 const PAPER_INITIAL_BALANCE_MON = 1000;
-const PAPER_MAX_BUY_MON = 1;
 const PAPER_SLIPPAGE_BPS = 500;
 const PAPER_BALANCE_KEY = "paper_balance_mon";
 const PAPER_REALIZED_PNL_KEY = "paper_realized_pnl_usd";
@@ -27,6 +26,28 @@ type RuntimeState = {
   paperCircuitOpen?: boolean;
 };
 
+async function readRuntimeState(env: Env): Promise<RuntimeState> {
+  const raw = await env.CIEL_STATE.get(RUNTIME_STATE_KEY);
+  if (!raw) return {};
+  try { return JSON.parse(raw) as RuntimeState; } catch { return {}; }
+}
+
+async function writeRuntimeState(env: Env, patch: RuntimeState) {
+  if (patch.lastMarketCycle !== undefined) {
+    const { lastMarketCycle: _ignored, ...rest } = patch;
+    patch = rest;
+  }
+  if (Object.keys(patch).length === 0) return;
+
+  const current = await readRuntimeState(env);
+  const holdingTelemetryOnly = Object.keys(patch).every((key) => key === "lastHoldingCheck" || key === "paperUnrealizedPnlUsd");
+  if (holdingTelemetryOnly) {
+    const lastPersisted = Number(current.lastHoldingCheck || 0);
+    if (lastPersisted > 0 && Date.now() - lastPersisted < RUNTIME_TELEMETRY_INTERVAL_MS) return;
+  }
+  await env.CIEL_STATE.put(RUNTIME_STATE_KEY, JSON.stringify({ ...current, ...patch }));
+}
+
 export interface Env {
   CIEL_STATE: KVNamespace;
   DB: D1Database;
@@ -42,30 +63,6 @@ export interface Env {
   HOLDING_CHECK_MINUTES: string;
   GEMINI_MODEL: string;
   NAD_RPC_URL?: string;
-}
-
-async function readRuntimeState(env: Env): Promise<RuntimeState> {
-  const raw = await env.CIEL_STATE.get(RUNTIME_STATE_KEY);
-  if (!raw) return {};
-  try { return JSON.parse(raw) as RuntimeState; } catch { return {}; }
-}
-
-async function writeRuntimeState(env: Env, patch: RuntimeState) {
-  // Market-cycle telemetry is already persisted atomically with the indexer cursor.
-  // Do not create a second KV write every three minutes.
-  if (patch.lastMarketCycle !== undefined) {
-    const { lastMarketCycle: _ignored, ...rest } = patch;
-    patch = rest;
-  }
-  if (Object.keys(patch).length === 0) return;
-
-  const current = await readRuntimeState(env);
-  const holdingTelemetryOnly = Object.keys(patch).every((key) => key === "lastHoldingCheck" || key === "paperUnrealizedPnlUsd");
-  if (holdingTelemetryOnly) {
-    const lastPersisted = Number(current.lastHoldingCheck || 0);
-    if (lastPersisted > 0 && Date.now() - lastPersisted < RUNTIME_TELEMETRY_INTERVAL_MS) return;
-  }
-  await env.CIEL_STATE.put(RUNTIME_STATE_KEY, JSON.stringify({ ...current, ...patch }));
 }
 
 export default {
@@ -146,7 +143,7 @@ async function executePaperSignal(env: Env, signalId: number) {
   try {
     if (signal.action === "BUY") {
       const balance = await getPaperBalance(env);
-      const amountMon = Math.min(PAPER_MAX_BUY_MON, balance);
+      const amountMon = balance;
       if (!(amountMon > 0) || !(monUsd > 0)) return consumeSignal(env, signalId, "paper skipped: insufficient balance or MON/USD price");
       const amountIn = BigInt(Math.floor(amountMon * 1e18));
       const tokenOut = await quoteBuy(client, token, amountIn);
@@ -179,9 +176,13 @@ async function executePaperSignal(env: Env, signalId: number) {
       await setPaperState(env, signalId, "POSITION_UPDATED", {});
       await markConsumed(env, signalId);
       await setPaperState(env, signalId, "CONSUMED", {});
-      await env.CIEL_STATE.put(PAPER_FAILURE_COUNT_KEY, "0");
-      await env.CIEL_STATE.delete(PAPER_CIRCUIT_KEY);
-      await writeRuntimeState(env, { paperFailureCount: 0, paperCircuitOpen: false });
+      const failureCount = Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0");
+      const circuitOpen = await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true";
+      if (failureCount > 0 || circuitOpen) {
+        await env.CIEL_STATE.put(PAPER_FAILURE_COUNT_KEY, "0");
+        await env.CIEL_STATE.delete(PAPER_CIRCUIT_KEY);
+        await writeRuntimeState(env, { paperFailureCount: 0, paperCircuitOpen: false });
+      }
       await notifyTelegram(env, `📝 Ciel PAPER BUY\nToken: ${token}\nSpend: ${amountMon.toFixed(6)} MON\nTokens: ${tokenOut.toString()}\nFill: $${fillPriceUsd.toFixed(8)}`);
       return { ok: true, action: "BUY", amountMon, quantity: tokenOut.toString(), fillPriceUsd, executionState: "CONSUMED" };
     }
@@ -219,9 +220,13 @@ async function executePaperSignal(env: Env, signalId: number) {
       await setPaperState(env, signalId, "POSITION_UPDATED", {});
       await markConsumed(env, signalId);
       await setPaperState(env, signalId, "CONSUMED", {});
-      await env.CIEL_STATE.put(PAPER_FAILURE_COUNT_KEY, "0");
-      await env.CIEL_STATE.delete(PAPER_CIRCUIT_KEY);
-      await writeRuntimeState(env, { paperFailureCount: 0, paperCircuitOpen: false });
+      const failureCount = Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0");
+      const circuitOpen = await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true";
+      if (failureCount > 0 || circuitOpen) {
+        await env.CIEL_STATE.put(PAPER_FAILURE_COUNT_KEY, "0");
+        await env.CIEL_STATE.delete(PAPER_CIRCUIT_KEY);
+        await writeRuntimeState(env, { paperFailureCount: 0, paperCircuitOpen: false });
+      }
       await notifyTelegram(env, `📝 Ciel PAPER SELL\nToken: ${token}\nProceeds: ${proceedsMon.toFixed(6)} MON\nFill: $${fillPriceUsd.toFixed(8)}\nRealized P&L: $${pnlUsd.toFixed(4)}`);
       return { ok: true, action: "SELL", proceedsMon, pnlUsd, executionState: "CONSUMED" };
     }
@@ -291,62 +296,50 @@ async function runPaperPositionMonitoring(env: Env, monUsd: number) {
 async function runMarketCycle(env: Env) {
   const result = await indexNadFun(env);
   await writeRuntimeState(env, { lastMarketCycle: Date.now() });
-  if (result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\nSnapshots: ${result.snapshots}\nLatest block: ${result.latestBlock}`);
+  if (result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\nSnapshots: ${result.snapshots}\nTokens: ${result.tokens}`);
   await runPaperSignalCycle(env);
 }
 
 async function runPaperSignalCycle(env: Env) {
-  if (env.PAPER_TRADING !== "true" || env.TRADING_ENABLED === "true") return;
+  if (env.TRADING_ENABLED === "true" || env.PAPER_TRADING !== "true") return;
+  if (await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true") return;
   const rows = await env.DB.prepare("SELECT id FROM signals WHERE consumed_ts_ms IS NULL ORDER BY ts_ms ASC LIMIT 10").all<{ id: number }>();
   for (const row of rows.results || []) {
-    await env.TRADING_ENGINE.idFromName(`signal-${row.id}`).toString();
-    const stub = env.TRADING_ENGINE.get(env.TRADING_ENGINE.idFromName(`signal-${row.id}`));
-    await stub.fetch("https://ciel/paper-signal", { method: "POST", body: JSON.stringify({ action: "paper-signal", signalId: row.id }) });
+    await executePaperSignal(env, row.id);
   }
 }
 
 async function runModelMaintenance(env: Env) {
-  const snapshots = await env.DB.prepare("SELECT token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,buy_volume_usd,sell_volume_usd FROM market_snapshots ORDER BY ts_ms DESC LIMIT 500").all<Snapshot>();
-  const baseline = buildBaseline(snapshots.results || []);
-  const analyzed = snapshots.results?.slice(0, 50) || [];
-  const signals = [];
-  for (const snapshot of analyzed) {
-    const score = deviationScore(snapshot, baseline);
-    const ai = await askGemini(env, snapshot, score);
-    signals.push({ snapshot, score, ai });
+  const result = await env.DB.prepare("SELECT * FROM signals ORDER BY ts_ms DESC LIMIT 50").all();
+  const rows = (result.results || []) as unknown as Snapshot[];
+  const baseline = buildBaseline(rows);
+  const last = rows[0];
+  if (last) deviationScore(last, baseline);
+  await writeRuntimeState(env, { lastModelMaintenance: Date.now() });
+  const analysis = await askGemini(env, rows);
+  if (analysis) {
+    await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
+    await notifyTelegram(env, `🧠 Ciel model\n${analysis.slice(0, 3000)}`);
   }
-  for (const item of signals) {
-    const action = item.ai.action === "BUY" || item.ai.action === "SELL" ? item.ai.action : "HOLD";
-    await env.DB.prepare("INSERT INTO signals(token_address,ts_ms,action,confidence,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?)").bind(item.snapshot.token_address, item.snapshot.ts_ms, action, item.ai.confidence, item.score, env.GEMINI_MODEL, item.ai.rationale).run();
-  }
-  await writeRuntimeState(env, { lastModelMaintenance: Date.now(), lastModelAnalyzed: analyzed.length });
-  if (signals.length > 0) await notifyTelegram(env, `🧠 Ciel model\nAnalyzed: ${signals.length}\nSignals: ${signals.map(s => `${s.ai.action} ${s.ai.confidence.toFixed(2)}`).join(", ")}`);
 }
 
 async function status(env: Env) {
-  const state = await readRuntimeState(env);
   const indexerRaw = await env.CIEL_STATE.get("indexer_state");
-  let indexerState: { nextBlock?: string; latestBlock?: string; lastSnapshotCount?: number; lastRunMs?: number } = {};
-  try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch { /* ignore malformed telemetry */ }
-  const balance = await getPaperBalance(env);
-  const realized = Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0");
+  let indexerState: { lastRunMs?: number } = {};
+  try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
+  const state = await readRuntimeState(env);
   return {
-    ok: true,
     tradingEnabled: env.TRADING_ENABLED === "true",
     paperTrading: env.PAPER_TRADING === "true",
-    paperBalanceMon: balance,
-    paperRealizedPnlUsd: realized,
-    paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
+    paperBalanceMon: await getPaperBalance(env),
+    paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"),
     paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
+    paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
     lastHoldingCheck: state.lastHoldingCheck || null,
-    lastMarketCycle: indexerState.lastRunMs ?? null,
+    lastMarketCycle: indexerState.lastRunMs || null,
     lastModelMaintenance: state.lastModelMaintenance || null,
-    lastModelAnalyzed: state.lastModelAnalyzed || null,
-    monUsd: state.monUsd || null,
-    nextBlock: indexerState.nextBlock || null,
-    latestBlock: indexerState.latestBlock || null,
-    lastSnapshotCount: indexerState.lastSnapshotCount || 0
+    lastModelAnalyzed: state.lastModelAnalyzed || null
   };
 }
 
-function json(data: unknown) { return new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } }); }
+function json(value: unknown) { return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } }); }
