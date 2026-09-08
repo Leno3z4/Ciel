@@ -2,7 +2,7 @@ import { indexNadFun } from "./indexer";
 import { publicClient, tokenBalance, quoteSell, quoteBuy, walletAddress, sellToNative } from "./nadfun";
 import { buildBaseline, deviationScore, askGemini, type Snapshot } from "./model";
 import { riskGate } from "./risk";
-import { notifyTelegram } from "./telegram";
+import { notifyTelegram, testTelegram } from "./telegram";
 
 const PAPER_INITIAL_BALANCE_MON = 1000;
 const PAPER_SLIPPAGE_BPS = 500;
@@ -205,7 +205,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, service: "ciel", tradingEnabled: env.TRADING_ENABLED === "true", paperTrading: env.PAPER_TRADING === "true" });
-    if (url.pathname === "/status") return json(await status(env));
+    if (url.pathname === "/status") {
+      if (url.searchParams.get("telegramTest") === "1") return json(await testTelegram(env));
+      return json(await status(env));
+    }
     return new Response("Ciel trading service", { status: 200 });
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
@@ -466,6 +469,7 @@ async function status(env: Env) {
   return {
     tradingEnabled: env.TRADING_ENABLED === "true",
     paperTrading: env.PAPER_TRADING === "true",
+    telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     paperBalanceMon: await getPaperBalance(env),
     paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"),
     paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
