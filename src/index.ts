@@ -12,6 +12,7 @@ const PAPER_REALIZED_PNL_KEY = "paper_realized_pnl_usd";
 const PAPER_FAILURE_COUNT_KEY = "paper_execution_failure_count";
 const PAPER_CIRCUIT_KEY = "paper_execution_circuit_open";
 const RUNTIME_STATE_KEY = "ciel_runtime_state";
+const RUNTIME_TELEMETRY_INTERVAL_MS = 10 * 60 * 1000;
 
 type PaperState = "CREATED" | "RISK_CHECKED" | "QUOTED" | "BALANCE_RESERVED" | "FILLED" | "POSITION_UPDATED" | "CONSUMED" | "REJECTED" | "FAILED";
 
@@ -50,7 +51,20 @@ async function readRuntimeState(env: Env): Promise<RuntimeState> {
 }
 
 async function writeRuntimeState(env: Env, patch: RuntimeState) {
+  // Market-cycle telemetry is already persisted atomically with the indexer cursor.
+  // Do not create a second KV write every three minutes.
+  if (patch.lastMarketCycle !== undefined) {
+    const { lastMarketCycle: _ignored, ...rest } = patch;
+    patch = rest;
+  }
+  if (Object.keys(patch).length === 0) return;
+
   const current = await readRuntimeState(env);
+  const holdingTelemetryOnly = Object.keys(patch).every((key) => key === "lastHoldingCheck" || key === "paperUnrealizedPnlUsd");
+  if (holdingTelemetryOnly) {
+    const lastPersisted = Number(current.lastHoldingCheck || 0);
+    if (lastPersisted > 0 && Date.now() - lastPersisted < RUNTIME_TELEMETRY_INTERVAL_MS) return;
+  }
   await env.CIEL_STATE.put(RUNTIME_STATE_KEY, JSON.stringify({ ...current, ...patch }));
 }
 
@@ -290,7 +304,7 @@ async function runPaperPositionMonitoring(env: Env, monUsd: number) {
       await env.DB.prepare("UPDATE positions SET last_price_usd=?,updated_ts_ms=? WHERE token_address=?").bind(qtyUnits > 0 ? valueUsd / qtyUnits : 0, Date.now(), token).run();
     } catch (error) { await notifyTelegram(env, `⚠️ Ciel paper position monitor failed for ${p.token_address}: ${String(error).slice(0, 250)}`); }
   }
-  // P&L telemetry is useful hourly, but does not need a KV write every two minutes.
+  // Keep every two-minute quote/DB monitoring cycle intact; persist only durable telemetry every 10 minutes.
   await writeRuntimeState(env, { paperUnrealizedPnlUsd: unrealizedUsd });
 }
 
@@ -356,14 +370,14 @@ async function status(env: Env) {
     env.CIEL_STATE.get(PAPER_BALANCE_KEY),
     env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY)
   ]);
-  let indexerState: { nextBlock?: string; latestBlock?: string; lastSnapshotCount?: number } = {};
+  let indexerState: { nextBlock?: string; latestBlock?: string; lastSnapshotCount?: number; lastRunMs?: number } = {};
   try { if (indexer) indexerState = JSON.parse(indexer); } catch {}
   return {
     service: "ciel",
     tradingEnabled: env.TRADING_ENABLED === "true",
     paperTrading: env.PAPER_TRADING === "true",
     lastHoldingCheck: state.lastHoldingCheck ?? null,
-    lastMarketCycle: state.lastMarketCycle ?? null,
+    lastMarketCycle: indexerState.lastRunMs ?? null,
     lastModelMaintenance: state.lastModelMaintenance ?? null,
     indexerNextBlock: indexerState.nextBlock ?? null,
     indexerLatestBlock: indexerState.latestBlock ?? null,
