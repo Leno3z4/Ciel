@@ -40,14 +40,13 @@ export default {
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     if (controller.cron === "*/2 * * * *") ctx.waitUntil(runHoldingCheck(env));
-    if (controller.cron === "*/5 * * * *") ctx.waitUntil(runMarketCycle(env));
+    if (controller.cron === "*/3 * * * *") ctx.waitUntil(runMarketCycle(env));
     if (controller.cron === "0 * * * *") ctx.waitUntil(runModelMaintenance(env));
   }
 };
 
 export class TradingEngine {
   constructor(private state: DurableObjectState, private env: Env) {}
-
   async fetch(request: Request): Promise<Response> {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     const body = await request.json().catch(() => ({})) as { action?: string; signalId?: number };
@@ -63,8 +62,7 @@ async function beginPaperExecution(env: Env, signal: { id: number; token_address
   const key = `paper:${signal.id}`;
   const now = Date.now();
   await env.DB.prepare(`INSERT INTO paper_executions(signal_id,execution_key,token_address,side,state,created_ts_ms,updated_ts_ms)
-    VALUES(?,?,?,?,?,?,?) ON CONFLICT(signal_id) DO NOTHING`)
-    .bind(signal.id, key, signal.token_address, signal.action, "CREATED", now, now).run();
+    VALUES(?,?,?,?,?,?,?) ON CONFLICT(signal_id) DO NOTHING`).bind(signal.id, key, signal.token_address, signal.action, "CREATED", now, now).run();
   return { key, row: await env.DB.prepare("SELECT * FROM paper_executions WHERE signal_id=?").bind(signal.id).first<any>() };
 }
 
@@ -88,15 +86,12 @@ async function executePaperSignal(env: Env, signalId: number) {
   if (env.TRADING_ENABLED === "true") return { ok: false, skipped: "live trading flag is enabled; paper executor is disabled" };
   if (env.PAPER_TRADING !== "true") return { ok: false, skipped: "paper trading disabled" };
   if (await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true") return { ok: false, skipped: "paper execution circuit breaker is open" };
-
   const signal = await env.DB.prepare("SELECT id,token_address,action,confidence FROM signals WHERE id=?").bind(signalId).first<{ id: number; token_address: string; action: string; confidence: number }>();
   if (!signal) return { ok: false, skipped: "signal missing" };
-
   const execution = await beginPaperExecution(env, signal);
   const existing = execution.row;
   if (existing?.state === "CONSUMED") return { ok: true, skipped: "paper execution already consumed", executionState: existing.state };
   if (existing?.state === "REJECTED") return { ok: false, skipped: existing.error || "paper execution rejected" };
-
   const token = signal.token_address as `0x${string}`;
   const monUsd = Number(await env.CIEL_STATE.get("mon_usd"));
   const meta = await env.DB.prepare("SELECT decimals,liquidity_usd FROM tokens WHERE address=?").bind(token).first<{ decimals: number; liquidity_usd: number }>();
@@ -105,7 +100,6 @@ async function executePaperSignal(env: Env, signalId: number) {
   const liquidityUsd = Number(meta?.liquidity_usd || 0);
   const priceChangePct = previous?.price_usd && current?.price_usd ? ((current.price_usd - previous.price_usd) / previous.price_usd) * 100 : 0;
   const client = publicClient(env.NAD_RPC_URL);
-
   try {
     if (signal.action === "BUY") {
       const balance = await getPaperBalance(env);
@@ -126,7 +120,6 @@ async function executePaperSignal(env: Env, signalId: number) {
       const gate = riskGate({ confidence: Number(signal.confidence || 0), liquidityUsd, slippageBps: PAPER_SLIPPAGE_BPS, portfolioExposurePct: positionPct, positionPct, priceChangePct });
       await setPaperState(env, signalId, gate.allowed ? "RISK_CHECKED" : "REJECTED", { error: gate.allowed ? null : gate.reasons.join(", "), quantity: tokenOut.toString(), fill_price_usd: fillPriceUsd });
       if (!gate.allowed) return consumeSignal(env, signalId, `paper BUY blocked: ${gate.reasons.join(", ")}`, true);
-
       await setPaperState(env, signalId, "QUOTED", { quantity: tokenOut.toString(), fill_price_usd: fillPriceUsd, balance_before_mon: balance, balance_after_mon: balance - amountMon, position_quantity_after: totalTokenUnits.toString() });
       const currentBalance = await getPaperBalance(env);
       const expectedAfter = balance - amountMon;
@@ -135,13 +128,11 @@ async function executePaperSignal(env: Env, signalId: number) {
         else throw new Error("paper balance changed unexpectedly during BUY reservation");
       }
       await setPaperState(env, signalId, "BALANCE_RESERVED", {});
-      await env.DB.prepare("INSERT OR IGNORE INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error,execution_key) VALUES(?,?,?,?,?,?,?,?,?,?)")
-        .bind(token, Date.now(), "BUY", tokenOut.toString(), fillPriceUsd, null, "paper", "filled", null, execution.key).run();
+      await env.DB.prepare("INSERT OR IGNORE INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error,execution_key) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(token, Date.now(), "BUY", tokenOut.toString(), fillPriceUsd, null, "paper", "filled", null, execution.key).run();
       await setPaperState(env, signalId, "FILLED", {});
       const entryPrice = existingQty === 0n ? fillPriceUsd : Number(position?.entry_price_usd || fillPriceUsd);
       await env.DB.prepare(`INSERT INTO positions(token_address,quantity,entry_price_usd,entry_ts_ms,last_price_usd,updated_ts_ms)
-        VALUES(?,?,?,?,?,?) ON CONFLICT(token_address) DO UPDATE SET quantity=excluded.quantity,entry_price_usd=CASE WHEN positions.quantity='0' THEN excluded.entry_price_usd ELSE positions.entry_price_usd END,entry_ts_ms=CASE WHEN positions.quantity='0' THEN excluded.entry_ts_ms ELSE positions.entry_ts_ms END,last_price_usd=excluded.last_price_usd,updated_ts_ms=excluded.updated_ts_ms`)
-        .bind(token, totalTokenUnits.toString(), entryPrice, Date.now(), fillPriceUsd, Date.now()).run();
+        VALUES(?,?,?,?,?,?) ON CONFLICT(token_address) DO UPDATE SET quantity=excluded.quantity,entry_price_usd=CASE WHEN positions.quantity='0' THEN excluded.entry_price_usd ELSE positions.entry_price_usd END,entry_ts_ms=CASE WHEN positions.quantity='0' THEN excluded.entry_ts_ms ELSE positions.entry_ts_ms END,last_price_usd=excluded.last_price_usd,updated_ts_ms=excluded.updated_ts_ms`).bind(token, totalTokenUnits.toString(), entryPrice, Date.now(), fillPriceUsd, Date.now()).run();
       await setPaperState(env, signalId, "POSITION_UPDATED", {});
       await markConsumed(env, signalId);
       await setPaperState(env, signalId, "CONSUMED", {});
@@ -150,7 +141,6 @@ async function executePaperSignal(env: Env, signalId: number) {
       await notifyTelegram(env, `📝 Ciel PAPER BUY\nToken: ${token}\nSpend: ${amountMon.toFixed(6)} MON\nTokens: ${tokenOut.toString()}\nFill: $${fillPriceUsd.toFixed(8)}`);
       return { ok: true, action: "BUY", amountMon, quantity: tokenOut.toString(), fillPriceUsd, executionState: "CONSUMED" };
     }
-
     if (signal.action === "SELL") {
       const position = await env.DB.prepare(`SELECT quantity,entry_price_usd FROM positions WHERE token_address=? AND ${positiveQuantitySql("quantity")}`).bind(token).first<{ quantity: string; entry_price_usd: number }>();
       if (!position) return consumeSignal(env, signalId, "paper SELL skipped: no position");
@@ -168,7 +158,6 @@ async function executePaperSignal(env: Env, signalId: number) {
       const gate = riskGate({ confidence: Number(signal.confidence || 0), liquidityUsd, slippageBps: PAPER_SLIPPAGE_BPS, portfolioExposurePct: positionPct, positionPct, priceChangePct });
       await setPaperState(env, signalId, gate.allowed ? "RISK_CHECKED" : "REJECTED", { error: gate.allowed ? null : gate.reasons.join(", "), quantity: quantity.toString(), quote_out: quoteOut.toString(), fill_price_usd: fillPriceUsd });
       if (!gate.allowed) return consumeSignal(env, signalId, `paper SELL blocked: ${gate.reasons.join(", ")}`, true);
-
       const pnlUsd = (fillPriceUsd - Number(position.entry_price_usd || fillPriceUsd)) * quantityUnits;
       const expectedAfter = balance + proceedsMon;
       await setPaperState(env, signalId, "QUOTED", { balance_before_mon: balance, balance_after_mon: expectedAfter, position_quantity_after: "0", realized_pnl_usd: pnlUsd });
@@ -179,8 +168,7 @@ async function executePaperSignal(env: Env, signalId: number) {
       }
       await setPaperState(env, signalId, "BALANCE_RESERVED", {});
       await env.CIEL_STATE.put(PAPER_REALIZED_PNL_KEY, String(Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0") + pnlUsd));
-      await env.DB.prepare("INSERT OR IGNORE INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error,execution_key) VALUES(?,?,?,?,?,?,?,?,?,?)")
-        .bind(token, Date.now(), "SELL", quantity.toString(), fillPriceUsd, null, "paper", "filled", null, execution.key).run();
+      await env.DB.prepare("INSERT OR IGNORE INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error,execution_key) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(token, Date.now(), "SELL", quantity.toString(), fillPriceUsd, null, "paper", "filled", null, execution.key).run();
       await setPaperState(env, signalId, "FILLED", {});
       await env.DB.prepare("UPDATE positions SET quantity='0',last_price_usd=?,updated_ts_ms=? WHERE token_address=?").bind(fillPriceUsd, Date.now(), token).run();
       await setPaperState(env, signalId, "POSITION_UPDATED", {});
@@ -191,7 +179,6 @@ async function executePaperSignal(env: Env, signalId: number) {
       await notifyTelegram(env, `📝 Ciel PAPER SELL\nToken: ${token}\nProceeds: ${proceedsMon.toFixed(6)} MON\nFill: $${fillPriceUsd.toFixed(8)}\nRealized P&L: $${pnlUsd.toFixed(4)}`);
       return { ok: true, action: "SELL", proceedsMon, pnlUsd, executionState: "CONSUMED" };
     }
-
     return consumeSignal(env, signalId, `paper ${signal.action} not executable`);
   } catch (error) {
     await failPaperExecution(env, signalId, error);
