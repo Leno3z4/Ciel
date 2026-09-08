@@ -1,9 +1,11 @@
 import { parseAbiItem, type Address } from "viem";
-import { NADFUN_BONDING, publicClient, quoteSell, WMON } from "./nadfun";
+import { NADFUN_BONDING, NADFUN_ROUTER, publicClient, quoteSell, WMON } from "./nadfun";
 
 const createEvent = parseAbiItem("event Create(address indexed creator,address indexed token,address indexed pair,address quoteToken,string name,string symbol,string tokenURI,uint256 virtualQuoteReserve,uint256 virtualTokenReserve,uint256 minTokenReserve)");
-const buyEvent = parseAbiItem("event Buy(address indexed token,address indexed buyer,uint256 quoteIn,uint256 tokenOut)");
-const sellEvent = parseAbiItem("event Sell(address indexed token,address indexed seller,uint256 tokenIn,uint256 quoteOut)");
+const bondingBuyEvent = parseAbiItem("event Buy(address indexed token,address indexed buyer,uint256 quoteIn,uint256 tokenOut)");
+const bondingSellEvent = parseAbiItem("event Sell(address indexed token,address indexed seller,uint256 tokenIn,uint256 quoteOut)");
+const routerBuyEvent = parseAbiItem("event Buy(address indexed buyer,address indexed token,uint256 amountIn,uint256 amountOut,bool graduated)");
+const routerSellEvent = parseAbiItem("event Sell(address indexed seller,address indexed token,uint256 amountIn,uint256 amountOut,bool graduated)");
 const graduateEvent = parseAbiItem("event Graduate(address indexed token,address indexed pair)");
 const syncEvent = parseAbiItem("event Sync(address indexed token,uint256 realQuoteReserve,uint256 realTokenReserve,uint256 virtualQuoteReserve,uint256 virtualTokenReserve)");
 const snipingEvent = parseAbiItem("event SnipingPenalty(address indexed token,uint256 penaltyBps)");
@@ -22,8 +24,6 @@ export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: numb
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
 
 const INDEXER_STATE_KEY = "indexer_state";
-// Monad's public RPC currently rejects eth_getLogs ranges wider than 100 blocks.
-// Keep the default at the RPC-safe maximum so every scheduled indexer run can advance.
 const RPC_LOG_RANGE_BLOCKS = 100;
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
@@ -63,10 +63,13 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   if (fromBlock > latest) return null;
   const requestedBlocks = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS));
   const toBlock = fromBlock + BigInt(requestedBlocks - 1) > latest ? latest : fromBlock + BigInt(requestedBlocks - 1);
-  const [creates, buys, sells, graduates, syncs, snipingPenalties, monPrice] = await Promise.all([
+
+  const [creates, bondingBuys, bondingSells, routerBuys, routerSells, graduates, syncs, snipingPenalties, monPrice] = await Promise.all([
     client.getLogs({ address: NADFUN_BONDING, event: createEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_BONDING, event: buyEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_BONDING, event: sellEvent, fromBlock, toBlock }),
+    client.getLogs({ address: NADFUN_BONDING, event: bondingBuyEvent, fromBlock, toBlock }),
+    client.getLogs({ address: NADFUN_BONDING, event: bondingSellEvent, fromBlock, toBlock }),
+    client.getLogs({ address: NADFUN_ROUTER, event: routerBuyEvent, fromBlock, toBlock }),
+    client.getLogs({ address: NADFUN_ROUTER, event: routerSellEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: graduateEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: syncEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: snipingEvent, fromBlock, toBlock }),
@@ -93,16 +96,36 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
       .bind(a.token, a.symbol ?? null, a.name ?? null, 0, 0, Date.now(), Date.now(), totalSupply?.toString() ?? null, Number(decimals), a.quoteToken, a.pair, 0, Number(log.blockNumber)).run();
   }
 
-  for (const log of buys) {
+  // Router Buy/Sell events are the authoritative user-action feed across both
+  // pre-graduation bonding-curve and post-graduation DEX routes. Do not add
+  // bonding-curve Buy/Sell counts separately or pre-graduation trades would be double-counted.
+  for (const log of routerBuys) {
     const a = log.args; if (!a.token) continue;
-    const s = touch(a.token); s.buyVolume += a.quoteIn ?? 0n; s.buys++;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-buy.json`, JSON.stringify({ type: "Buy", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, buyer: a.buyer, quoteIn: a.quoteIn?.toString(), tokenOut: a.tokenOut?.toString() }));
+    const s = touch(a.token); s.buyVolume += a.amountIn ?? 0n; s.buys++;
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-buy.json`, JSON.stringify({ type: "Buy", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, buyer: a.buyer, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated }));
   }
-  for (const log of sells) {
+  for (const log of routerSells) {
     const a = log.args; if (!a.token) continue;
-    const s = touch(a.token); s.sellVolume += a.quoteOut ?? 0n; s.sells++;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, tokenIn: a.tokenIn?.toString(), quoteOut: a.quoteOut?.toString() }));
+    const s = touch(a.token); s.sellVolume += a.amountOut ?? 0n; s.sells++;
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated }));
   }
+  // Keep the bonding Buy/Sell queries above for compatibility with old deployments
+  // that may have router events unavailable, but only use them if the router returned
+  // no corresponding trade for that block. This avoids double counting while allowing
+  // the indexer to recover pre-router historical activity.
+  if (routerBuys.length === 0) {
+    for (const log of bondingBuys) {
+      const a = log.args; if (!a.token) continue;
+      const s = touch(a.token); s.buyVolume += a.quoteIn ?? 0n; s.buys++;
+    }
+  }
+  if (routerSells.length === 0) {
+    for (const log of bondingSells) {
+      const a = log.args; if (!a.token) continue;
+      const s = touch(a.token); s.sellVolume += a.quoteOut ?? 0n; s.sells++;
+    }
+  }
+
   for (const log of syncs) {
     const a = log.args; if (!a.token) continue;
     touch(a.token).liquidityQuote = a.realQuoteReserve ?? 0n;
@@ -140,5 +163,5 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   }
 
   await env.CIEL_STATE.put(INDEXER_STATE_KEY, JSON.stringify({ nextBlock: (toBlock + 1n).toString(), latestBlock: latest.toString(), lastSnapshotCount: snapshots, lastRunMs: ts } satisfies IndexerState));
-  return { fromBlock, toBlock, creates: creates.length, buys: buys.length, sells: sells.length, graduates: graduates.length, syncs: syncs.length, snapshots, nextBlock: toBlock + 1n };
+  return { fromBlock, toBlock, creates: creates.length, buys: routerBuys.length || bondingBuys.length, sells: routerSells.length || bondingSells.length, graduates: graduates.length, syncs: syncs.length, snapshots, nextBlock: toBlock + 1n };
 }
