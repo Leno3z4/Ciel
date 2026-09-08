@@ -19,7 +19,7 @@ const pairAbi = [
 ] as const;
 
 export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: number; buys: number; sells: number; graduates: number; syncs: number; snapshots: number; nextBlock: bigint; }
-type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA: R2Bucket; NAD_RPC_URL?: string };
+type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
 
 const INDEXER_STATE_KEY = "indexer_state";
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
@@ -92,26 +92,26 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = 3000): Promise<Inde
   for (const log of buys) {
     const a = log.args; if (!a.token) continue;
     const s = touch(a.token); s.buyVolume += a.quoteIn ?? 0n; s.buys++;
-    await env.MARKET_DATA.put(`events/${log.blockNumber}-${log.logIndex}-buy.json`, JSON.stringify({ type: "Buy", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, buyer: a.buyer, quoteIn: a.quoteIn?.toString(), tokenOut: a.tokenOut?.toString() }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-buy.json`, JSON.stringify({ type: "Buy", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, buyer: a.buyer, quoteIn: a.quoteIn?.toString(), tokenOut: a.tokenOut?.toString() }));
   }
   for (const log of sells) {
     const a = log.args; if (!a.token) continue;
     const s = touch(a.token); s.sellVolume += a.quoteOut ?? 0n; s.sells++;
-    await env.MARKET_DATA.put(`events/${log.blockNumber}-${log.logIndex}-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, tokenIn: a.tokenIn?.toString(), quoteOut: a.quoteOut?.toString() }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, tokenIn: a.tokenIn?.toString(), quoteOut: a.quoteOut?.toString() }));
   }
   for (const log of syncs) {
     const a = log.args; if (!a.token) continue;
     touch(a.token).liquidityQuote = a.realQuoteReserve ?? 0n;
-    await env.MARKET_DATA.put(`events/${log.blockNumber}-${log.logIndex}-sync.json`, JSON.stringify({ type: "Sync", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, realQuoteReserve: a.realQuoteReserve?.toString(), realTokenReserve: a.realTokenReserve?.toString(), virtualQuoteReserve: a.virtualQuoteReserve?.toString(), virtualTokenReserve: a.virtualTokenReserve?.toString() }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sync.json`, JSON.stringify({ type: "Sync", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, realQuoteReserve: a.realQuoteReserve?.toString(), realTokenReserve: a.realTokenReserve?.toString(), virtualQuoteReserve: a.virtualQuoteReserve?.toString(), virtualTokenReserve: a.virtualTokenReserve?.toString() }));
   }
   for (const log of graduates) {
     const a = log.args; if (!a.token) continue;
     await env.DB.prepare("UPDATE tokens SET graduated=1,pair_address=? WHERE address=?").bind(a.pair ?? null, a.token).run();
-    await env.MARKET_DATA.put(`events/${log.blockNumber}-${log.logIndex}-graduate.json`, JSON.stringify({ type: "Graduate", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, pair: a.pair }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-graduate.json`, JSON.stringify({ type: "Graduate", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, pair: a.pair }));
   }
   for (const log of snipingPenalties) {
     const a = log.args; if (!a.token) continue;
-    await env.MARKET_DATA.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
   }
 
   let snapshots = 0;
@@ -135,7 +135,6 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = 3000): Promise<Inde
     snapshots++;
   }
 
-  // Keep the cursor, telemetry, and market-cycle timestamp together in one KV record.
   await env.CIEL_STATE.put(INDEXER_STATE_KEY, JSON.stringify({ nextBlock: (toBlock + 1n).toString(), latestBlock: latest.toString(), lastSnapshotCount: snapshots, lastRunMs: ts } satisfies IndexerState));
   return { fromBlock, toBlock, creates: creates.length, buys: buys.length, sells: sells.length, graduates: graduates.length, syncs: syncs.length, snapshots, nextBlock: toBlock + 1n };
 }
