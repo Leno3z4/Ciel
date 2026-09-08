@@ -10,19 +10,21 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
             const path = 'src/index.ts';
             const branch = 'main';
-            const file = await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path, ref: branch });
-            if (Array.isArray(file.data)) throw new Error('Expected a file');
-            const sha = file.data.sha;
-            let source = Buffer.from(file.data.content, 'base64').toString('utf8');
-            const replaceOnce = (re, replacement) => {
-              const next = source.replace(re, replacement);
-              if (next === source) throw new Error(`Pattern did not match: ${re}`);
-              source = next;
-            };
-            replaceOnce(/lastModelAnalyzed\?: number;\n(\s*)monUsd\?: number;/, 'lastModelAnalyzed?: number;\n$1lastModelError?: string;\n$1lastMarketCycleError?: string;\n$1monUsd?: number;');
-            replaceOnce(/async function runHoldingCheck\(env: Env\) \{[\s\S]*?\n\}\n\nasync function runPaperPositionMonitoring/, `async function runHoldingCheck(env: Env) {
+            try {
+              const file = await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path, ref: branch });
+              if (Array.isArray(file.data)) throw new Error('Expected a file');
+              const sha = file.data.sha;
+              let source = Buffer.from(file.data.content, 'base64').toString('utf8');
+              const replaceOnce = (re, replacement) => {
+                const next = source.replace(re, replacement);
+                if (next === source) throw new Error(`Pattern did not match: ${re}`);
+                source = next;
+              };
+              replaceOnce(/lastModelAnalyzed\?: number;\n(\s*)monUsd\?: number;/, 'lastModelAnalyzed?: number;\n$1lastModelError?: string;\n$1lastMarketCycleError?: string;\n$1monUsd?: number;');
+              replaceOnce(/async function runHoldingCheck\(env: Env\) \{[\s\S]*?\n\}\n\nasync function runPaperPositionMonitoring/, `async function runHoldingCheck(env: Env) {
   const checkedAt = Date.now();
   try {
     await ensureDatabaseSchema(env);
@@ -62,7 +64,7 @@ jobs:
 }
 
 async function runPaperPositionMonitoring`);
-            replaceOnce(/async function runMarketCycle\(env: Env\) \{[\s\S]*?\n\}\n\nasync function runPaperSignalCycle/, `async function runMarketCycle(env: Env) {
+              replaceOnce(/async function runMarketCycle\(env: Env\) \{[\s\S]*?\n\}\n\nasync function runPaperSignalCycle/, `async function runMarketCycle(env: Env) {
   const cycleAt = Date.now();
   try {
     await ensureDatabaseSchema(env);
@@ -78,7 +80,7 @@ async function runPaperPositionMonitoring`);
 }
 
 async function runPaperSignalCycle`);
-            replaceOnce(/async function runModelMaintenance\(env: Env\) \{[\s\S]*?\n\}\n\nasync function status/, `async function runModelMaintenance(env: Env) {
+              replaceOnce(/async function runModelMaintenance\(env: Env\) \{[\s\S]*?\n\}\n\nasync function status/, `async function runModelMaintenance(env: Env) {
   const maintenanceAt = Date.now();
   try {
     await ensureDatabaseSchema(env);
@@ -101,7 +103,7 @@ async function runPaperSignalCycle`);
 }
 
 async function status`);
-            replaceOnce(/async function status\(env: Env\) \{[\s\S]*?\n\}\n\nfunction json/, `async function status(env: Env) {
+              replaceOnce(/async function status\(env: Env\) \{[\s\S]*?\n\}\n\nfunction json/, `async function status(env: Env) {
   const indexerRaw = await env.CIEL_STATE.get("indexer_state");
   let indexerState: { lastRunMs?: number } = {};
   try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
@@ -133,5 +135,10 @@ async function status`);
 }
 
 function json`);
-            await github.rest.repos.createOrUpdateFileContents({ owner: context.repo.owner, repo: context.repo.repo, path, message: 'fix: add runtime monitoring and scheduler diagnostics', content: Buffer.from(source).toString('base64'), sha, branch });
-            await github.rest.repos.deleteFile({ owner: context.repo.owner, repo: context.repo.repo, path: '.github/workflows/one-time-telegram-monitor-patch.yml', message: 'chore: remove one-time monitor patch workflow', sha: (await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path: '.github/workflows/one-time-telegram-monitor-patch.yml', ref: branch })).data.sha, branch });
+              await github.rest.repos.createOrUpdateFileContents({ owner: context.repo.owner, repo: context.repo.repo, path, message: 'fix: add runtime monitoring and scheduler diagnostics', content: Buffer.from(source).toString('base64'), sha, branch });
+              await github.rest.repos.deleteFile({ owner: context.repo.owner, repo: context.repo.repo, path: '.github/workflows/one-time-telegram-monitor-patch.yml', message: 'chore: remove one-time monitor patch workflow', sha: (await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path: '.github/workflows/one-time-telegram-monitor-patch.yml', ref: branch })).data.sha, branch });
+            } catch (error) {
+              const message = String(error).slice(0, 4000);
+              await github.rest.repos.createOrUpdateFileContents({ owner: context.repo.owner, repo: context.repo.repo, path: '.telegram-monitor-patch-error.txt', message: 'chore: record monitor patch error', content: Buffer.from(message).toString('base64'), branch });
+              throw error;
+            }
