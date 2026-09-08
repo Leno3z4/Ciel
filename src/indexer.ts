@@ -22,6 +22,9 @@ export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: numb
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
 
 const INDEXER_STATE_KEY = "indexer_state";
+// Monad's public RPC currently rejects eth_getLogs ranges wider than 100 blocks.
+// Keep the default at the RPC-safe maximum so every scheduled indexer run can advance.
+const RPC_LOG_RANGE_BLOCKS = 100;
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
 async function monUsd(env: IndexEnv): Promise<number> {
@@ -50,7 +53,7 @@ async function pairLiquidityUsd(client: ReturnType<typeof publicClient>, pair: A
   } catch { return 0; }
 }
 
-export async function indexNadFun(env: IndexEnv, maxBlocks = 3000): Promise<IndexResult | null> {
+export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCKS): Promise<IndexResult | null> {
   const client = publicClient(env.NAD_RPC_URL);
   const latest = await client.getBlockNumber();
   const stateRaw = await env.CIEL_STATE.get(INDEXER_STATE_KEY);
@@ -58,7 +61,8 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = 3000): Promise<Inde
   const cursorRaw = state?.nextBlock ?? await env.CIEL_STATE.get("indexer_next_block");
   const fromBlock = cursorRaw ? BigInt(cursorRaw) : (latest > 216_000n ? latest - 216_000n : 73_857_231n);
   if (fromBlock > latest) return null;
-  const toBlock = fromBlock + BigInt(maxBlocks - 1) > latest ? latest : fromBlock + BigInt(maxBlocks - 1);
+  const requestedBlocks = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS));
+  const toBlock = fromBlock + BigInt(requestedBlocks - 1) > latest ? latest : fromBlock + BigInt(requestedBlocks - 1);
   const [creates, buys, sells, graduates, syncs, snipingPenalties, monPrice] = await Promise.all([
     client.getLogs({ address: NADFUN_BONDING, event: createEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: buyEvent, fromBlock, toBlock }),
