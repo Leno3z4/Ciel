@@ -9,7 +9,6 @@ permissions:
 
 jobs:
   patch:
-    if: github.event.head_commit.message == 'chore: apply telegram runtime monitoring patch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,8 +19,8 @@ jobs:
           from pathlib import Path
           p = Path('src/index.ts')
           s = p.read_text()
-
-          old = '''type RuntimeState = {
+          replacements = [
+          ('''type RuntimeState = {
             lastHoldingCheck?: number;
             lastMarketCycle?: number;
             lastModelMaintenance?: number;
@@ -30,8 +29,7 @@ jobs:
             paperUnrealizedPnlUsd?: number;
             paperFailureCount?: number;
             paperCircuitOpen?: boolean;
-          };'''
-          new = '''type RuntimeState = {
+          };''', '''type RuntimeState = {
             lastHoldingCheck?: number;
             lastMarketCycle?: number;
             lastModelMaintenance?: number;
@@ -42,11 +40,8 @@ jobs:
             paperUnrealizedPnlUsd?: number;
             paperFailureCount?: number;
             paperCircuitOpen?: boolean;
-          };'''
-          if old not in s: raise SystemExit('RuntimeState block not found')
-          s = s.replace(old, new, 1)
-
-          old = '''async function runHoldingCheck(env: Env) {
+          };'''),
+          ('''async function runHoldingCheck(env: Env) {
             const state = await readRuntimeState(env);
             const monUsd = Number(state.monUsd || await env.CIEL_STATE.get("mon_usd"));
             if (!(monUsd > 0)) return;
@@ -67,8 +62,7 @@ jobs:
               }
             }
             await writeRuntimeState(env, { lastHoldingCheck: Date.now() });
-          }'''
-          new = '''async function runHoldingCheck(env: Env) {
+          }''', '''async function runHoldingCheck(env: Env) {
             const checkedAt = Date.now();
             try {
               await ensureDatabaseSchema(env);
@@ -105,37 +99,28 @@ jobs:
               await writeRuntimeState(env, { lastHoldingCheck: checkedAt });
               console.error(`Holding check failed: ${String(error).slice(0, 1000)}`);
             }
-          }'''
-          if old not in s: raise SystemExit('Holding check block not found')
-          s = s.replace(old, new, 1)
-
-          old = '''async function runMarketCycle(env: Env) {
+          }'''),
+          ('''async function runMarketCycle(env: Env) {
             await ensureDatabaseSchema(env);
             const result = await indexNadFun(env);
             await writeRuntimeState(env, { lastMarketCycle: Date.now() });
             if (result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\\nSnapshots: ${result.snapshots}\\nTokens: ${result.tokens}`);
             await runPaperSignalCycle(env);
-          }'''
-          new = '''async function runMarketCycle(env: Env) {
+          }''', '''async function runMarketCycle(env: Env) {
             const cycleAt = Date.now();
             try {
               await ensureDatabaseSchema(env);
               const result = await indexNadFun(env);
               await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: undefined });
-              if (result && result.snapshots > 0) {
-                await notifyTelegram(env, `📡 Ciel indexer\\nSnapshots: ${result.snapshots}`);
-              }
+              if (result && result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\\nSnapshots: ${result.snapshots}`);
               await runPaperSignalCycle(env);
             } catch (error) {
               const message = String(error).slice(0, 1000);
               await writeRuntimeState(env, { lastMarketCycle: cycleAt, lastMarketCycleError: message });
               console.error(`Market cycle failed: ${message}`);
             }
-          }'''
-          if old not in s: raise SystemExit('Market cycle block not found')
-          s = s.replace(old, new, 1)
-
-          old = '''async function runModelMaintenance(env: Env) {
+          }'''),
+          ('''async function runModelMaintenance(env: Env) {
             await ensureDatabaseSchema(env);
             const result = await env.DB.prepare("SELECT * FROM signals ORDER BY ts_ms DESC LIMIT 50").all();
             const rows = (result.results || []) as unknown as Snapshot[];
@@ -148,8 +133,7 @@ jobs:
               await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
               await notifyTelegram(env, `🧠 Ciel model\\n${analysis.slice(0, 3000)}`);
             }
-          }'''
-          new = '''async function runModelMaintenance(env: Env) {
+          }''', '''async function runModelMaintenance(env: Env) {
             const maintenanceAt = Date.now();
             try {
               await ensureDatabaseSchema(env);
@@ -169,11 +153,8 @@ jobs:
               await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message });
               console.error(`Model maintenance failed: ${message}`);
             }
-          }'''
-          if old not in s: raise SystemExit('Model maintenance block not found')
-          s = s.replace(old, new, 1)
-
-          old = '''async function status(env: Env) {
+          }'''),
+          ('''async function status(env: Env) {
             const indexerRaw = await env.CIEL_STATE.get("indexer_state");
             let indexerState: { lastRunMs?: number } = {};
             try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
@@ -191,8 +172,7 @@ jobs:
               lastModelMaintenance: state.lastModelMaintenance || null,
               lastModelAnalyzed: state.lastModelAnalyzed || null
             };
-          }'''
-          new = '''async function status(env: Env) {
+          }''', '''async function status(env: Env) {
             const indexerRaw = await env.CIEL_STATE.get("indexer_state");
             let indexerState: { lastRunMs?: number } = {};
             try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {}
@@ -221,10 +201,11 @@ jobs:
               lastModelAnalyzed: state.lastModelAnalyzed || null,
               lastModelError: state.lastModelError || null
             };
-          }'''
-          if old not in s: raise SystemExit('Status block not found')
-          s = s.replace(old, new, 1)
-
+          }''')]
+          for old, new in replacements:
+              if old not in s:
+                  raise SystemExit('Expected source block not found')
+              s = s.replace(old, new, 1)
           p.write_text(s)
           PY
 
@@ -232,6 +213,6 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/index.ts .github/workflows/one-time-telegram-monitor-patch.yml
+          git add src/index.ts .github/workflows/one-time-telegram-monitor-patch.yml .telegram-monitor-patch-trigger
           git commit -m 'fix: add runtime monitoring and scheduler diagnostics'
           git push origin main
