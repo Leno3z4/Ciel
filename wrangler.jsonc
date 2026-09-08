@@ -21,9 +21,8 @@
       "TELEGRAM_CHAT_ID"
     ]
   },
-  "kv_namespaces": [{ "binding": "CIEL_STATE", "id": "REPLACE_WITH_KV_ID" }],
-  "d1_databases": [{ "binding": "DB", "database_name": "ciel", "database_id": "REPLACE_WITH_D1_ID" }],
-  "r2_buckets": [{ "binding": "MARKET_DATA", "bucket_name": "ciel-market-data" }],
+  "kv_namespaces": [{ "binding": "CIEL_STATE", "id": "8b5c4b6078ce43a8aec4d9343855a70f" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "ciel", "database_id": "fb55e85b-af9b-45b3-ba43-6c7f7996dfa8" }],
   "durable_objects": { "bindings": [{ "name": "TRADING_ENGINE", "class_name": "TradingEngine" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TradingEngine"] }]
 }
