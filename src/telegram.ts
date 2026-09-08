@@ -31,29 +31,29 @@ async function telegramRequest(env: Env, method: string, body?: Record<string, u
 async function sendTelegram(env: Env, text: string): Promise<void> {
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = env.TELEGRAM_CHAT_ID?.trim();
-  if (!token || !chatId) {
-    throw new Error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured");
-  }
+  if (!token || !chatId) throw new Error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured");
   if (!text.trim()) throw new Error("Telegram message text is empty");
   if (text.length > 4096) throw new Error(`Telegram message is too long: ${text.length} characters`);
-  await telegramRequest(env, "sendMessage", {
-    chat_id: chatId,
-    text,
-    disable_web_page_preview: true
-  });
+  await telegramRequest(env, "sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
 }
 
-export async function testTelegram(env: Env): Promise<{ ok: boolean; bot?: string; chatConfigured?: boolean; error?: string }> {
-  if (!env.TELEGRAM_BOT_TOKEN?.trim() || !env.TELEGRAM_CHAT_ID?.trim()) {
-    return { ok: false, chatConfigured: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" };
-  }
+export async function testTelegram(env: Env): Promise<{ ok: boolean; bot?: string; chat?: string; error?: string }> {
+  const token = env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = env.TELEGRAM_CHAT_ID?.trim();
+  if (!token || !chatId) return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" };
   try {
     const me = await telegramRequest(env, "getMe");
     const username = (me.result as { username?: string } | undefined)?.username;
-    await sendTelegram(env, "🔌 Ciel Telegram test\nTelegram Bot API authentication and message delivery are working.");
-    return { ok: true, bot: username ? `@${username}` : undefined, chatConfigured: true };
+    const chat = await telegramRequest(env, "getChat", { chat_id: chatId });
+    const chatInfo = chat.result as { title?: string; username?: string; first_name?: string; type?: string } | undefined;
+    await sendTelegram(env, "🔌 Ciel Telegram test\nBot authentication, chat access, and message delivery are working.");
+    return {
+      ok: true,
+      bot: username ? `@${username}` : undefined,
+      chat: chatInfo?.title || chatInfo?.username || chatInfo?.first_name || chatInfo?.type || chatId
+    };
   } catch (error) {
-    return { ok: false, chatConfigured: true, error: String(error).slice(0, 800) };
+    return { ok: false, error: String(error).slice(0, 800) };
   }
 }
 
