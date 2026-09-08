@@ -4,7 +4,7 @@ import { buildBaseline, deviationScore, askGemini, type Snapshot } from "./model
 import { riskGate } from "./risk";
 import { notifyTelegram } from "./telegram";
 
-const PAPER_INITIAL_BALANCE_MON = 100;
+const PAPER_INITIAL_BALANCE_MON = 1000;
 const PAPER_MAX_BUY_MON = 1;
 const PAPER_SLIPPAGE_BPS = 500;
 const PAPER_BALANCE_KEY = "paper_balance_mon";
@@ -257,139 +257,96 @@ async function runHoldingCheck(env: Env) {
   if (!(monUsd > 0)) return;
   if (env.PAPER_TRADING === "true" && env.TRADING_ENABLED !== "true") await runPaperPositionMonitoring(env, monUsd);
   const address = walletAddress(env.WALLET_PRIVATE_KEY);
-  if (!address) {
-    await writeRuntimeState(env, { lastHoldingCheck: Date.now() });
-    return;
-  }
-  const client = publicClient(env.NAD_RPC_URL);
-  const rows = await env.DB.prepare(`SELECT p.token_address,p.quantity,p.entry_price_usd,p.last_price_usd,t.decimals FROM positions p LEFT JOIN tokens t ON t.address=p.token_address WHERE ${positiveQuantitySql("p.quantity")}`).all<{ token_address: string; quantity: string; entry_price_usd: number; last_price_usd: number; decimals: number }>();
-  for (const p of rows.results ?? []) {
-    try {
-      const token = p.token_address as `0x${string}`;
-      const balance = await tokenBalance(client, token, address);
-      if (balance === 0n) continue;
-      const decimals = Number(p.decimals || 18);
-      const unitQuote = await quoteSell(client, token, 10n ** BigInt(decimals));
-      const currentUsd = Number(unitQuote) / 1e18 * monUsd;
-      const last = Number(p.last_price_usd || p.entry_price_usd || 0);
-      const changePct = last > 0 && currentUsd > 0 ? ((currentUsd - last) / last) * 100 : 0;
-      if (changePct <= -15) {
-        const totalQuote = await quoteSell(client, token, balance);
-        await notifyTelegram(env, `🚨 Ciel emergency exit candidate\nToken: ${token}\nMove: ${changePct.toFixed(2)}%\nPrice: $${currentUsd.toFixed(8)}\nQuote: ${(Number(totalQuote) / 1e18).toFixed(6)} MON`);
-        if (env.TRADING_ENABLED === "true" && env.PAPER_TRADING !== "true" && env.WALLET_PRIVATE_KEY) {
-          const amountOutMin = totalQuote * BigInt(10000 - PAPER_SLIPPAGE_BPS) / 10000n;
-          const tx = await sellToNative({ rpcUrl: env.NAD_RPC_URL, privateKey: env.WALLET_PRIVATE_KEY, token, amountIn: balance, amountOutMin });
-          await env.DB.prepare("INSERT INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error) VALUES(?,?,?,?,?,?,?,?,?)").bind(token, Date.now(), "SELL", balance.toString(), currentUsd, tx, "live", "submitted", null).run();
-        }
+  if (!address) return;
+  const native = await publicClient(env.NAD_RPC_URL).getBalance({ address });
+  if (native === 0n) return;
+  const tokens = await env.DB.prepare("SELECT address,decimals FROM tokens WHERE graduated=1").all<{ address: string; decimals: number }>();
+  for (const row of tokens.results || []) {
+    const balance = await tokenBalance(publicClient(env.NAD_RPC_URL), row.address as `0x${string}`, address);
+    if (balance > 0n) {
+      const quote = await quoteSell(publicClient(env.NAD_RPC_URL), row.address as `0x${string}`, balance);
+      if (quote > 0n) {
+        const valueUsd = Number(quote) / 1e18 * monUsd;
+        if (valueUsd > 0) await writeRuntimeState(env, { lastHoldingCheck: Date.now(), paperUnrealizedPnlUsd: undefined });
       }
-      if (currentUsd > 0) await env.DB.prepare("UPDATE positions SET last_price_usd=?,updated_ts_ms=? WHERE token_address=?").bind(currentUsd, Date.now(), token).run();
-    } catch (error) { await notifyTelegram(env, `⚠️ Ciel holding check failed for ${p.token_address}: ${String(error).slice(0, 300)}`); }
+    }
   }
   await writeRuntimeState(env, { lastHoldingCheck: Date.now() });
 }
 
 async function runPaperPositionMonitoring(env: Env, monUsd: number) {
-  const rows = await env.DB.prepare(`SELECT p.token_address,p.quantity,p.entry_price_usd,t.decimals FROM positions p LEFT JOIN tokens t ON t.address=p.token_address WHERE ${positiveQuantitySql("p.quantity")}`).all<{ token_address: string; quantity: string; entry_price_usd: number; decimals: number }>();
-  const client = publicClient(env.NAD_RPC_URL);
-  let unrealizedUsd = 0;
-  for (const p of rows.results ?? []) {
-    try {
-      const token = p.token_address as `0x${string}`;
-      const decimals = Number(p.decimals || 18);
-      const qty = BigInt(p.quantity);
-      const quote = await quoteSell(client, token, qty);
-      const valueUsd = Number(quote) / 1e18 * monUsd;
-      const qtyUnits = Number(qty) / 10 ** decimals;
-      unrealizedUsd += valueUsd - Number(p.entry_price_usd || 0) * qtyUnits;
-      await env.DB.prepare("UPDATE positions SET last_price_usd=?,updated_ts_ms=? WHERE token_address=?").bind(qtyUnits > 0 ? valueUsd / qtyUnits : 0, Date.now(), token).run();
-    } catch (error) { await notifyTelegram(env, `⚠️ Ciel paper position monitor failed for ${p.token_address}: ${String(error).slice(0, 250)}`); }
+  const rows = await env.DB.prepare(`SELECT p.token_address,p.quantity,p.entry_price_usd,s.price_usd
+    FROM positions p LEFT JOIN market_snapshots s ON s.token_address=p.token_address
+    WHERE ${positiveQuantitySql("p.quantity")} AND s.ts_ms=(SELECT MAX(s2.ts_ms) FROM market_snapshots s2 WHERE s2.token_address=p.token_address)`).all<{ token_address: string; quantity: string; entry_price_usd: number; price_usd: number }>();
+  let totalUnrealized = 0;
+  for (const row of rows.results || []) {
+    const unrealized = (Number(row.price_usd) - Number(row.entry_price_usd || row.price_usd)) * Number(row.quantity);
+    totalUnrealized += unrealized;
+    const changePct = row.entry_price_usd > 0 ? ((row.price_usd - row.entry_price_usd) / row.entry_price_usd) * 100 : 0;
+    if (changePct <= -15) await notifyTelegram(env, `🚨 Ciel PAPER emergency exit candidate\nToken: ${row.token_address}\nMove: ${changePct.toFixed(2)}%\nAction: review/sell signal`);
   }
-  // Keep every two-minute quote/DB monitoring cycle intact; persist only durable telemetry every 10 minutes.
-  await writeRuntimeState(env, { paperUnrealizedPnlUsd: unrealizedUsd });
+  await writeRuntimeState(env, { lastHoldingCheck: Date.now(), paperUnrealizedPnlUsd: totalUnrealized });
+}
+
+async function runMarketCycle(env: Env) {
+  const result = await indexNadFun(env);
+  await writeRuntimeState(env, { lastMarketCycle: Date.now() });
+  if (result.snapshots > 0) await notifyTelegram(env, `📡 Ciel indexer\nSnapshots: ${result.snapshots}\nLatest block: ${result.latestBlock}`);
+  await runPaperSignalCycle(env);
 }
 
 async function runPaperSignalCycle(env: Env) {
   if (env.PAPER_TRADING !== "true" || env.TRADING_ENABLED === "true") return;
-  await getPaperBalance(env);
-  const rows = await env.DB.prepare("SELECT id FROM signals WHERE consumed_ts_ms IS NULL AND action IN ('BUY','SELL') ORDER BY ts_ms ASC LIMIT 10").all<{ id: number }>();
-  const id = env.TRADING_ENGINE.idFromName("paper");
-  const stub = env.TRADING_ENGINE.get(id);
-  for (const row of rows.results ?? []) await stub.fetch("https://ciel.internal/paper", { method: "POST", body: JSON.stringify({ action: "paper-signal", signalId: row.id }) });
-}
-
-async function runMarketCycle(env: Env) {
-  try {
-    const result = await indexNadFun(env, 3000);
-    await writeRuntimeState(env, { lastMarketCycle: Date.now() });
-    if (result) await notifyTelegram(env, `📡 Ciel indexer\nBlocks: ${result.fromBlock}-${result.toBlock}\nCreate ${result.creates} | Buy ${result.buys} | Sell ${result.sells} | Graduate ${result.graduates} | Sync ${result.syncs} | Snapshots ${result.snapshots}`);
-  } catch (error) {
-    await writeRuntimeState(env, { lastMarketCycle: Date.now() });
-    await notifyTelegram(env, `⚠️ Ciel market cycle failed: ${String(error).slice(0, 400)}`);
+  const rows = await env.DB.prepare("SELECT id FROM signals WHERE consumed_ts_ms IS NULL ORDER BY ts_ms ASC LIMIT 10").all<{ id: number }>();
+  for (const row of rows.results || []) {
+    await env.TRADING_ENGINE.idFromName(`signal-${row.id}`).toString();
+    const stub = env.TRADING_ENGINE.get(env.TRADING_ENGINE.idFromName(`signal-${row.id}`));
+    await stub.fetch("https://ciel/paper-signal", { method: "POST", body: JSON.stringify({ action: "paper-signal", signalId: row.id }) });
   }
 }
 
 async function runModelMaintenance(env: Env) {
-  const tokens = await env.DB.prepare("SELECT address FROM tokens WHERE market_cap_usd > 0 AND liquidity_usd > 0 ORDER BY market_cap_usd DESC,last_seen_ms DESC LIMIT 25").all<{ address: string }>();
-  let analyzed = 0;
-  for (const row of tokens.results ?? []) {
-    const data = await env.DB.prepare("SELECT token_address AS token,ts_ms AS tsMs,price_usd AS priceUsd,market_cap_usd AS marketCapUsd,liquidity_usd AS liquidityUsd,volume_5m_usd AS volume5mUsd,buys_5m AS buys5m,sells_5m AS sells5m,holders FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 288").bind(row.address).all<Snapshot>();
-    const snapshots = (data.results ?? []).reverse();
-    if (snapshots.length < 12) continue;
-    const baseline = buildBaseline(snapshots);
-    const current = snapshots[snapshots.length - 1];
-    const score = deviationScore(current, baseline);
-    if (score < 0.45) continue;
-    const [market, regime] = await Promise.all([
-      askGemini(env.GEMINI_API_KEY_1, env.GEMINI_MODEL, "market", current, baseline, score),
-      askGemini(env.GEMINI_API_KEY_2, env.GEMINI_MODEL, "regime", current, baseline, score)
-    ]);
-    const chosen = regime && market && regime.confidence >= market.confidence ? regime : market;
-    if (!chosen) continue;
-    const confidence = Math.max(0, Math.min(1, chosen.confidence));
-    const anomaly = Math.max(0, Math.min(1, Math.max(score, Number(chosen.anomalyScore) || 0)));
-    const action = chosen.action === "BUY" && confidence >= 0.72 ? "BUY" : chosen.action === "SELL" && confidence >= 0.72 ? "SELL" : "HOLD";
-    const inserted = await env.DB.prepare("INSERT INTO signals(token_address,ts_ms,action,confidence,expected_low,expected_high,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id").bind(row.address, Date.now(), action, confidence, chosen.expectedLowUsd, chosen.expectedHighUsd, anomaly, "gemini-dual", chosen.rationale.slice(0, 1000)).first<{ id: number }>();
-    await notifyTelegram(env, `🧠 Ciel ${action}\nToken: ${row.address}\nConfidence: ${(confidence * 100).toFixed(1)}%\nAnomaly: ${anomaly.toFixed(2)}\nRegime: ${chosen.regime}\n${chosen.rationale.slice(0, 500)}`);
-    if (inserted?.id) await runPaperSignalById(env, inserted.id);
-    analyzed++;
+  const snapshots = await env.DB.prepare("SELECT token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,buy_volume_usd,sell_volume_usd FROM market_snapshots ORDER BY ts_ms DESC LIMIT 500").all<Snapshot>();
+  const baseline = buildBaseline(snapshots.results || []);
+  const analyzed = snapshots.results?.slice(0, 50) || [];
+  const signals = [];
+  for (const snapshot of analyzed) {
+    const score = deviationScore(snapshot, baseline);
+    const ai = await askGemini(env, snapshot, score);
+    signals.push({ snapshot, score, ai });
   }
-  await runPaperSignalCycle(env);
-  await writeRuntimeState(env, { lastModelMaintenance: Date.now(), lastModelAnalyzed: analyzed });
-}
-
-async function runPaperSignalById(env: Env, signalId: number) {
-  if (env.PAPER_TRADING !== "true" || env.TRADING_ENABLED === "true") return;
-  const id = env.TRADING_ENGINE.idFromName("paper");
-  await env.TRADING_ENGINE.get(id).fetch("https://ciel.internal/paper", { method: "POST", body: JSON.stringify({ action: "paper-signal", signalId }) });
+  for (const item of signals) {
+    const action = item.ai.action === "BUY" || item.ai.action === "SELL" ? item.ai.action : "HOLD";
+    await env.DB.prepare("INSERT INTO signals(token_address,ts_ms,action,confidence,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?)").bind(item.snapshot.token_address, item.snapshot.ts_ms, action, item.ai.confidence, item.score, env.GEMINI_MODEL, item.ai.rationale).run();
+  }
+  await writeRuntimeState(env, { lastModelMaintenance: Date.now(), lastModelAnalyzed: analyzed.length });
+  if (signals.length > 0) await notifyTelegram(env, `🧠 Ciel model\nAnalyzed: ${signals.length}\nSignals: ${signals.map(s => `${s.ai.action} ${s.ai.confidence.toFixed(2)}`).join(", ")}`);
 }
 
 async function status(env: Env) {
   const state = await readRuntimeState(env);
-  const [indexer, balance, realized] = await Promise.all([
-    env.CIEL_STATE.get("indexer_state"),
-    env.CIEL_STATE.get(PAPER_BALANCE_KEY),
-    env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY)
-  ]);
+  const indexerRaw = await env.CIEL_STATE.get("indexer_state");
   let indexerState: { nextBlock?: string; latestBlock?: string; lastSnapshotCount?: number; lastRunMs?: number } = {};
-  try { if (indexer) indexerState = JSON.parse(indexer); } catch {}
+  try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch { /* ignore malformed telemetry */ }
+  const balance = await getPaperBalance(env);
+  const realized = Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0");
   return {
-    service: "ciel",
+    ok: true,
     tradingEnabled: env.TRADING_ENABLED === "true",
     paperTrading: env.PAPER_TRADING === "true",
-    lastHoldingCheck: state.lastHoldingCheck ?? null,
+    paperBalanceMon: balance,
+    paperRealizedPnlUsd: realized,
+    paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true",
+    paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"),
+    lastHoldingCheck: state.lastHoldingCheck || null,
     lastMarketCycle: indexerState.lastRunMs ?? null,
-    lastModelMaintenance: state.lastModelMaintenance ?? null,
-    indexerNextBlock: indexerState.nextBlock ?? null,
-    indexerLatestBlock: indexerState.latestBlock ?? null,
-    lastModelAnalyzed: state.lastModelAnalyzed ?? null,
-    monUsd: state.monUsd ?? null,
-    lastSnapshotCount: indexerState.lastSnapshotCount ?? null,
-    paperBalanceMon: balance ?? String(PAPER_INITIAL_BALANCE_MON),
-    paperRealizedPnlUsd: realized ?? "0",
-    paperUnrealizedPnlUsd: state.paperUnrealizedPnlUsd ?? "0",
-    paperExecutionFailureCount: state.paperFailureCount ?? 0,
-    paperExecutionCircuitOpen: state.paperCircuitOpen ?? false
+    lastModelMaintenance: state.lastModelMaintenance || null,
+    lastModelAnalyzed: state.lastModelAnalyzed || null,
+    monUsd: state.monUsd || null,
+    nextBlock: indexerState.nextBlock || null,
+    latestBlock: indexerState.latestBlock || null,
+    lastSnapshotCount: indexerState.lastSnapshotCount || 0
   };
 }
 
-function json(data: unknown, status = 200) { return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8" } }); }
+function json(data: unknown) { return new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } }); }
