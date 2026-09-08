@@ -22,7 +22,7 @@ export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: numb
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA: R2Bucket; NAD_RPC_URL?: string };
 
 const INDEXER_STATE_KEY = "indexer_state";
-type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number };
+type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
 async function monUsd(env: IndexEnv): Promise<number> {
   const cached = Number(await env.CIEL_STATE.get("mon_usd"));
@@ -31,8 +31,6 @@ async function monUsd(env: IndexEnv): Promise<number> {
     if (!r.ok) return cached > 0 ? cached : 0;
     const j = await r.json() as { monad?: { usd?: number } };
     const price = Number(j.monad?.usd || 0);
-    // Do not write every market cycle. The Worker cache handles short-lived freshness;
-    // the KV value is only a durable fallback initialized when absent.
     if (price > 0 && !(cached > 0)) await env.CIEL_STATE.put("mon_usd", String(price), { expirationTtl: 3600 });
     return price > 0 ? price : cached > 0 ? cached : 0;
   } catch { return cached > 0 ? cached : 0; }
@@ -58,7 +56,6 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = 3000): Promise<Inde
   const stateRaw = await env.CIEL_STATE.get(INDEXER_STATE_KEY);
   const state = stateRaw ? JSON.parse(stateRaw) as IndexerState : null;
   const cursorRaw = state?.nextBlock ?? await env.CIEL_STATE.get("indexer_next_block");
-  // Initial learning window: approximately 24h at Monad's ~0.4s block cadence.
   const fromBlock = cursorRaw ? BigInt(cursorRaw) : (latest > 216_000n ? latest - 216_000n : 73_857_231n);
   if (fromBlock > latest) return null;
   const toBlock = fromBlock + BigInt(maxBlocks - 1) > latest ? latest : fromBlock + BigInt(maxBlocks - 1);
@@ -138,7 +135,7 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = 3000): Promise<Inde
     snapshots++;
   }
 
-  // One KV write per successful market cycle instead of three.
-  await env.CIEL_STATE.put(INDEXER_STATE_KEY, JSON.stringify({ nextBlock: (toBlock + 1n).toString(), latestBlock: latest.toString(), lastSnapshotCount: snapshots } satisfies IndexerState));
+  // Keep the cursor, telemetry, and market-cycle timestamp together in one KV record.
+  await env.CIEL_STATE.put(INDEXER_STATE_KEY, JSON.stringify({ nextBlock: (toBlock + 1n).toString(), latestBlock: latest.toString(), lastSnapshotCount: snapshots, lastRunMs: ts } satisfies IndexerState));
   return { fromBlock, toBlock, creates: creates.length, buys: buys.length, sells: sells.length, graduates: graduates.length, syncs: syncs.length, snapshots, nextBlock: toBlock + 1n };
 }
