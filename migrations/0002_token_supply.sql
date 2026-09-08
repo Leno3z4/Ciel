@@ -1,0 +1,2 @@
+ALTER TABLE tokens ADD COLUMN total_supply TEXT;
+ALTER TABLE tokens ADD COLUMN decimals INTEGER;
