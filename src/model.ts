@@ -95,7 +95,7 @@ function validDecision(value: unknown): value is GeminiDecision {
   const x = value as Record<string, unknown>;
   return ["BUY", "HOLD", "SELL", "IGNORE"].includes(String(x.action)) &&
     Number.isFinite(Number(x.confidence)) && Number(x.confidence) >= 0 && Number(x.confidence) <= 1 &&
-    Number.isFinite(Number(x.anomalyScore)) &&
+    Number.isFinite(Number(x.anomalyScore)) && Number(x.anomalyScore) >= 0 && Number(x.anomalyScore) <= 1 &&
     Number.isFinite(Number(x.expectedLowUsd)) && Number(x.expectedLowUsd) >= 0 &&
     Number.isFinite(Number(x.expectedHighUsd)) && Number(x.expectedHighUsd) >= 0 &&
     ["ACCUMULATION", "TREND", "DISTRIBUTION", "PANIC", "UNKNOWN"].includes(String(x.regime)) &&
@@ -103,9 +103,13 @@ function validDecision(value: unknown): value is GeminiDecision {
 }
 
 export async function askGemini(apiKey: string | undefined, model: string, role: "market" | "regime", snapshot: Snapshot, baseline: Baseline, score: number): Promise<GeminiDecision | null> {
-  if (!apiKey) return null;
+  if (!apiKey) throw new Error("GEMINI_API_KEY_1 or GEMINI_API_KEY_2 is not configured");
+  if (!model?.trim()) throw new Error("GEMINI_MODEL is not configured");
+  if (!Number.isFinite(score)) throw new Error("Gemini anomaly score is not finite");
+
   const ai = new GoogleGenAI({ apiKey });
   const prompt = `${role === "market" ? "You are Ciel's market analyst." : "You are Ciel's regime/deviation analyst."}\nAnalyze the supplied token data against its token-specific historical baseline. Do not claim certainty or profitability. Never invent market data. BUY only when evidence supports a favorable risk/reward versus the observed baseline; otherwise prefer HOLD or IGNORE. SELL is for evidence of distribution, panic, or a deteriorating held position. Return only the requested JSON.\nSnapshot: ${JSON.stringify(snapshot)}\nBaseline: ${JSON.stringify(baseline)}\nDeterministic anomaly score: ${score.toFixed(4)}`;
+
   try {
     const response = await ai.models.generateContent({
       model,
@@ -127,9 +131,18 @@ export async function askGemini(apiKey: string | undefined, model: string, role:
         }
       }
     });
-    const parsed: unknown = JSON.parse(response.text || "null");
-    return validDecision(parsed) ? parsed : null;
-  } catch {
-    return null;
+    const raw = response.text || "";
+    if (!raw.trim()) throw new Error("Gemini returned an empty response");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Gemini returned invalid JSON: ${raw.slice(0, 500)}`);
+    }
+    if (!validDecision(parsed)) throw new Error(`Gemini returned an invalid decision: ${raw.slice(0, 800)}`);
+    return parsed;
+  } catch (error) {
+    const message = String(error).replace(/^Error:\s*/, "").slice(0, 1000);
+    throw new Error(message || "Gemini request failed");
   }
 }
