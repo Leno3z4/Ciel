@@ -1,5 +1,4 @@
 import base, { type Env, TradingEngine } from "./index";
-import { recoverFactoryMarkets } from "./factory_recovery";
 
 export { TradingEngine };
 
@@ -34,13 +33,6 @@ const worker = {
     return statusWithDiagnostics(request, env);
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    if (controller.cron === "*/3 * * * *") {
-      ctx.waitUntil((async () => {
-        try { await recoverFactoryMarkets(env); } catch (error) { console.error(`Factory recovery failed: ${String(error).slice(0, 500)}`); }
-        await base.scheduled(controller, env, ctx);
-      })());
-      return;
-    }
     await base.scheduled(controller, env, ctx);
   }
 };
