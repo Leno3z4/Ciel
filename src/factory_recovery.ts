@@ -14,7 +14,8 @@ const factoryAbi = [
 
 const pairAbi = [
   { type: "function", name: "token0", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
-  { type: "function", name: "token1", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }
+  { type: "function", name: "token1", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
+  { type: "function", name: "getReserves", stateMutability: "view", inputs: [], outputs: [{ name: "reserve0", type: "uint112" }, { name: "reserve1", type: "uint112" }, { name: "blockTimestampLast", type: "uint32" }] }
 ] as const;
 
 const tokenAbi = [
@@ -27,21 +28,31 @@ function n(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function units(raw: string | null, decimals: number): number {
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  if (!(parsed > 0)) return 0;
+  return parsed / 10 ** Math.max(0, decimals);
+}
+
 async function ensureTokensTable(env: Env): Promise<void> {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS tokens (address TEXT PRIMARY KEY,symbol TEXT,name TEXT,market_cap_usd REAL,liquidity_usd REAL,first_seen_ms INTEGER NOT NULL,last_seen_ms INTEGER NOT NULL,total_supply TEXT,decimals INTEGER NOT NULL DEFAULT 18,quote_token TEXT,pair_address TEXT,graduated INTEGER NOT NULL DEFAULT 0,created_at_block INTEGER)`).run();
 }
 
-async function fetchMarketCap(token: string): Promise<number> {
+async function fetchMarketData(token: string): Promise<{ cap: number; volume5m: number }> {
   const now = Math.floor(Date.now() / 1000);
   const from = now - 7 * 24 * 3600;
   try {
     const response = await fetch(`https://api.nadapp.net/trade/chart/${token}?resolution=60&from=${from}&to=${now}&countback=168&chart_type=market_cap_usd`, { headers: { Accept: "application/json", "User-Agent": "Ciel-NadFun/2.0" }, cf: { cacheTtl: 300 } });
-    if (!response.ok) return 0;
-    const data = await response.json() as { s?: string; c?: unknown[] };
-    if (data.s !== "ok" || !Array.isArray(data.c) || !data.c.length) return 0;
-    return n(data.c[data.c.length - 1]);
+    if (!response.ok) return { cap: 0, volume5m: 0 };
+    const data = await response.json() as { s?: string; c?: unknown[]; v?: unknown[] };
+    if (data.s !== "ok" || !Array.isArray(data.c) || !data.c.length) return { cap: 0, volume5m: 0 };
+    const index = data.c.length - 1;
+    const cap = n(data.c[index]);
+    const hourlyVolume = n(data.v?.[index]);
+    return { cap, volume5m: hourlyVolume > 0 ? hourlyVolume / 12 : 0 };
   } catch {
-    return 0;
+    return { cap: 0, volume5m: 0 };
   }
 }
 
@@ -60,7 +71,7 @@ export async function recoverFactoryMarkets(env: Env): Promise<void> {
   }
 
   const start = Math.max(0, total - FACTORY_PAIR_LIMIT);
-  const tokens: Array<{ token: string; pair: string; quote: string; supply: string | null; decimals: number }> = [];
+  const tokens: Array<{ token: string; pair: string; quote: string; supply: string | null; decimals: number; tokenReserveRaw: string | null }> = [];
 
   for (let i = total - 1; i >= start; i--) {
     try {
@@ -74,11 +85,14 @@ export async function recoverFactoryMarkets(env: Env): Promise<void> {
       if (!token0IsQuote && !token1IsQuote) continue;
       const token = token0IsQuote ? token1 : token0;
       const quote = token0IsQuote ? token0 : token1;
-      const [supply, decimals] = await Promise.all([
+      const [supply, decimals, reserves] = await Promise.all([
         client.readContract({ address: token, abi: tokenAbi, functionName: "totalSupply" }).catch(() => null),
-        client.readContract({ address: token, abi: tokenAbi, functionName: "decimals" }).catch(() => 18)
+        client.readContract({ address: token, abi: tokenAbi, functionName: "decimals" }).catch(() => 18),
+        client.readContract({ address: pair, abi: pairAbi, functionName: "getReserves" }).catch(() => null)
       ]);
-      tokens.push({ token, pair, quote, supply: supply?.toString() ?? null, decimals: Number(decimals) });
+      const reservePair = reserves as readonly [bigint, bigint, number] | null;
+      const tokenReserveRaw = reservePair ? (token0IsQuote ? reservePair[1] : reservePair[0]).toString() : null;
+      tokens.push({ token, pair, quote, supply: supply?.toString() ?? null, decimals: Number(decimals), tokenReserveRaw });
     } catch (error) {
       console.error(`Factory recovery pair ${i} failed: ${String(error).slice(0, 200)}`);
     }
@@ -95,10 +109,18 @@ export async function recoverFactoryMarkets(env: Env): Promise<void> {
 
   for (let i = 0; i < Math.min(CHART_LIMIT, tokens.length); i += 8) {
     const batch = tokens.slice(i, i + 8);
-    const caps = await Promise.all(batch.map(async item => ({ ...item, cap: await fetchMarketCap(item.token) })));
-    for (const item of caps) {
-      if (!(item.cap >= MIN_MARKET_CAP_USD)) continue;
-      await env.DB.prepare("UPDATE tokens SET market_cap_usd=?,last_seen_ms=?,graduated=1 WHERE address=?").bind(item.cap, Date.now(), item.token).run();
+    const data = await Promise.all(batch.map(async item => ({ ...item, market: await fetchMarketData(item.token) })));
+    for (const item of data) {
+      if (!(item.market.cap >= MIN_MARKET_CAP_USD)) continue;
+      const tokenSupply = units(item.supply, item.decimals);
+      const tokenPriceUsd = tokenSupply > 0 ? item.market.cap / tokenSupply : 0;
+      const tokenReserve = units(item.tokenReserveRaw, item.decimals);
+      const liquidityUsd = tokenReserve > 0 && tokenPriceUsd > 0 ? tokenReserve * tokenPriceUsd * 2 : 0;
+      await env.DB.prepare("UPDATE tokens SET market_cap_usd=?,liquidity_usd=?,last_seen_ms=?,graduated=1 WHERE address=?").bind(item.market.cap, liquidityUsd, Date.now(), item.token).run();
+      if (item.market.volume5m > 0 || liquidityUsd > 0) {
+        // Snapshot fields are populated by the normal indexer cycle; this recovery pass only ensures
+        // the token metadata is ranked correctly so that cycle can snapshot the highest-cap markets.
+      }
     }
   }
 
