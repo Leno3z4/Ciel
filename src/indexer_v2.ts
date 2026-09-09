@@ -20,7 +20,7 @@ const RANKING_FETCH_TS_KEY = "nadfun_market_ranking_fetch_ms";
 const MARKET_LIMIT = 50;
 const SNAPSHOT_LIMIT = 12;
 const MIN_MARKET_CAP_USD = 90_000;
-const LOG_RANGE_BLOCKS = 600;
+const LOG_RANGE_BLOCKS = 100;
 const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
 const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
 const API_BASE = "https://api.nadapp.net";
@@ -332,9 +332,9 @@ async function writeSnapshot(env: IndexEnv, token: string, item: TokenRecord, st
   const px = priceUsd(item);
   const liq = liquidityUsd(item, monUsd);
   if (!(cap >= MIN_MARKET_CAP_USD) || !(px > 0)) return false;
-  const quoteUsdMultiplier = monUsd > 0 ? monUsd / 1e18 : 0;
-  const buyVolumeUsd = Number(stats.buyQuoteWei) * quoteUsdMultiplier;
-  const sellVolumeUsd = Number(stats.sellQuoteWei) * quoteUsdMultiplier;
+  const quoteUsdMultiplier = monUsd > 0 ? monUsd : 0;
+  const buyVolumeUsd = Number(stats.buyQuoteWei) / 1e18 * quoteUsdMultiplier;
+  const sellVolumeUsd = Number(stats.sellQuoteWei) / 1e18 * quoteUsdMultiplier;
   await env.DB.prepare(`INSERT INTO market_snapshots(token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,buys_5m,sells_5m,holders,quote_token,buy_volume_usd,sell_volume_usd,source_block)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
     token,
