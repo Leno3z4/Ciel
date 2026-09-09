@@ -16,26 +16,35 @@ export interface Baseline {
   samples: number;
   meanPrice: number;
   medianPrice: number;
+  meanMarketCap: number;
+  medianMarketCap: number;
   meanVolume5m: number;
   meanLiquidity: number;
-  volatilityPct: number;
-  maxDrawdownPct: number;
+  marketCapVolatilityPct: number;
+  maxMarketCapDrawdownPct: number;
   buySellRatio: number;
-  priceP10: number;
-  priceP90: number;
+  marketCapP10: number;
+  marketCapP90: number;
 }
 
 export interface PatternProfile {
   historySamples: number;
   ageHours: number;
-  currentReturn5mPct: number;
-  currentReturn30mPct: number;
-  currentReturn2hPct: number;
+  hourOfDayUtc: number;
+  sameHourSamples: number;
+  currentMarketCapUsd: number;
+  currentMarketCapReturn5mPct: number;
+  currentMarketCapReturn30mPct: number;
+  currentMarketCapReturn2hPct: number;
+  marketCapVsMedian: number;
+  marketCapVsMean: number;
+  sameHourMarketCapVsBaseline: number;
+  marketCapPositionPct: number;
   volumeVsBaseline: number;
   liquidityVsBaseline: number;
   buyPressure: number;
   priceVsMedian: number;
-  drawdownFromHistoryPeakPct: number;
+  drawdownFromMarketCapPeakPct: number;
   regimeHint: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";
 }
 
@@ -49,112 +58,115 @@ export interface GeminiDecision {
   rationale: string;
 }
 
-function mean(xs: number[]): number {
-  return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
-}
-
+function mean(xs: number[]): number { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0; }
 function percentile(xs: number[], p: number): number {
   if (!xs.length) return 0;
   const sorted = [...xs].sort((a, b) => a - b);
   const index = (sorted.length - 1) * p;
-  const lo = Math.floor(index);
-  const hi = Math.ceil(index);
+  const lo = Math.floor(index); const hi = Math.ceil(index);
   return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (index - lo);
 }
+function pctChange(current: number, previous: number): number { return previous > 0 ? ((current - previous) / previous) * 100 : 0; }
 
-function pctChange(current: number, previous: number): number {
-  return previous > 0 ? ((current - previous) / previous) * 100 : 0;
-}
-
-function historyPriceBefore(rows: Snapshot[], msAgo: number): number {
+function historyValueBefore(rows: Snapshot[], msAgo: number, key: keyof Pick<Snapshot, "priceUsd" | "marketCapUsd">): number {
   const newestTs = rows[0]?.tsMs || 0;
   const target = newestTs - msAgo;
-  return rows.find(r => r.tsMs <= target && r.priceUsd > 0)?.priceUsd || 0;
+  return rows.find(r => r.tsMs <= target && Number(r[key]) > 0)?.[key] || 0;
 }
+
+function meanFinite(values: number[]): number { return mean(values.filter(v => Number.isFinite(v) && v > 0)); }
 
 export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
   if (!rows.length) return {
-    historySamples: 0, ageHours: 0, currentReturn5mPct: 0, currentReturn30mPct: 0, currentReturn2hPct: 0,
-    volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0, priceVsMedian: 0, drawdownFromHistoryPeakPct: 0, regimeHint: "UNKNOWN"
+    historySamples: 0, ageHours: 0, hourOfDayUtc: 0, sameHourSamples: 0, currentMarketCapUsd: 0,
+    currentMarketCapReturn5mPct: 0, currentMarketCapReturn30mPct: 0, currentMarketCapReturn2hPct: 0,
+    marketCapVsMedian: 0, marketCapVsMean: 0, sameHourMarketCapVsBaseline: 0, marketCapPositionPct: 0,
+    volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0.5, priceVsMedian: 0,
+    drawdownFromMarketCapPeakPct: 0, regimeHint: "UNKNOWN"
   };
   const current = rows[0];
   const oldest = rows[rows.length - 1];
-  const fiveMin = historyPriceBefore(rows, 5 * 60 * 1000);
-  const thirtyMin = historyPriceBefore(rows, 30 * 60 * 1000);
-  const twoHour = historyPriceBefore(rows, 2 * 60 * 60 * 1000);
+  const caps = rows.map(r => Number(r.marketCapUsd)).filter(v => Number.isFinite(v) && v > 0);
+  const prices = rows.map(r => Number(r.priceUsd)).filter(v => Number.isFinite(v) && v > 0);
+  const capMean = mean(caps); const capMedian = percentile(caps, 0.5);
+  const capPeak = caps.length ? Math.max(...caps) : current.marketCapUsd;
+  const drawdown = capPeak > 0 ? ((capPeak - current.marketCapUsd) / capPeak) * 100 : 0;
+  const fiveMin = historyValueBefore(rows, 5 * 60 * 1000, "marketCapUsd");
+  const thirtyMin = historyValueBefore(rows, 30 * 60 * 1000, "marketCapUsd");
+  const twoHour = historyValueBefore(rows, 2 * 60 * 60 * 1000, "marketCapUsd");
   const volumes = rows.map(r => Math.max(0, r.volume5mUsd));
   const liquidity = rows.map(r => Math.max(0, r.liquidityUsd));
-  const meanVolume = mean(volumes);
-  const meanLiquidity = mean(liquidity);
-  const priceSeries = rows.map(r => r.priceUsd).filter(p => Number.isFinite(p) && p > 0);
-  const peak = priceSeries.length ? Math.max(...priceSeries) : current.priceUsd;
-  const drawdown = peak > 0 ? ((peak - current.priceUsd) / peak) * 100 : 0;
+  const meanVolume = meanFinite(volumes); const meanLiquidity = meanFinite(liquidity);
+  const currentHour = new Date(current.tsMs).getUTCHours();
+  const sameHour = rows.filter(r => new Date(r.tsMs).getUTCHours() === currentHour && r.marketCapUsd > 0).map(r => r.marketCapUsd);
+  const sameHourMean = mean(sameHour);
+  const range = caps.length ? Math.max(caps[caps.length - 1] ?? 0, Math.max(...caps)) - Math.min(...caps) : 0;
+  const marketCapPositionPct = range > 0 ? ((current.marketCapUsd - Math.min(...caps)) / range) * 100 : 50;
   const flow = Math.max(0, current.buys5m) + Math.max(0, current.sells5m);
-  const buyPressure = flow > 0 ? current.buys5m / flow : 0.5;
-  const median = percentile(priceSeries, 0.5);
-  const currentReturn5mPct = pctChange(current.priceUsd, fiveMin);
-  const currentReturn30mPct = pctChange(current.priceUsd, thirtyMin);
-  const currentReturn2hPct = pctChange(current.priceUsd, twoHour);
+  const buyPressure = flow > 0 ? Math.max(0, current.buys5m) / flow : 0.5;
+  const priceMedian = percentile(prices, 0.5);
+  const capReturn30 = pctChange(current.marketCapUsd, thirtyMin);
   let regimeHint: PatternProfile["regimeHint"] = "UNKNOWN";
   if (drawdown >= 25 && buyPressure < 0.4) regimeHint = "PANIC";
-  else if (drawdown >= 15 && buyPressure < 0.45) regimeHint = "DISTRIBUTION";
-  else if (currentReturn30mPct > 8 && buyPressure >= 0.55) regimeHint = "TREND";
-  else if (Math.abs(currentReturn30mPct) <= 5 && buyPressure >= 0.55) regimeHint = "ACCUMULATION";
+  else if (drawdown >= 15 && capReturn30 < -5) regimeHint = "DISTRIBUTION";
+  else if (capReturn30 > 8 && buyPressure >= 0.45) regimeHint = "TREND";
+  else if (Math.abs(capReturn30) <= 5 && buyPressure >= 0.45) regimeHint = "ACCUMULATION";
   return {
     historySamples: rows.length,
     ageHours: Math.max(0, (Date.now() - oldest.tsMs) / 3600000),
-    currentReturn5mPct,
-    currentReturn30mPct,
-    currentReturn2hPct,
+    hourOfDayUtc: currentHour,
+    sameHourSamples: sameHour.length,
+    currentMarketCapUsd: current.marketCapUsd,
+    currentMarketCapReturn5mPct: pctChange(current.marketCapUsd, fiveMin),
+    currentMarketCapReturn30mPct: capReturn30,
+    currentMarketCapReturn2hPct: pctChange(current.marketCapUsd, twoHour),
+    marketCapVsMedian: capMedian > 0 ? current.marketCapUsd / capMedian : 0,
+    marketCapVsMean: capMean > 0 ? current.marketCapUsd / capMean : 0,
+    sameHourMarketCapVsBaseline: sameHourMean > 0 ? current.marketCapUsd / sameHourMean : 0,
+    marketCapPositionPct,
     volumeVsBaseline: meanVolume > 0 ? current.volume5mUsd / meanVolume : 0,
     liquidityVsBaseline: meanLiquidity > 0 ? current.liquidityUsd / meanLiquidity : 0,
     buyPressure,
-    priceVsMedian: median > 0 ? current.priceUsd / median : 0,
-    drawdownFromHistoryPeakPct: drawdown,
+    priceVsMedian: priceMedian > 0 ? current.priceUsd / priceMedian : 0,
+    drawdownFromMarketCapPeakPct: drawdown,
     regimeHint
   };
 }
 
 export function buildBaseline(rows: Snapshot[]): Baseline {
   const prices = rows.map(r => r.priceUsd).filter(Number.isFinite).filter(p => p > 0);
-  if (!prices.length) return { samples: 0, meanPrice: 0, medianPrice: 0, meanVolume5m: 0, meanLiquidity: 0, volatilityPct: 0, maxDrawdownPct: 0, buySellRatio: 1, priceP10: 0, priceP90: 0 };
-
-  const returns = prices.slice(1).map((p, i) => prices[i] > 0 ? Math.log(p / prices[i]) * 100 : 0).filter(Number.isFinite);
-  const avgReturn = mean(returns);
-  const variance = mean(returns.map(x => (x - avgReturn) ** 2));
-  let peak = prices[0];
-  let maxDrawdownPct = 0;
-  for (const price of prices) {
-    peak = Math.max(peak, price);
-    if (peak > 0) maxDrawdownPct = Math.max(maxDrawdownPct, ((peak - price) / peak) * 100);
-  }
+  const caps = rows.map(r => r.marketCapUsd).filter(Number.isFinite).filter(c => c > 0);
+  if (!prices.length || !caps.length) return { samples: 0, meanPrice: 0, medianPrice: 0, meanMarketCap: 0, medianMarketCap: 0, meanVolume5m: 0, meanLiquidity: 0, marketCapVolatilityPct: 0, maxMarketCapDrawdownPct: 0, buySellRatio: 1, marketCapP10: 0, marketCapP90: 0 };
+  const capReturns = caps.slice(1).map((cap, i) => caps[i] > 0 ? Math.log(cap / caps[i]) * 100 : 0).filter(Number.isFinite);
+  const avgReturn = mean(capReturns);
+  const variance = mean(capReturns.map(x => (x - avgReturn) ** 2));
+  let peak = caps[0]; let maxMarketCapDrawdownPct = 0;
+  for (const cap of caps) { peak = Math.max(peak, cap); if (peak > 0) maxMarketCapDrawdownPct = Math.max(maxMarketCapDrawdownPct, ((peak - cap) / peak) * 100); }
   const buys = rows.reduce((n, r) => n + Math.max(0, r.buys5m), 0);
   const sells = rows.reduce((n, r) => n + Math.max(0, r.sells5m), 0);
   return {
-    samples: prices.length,
-    meanPrice: mean(prices),
-    medianPrice: percentile(prices, 0.5),
+    samples: caps.length,
+    meanPrice: mean(prices), medianPrice: percentile(prices, 0.5),
+    meanMarketCap: mean(caps), medianMarketCap: percentile(caps, 0.5),
     meanVolume5m: mean(rows.map(r => Math.max(0, r.volume5mUsd))),
     meanLiquidity: mean(rows.map(r => Math.max(0, r.liquidityUsd))),
-    volatilityPct: Math.sqrt(variance),
-    maxDrawdownPct,
+    marketCapVolatilityPct: Math.sqrt(variance),
+    maxMarketCapDrawdownPct,
     buySellRatio: sells ? buys / sells : buys ? buys : 1,
-    priceP10: percentile(prices, 0.10),
-    priceP90: percentile(prices, 0.90)
+    marketCapP10: percentile(caps, 0.10), marketCapP90: percentile(caps, 0.90)
   };
 }
 
 export function deviationScore(current: Snapshot, baseline: Baseline): number {
-  if (!baseline.samples || current.priceUsd <= 0) return 0;
-  const volumeDev = baseline.meanVolume5m > 0 ? Math.abs(current.volume5mUsd - baseline.meanVolume5m) / baseline.meanVolume5m : 0;
-  const liquidityDev = baseline.meanLiquidity > 0 ? Math.abs(current.liquidityUsd - baseline.meanLiquidity) / baseline.meanLiquidity : 0;
-  const priceDev = baseline.medianPrice > 0 ? Math.abs(Math.log(current.priceUsd / baseline.medianPrice)) : 0;
+  if (!baseline.samples || current.marketCapUsd <= 0) return 0;
+  const marketCapDev = baseline.medianMarketCap > 0 ? Math.abs(Math.log(current.marketCapUsd / baseline.medianMarketCap)) : 0;
+  const marketCapRangeDev = baseline.marketCapP90 > baseline.marketCapP10 ? Math.min(1, Math.abs(current.marketCapUsd - baseline.medianMarketCap) / (baseline.marketCapP90 - baseline.marketCapP10)) : 0;
+  const liquidityDev = baseline.meanLiquidity > 0 ? Math.min(1, Math.abs(current.liquidityUsd - baseline.meanLiquidity) / baseline.meanLiquidity) : 0;
+  const volumeDev = baseline.meanVolume5m > 0 ? Math.min(1, Math.abs(current.volume5mUsd - baseline.meanVolume5m) / baseline.meanVolume5m) : 0;
+  const priceDev = baseline.medianPrice > 0 ? Math.min(1, Math.abs(Math.log(current.priceUsd / baseline.medianPrice))) : 0;
   const flow = Math.max(0, current.sells5m) + Math.max(0, current.buys5m);
   const imbalance = flow ? Math.abs(current.buys5m - current.sells5m) / flow : 0;
-  const drawdown = baseline.maxDrawdownPct > 0 && current.priceUsd < baseline.medianPrice
-    ? Math.min(1, ((baseline.medianPrice - current.priceUsd) / baseline.medianPrice) / Math.max(0.01, baseline.maxDrawdownPct / 100))
-    : 0;
-  return Math.min(1, volumeDev * 0.30 + liquidityDev * 0.15 + Math.min(1, priceDev) * 0.25 + imbalance * 0.20 + drawdown * 0.10);
+  return Math.min(1, marketCapDev * 0.30 + marketCapRangeDev * 0.25 + liquidityDev * 0.15 + volumeDev * 0.10 + priceDev * 0.10 + imbalance * 0.10);
 }
 
 function validDecision(value: unknown): value is GeminiDecision {
@@ -173,15 +185,13 @@ export async function askGemini(apiKey: string | undefined, model: string, role:
   if (!apiKey) throw new Error("GEMINI_API_KEY_1 or GEMINI_API_KEY_2 is not configured");
   if (!model?.trim()) throw new Error("GEMINI_MODEL is not configured");
   if (!Number.isFinite(score)) throw new Error("Gemini anomaly score is not finite");
-
   const ai = new GoogleGenAI({ apiKey });
   const prompt = `${role === "market" ? "You are Ciel's established-meme market analyst." : "You are Ciel's established-meme regime/deviation analyst."}
-The token has already passed Ciel's mature/high-volume market filter. Analyze its current behavior against its own historical baseline and its recent multi-horizon pattern profile. Do not claim certainty or profitability. Never invent market data. Do not reward novelty alone. Favor BUY only when the established token shows a favorable risk/reward setup such as sustained buy pressure, constructive momentum, and stable/improving liquidity. Prefer HOLD or IGNORE when evidence is weak. SELL is for distribution, panic, or a deteriorating held position. Return only the requested JSON.
+The primary signal is the token's MARKET CAP path over time. Ciel is studying already-created, established, high-volume meme markets, not chasing new launches. Use market-cap level, market-cap momentum, market-cap drawdown, market-cap position inside the token's historical range, and recurring UTC time-of-day behavior as the main evidence. Use price, liquidity, and volume as secondary context. Treat buys/sells and buy pressure only as confirmation, not as the main reason to enter. Compare current behavior with this token's own history and same-hour historical baseline. Favor BUY only when the market-cap pattern suggests a repeatable favorable entry regime with sufficient liquidity and risk/reward. Favor HOLD or IGNORE when evidence is weak or the setup depends mainly on novelty. SELL is for market-cap distribution, panic, or a deteriorating held position. Do not claim certainty or profitability and never invent data. Return only the requested JSON.
 Snapshot: ${JSON.stringify(snapshot)}
 Baseline: ${JSON.stringify(baseline)}
 Pattern profile: ${JSON.stringify(pattern || buildPatternProfile([snapshot]))}
-Deterministic anomaly score: ${score.toFixed(4)}`;
-
+Deterministic market-cap anomaly score: ${score.toFixed(4)}`;
   try {
     const response = await ai.models.generateContent({
       model,
@@ -206,11 +216,7 @@ Deterministic anomaly score: ${score.toFixed(4)}`;
     const raw = response.text || "";
     if (!raw.trim()) throw new Error("Gemini returned an empty response");
     let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      throw new Error(`Gemini returned invalid JSON: ${raw.slice(0, 500)}`);
-    }
+    try { parsed = JSON.parse(raw); } catch { throw new Error(`Gemini returned invalid JSON: ${raw.slice(0, 500)}`); }
     if (!validDecision(parsed)) throw new Error(`Gemini returned an invalid decision: ${raw.slice(0, 800)}`);
     return parsed;
   } catch (error) {
