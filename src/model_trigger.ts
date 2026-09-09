@@ -13,10 +13,10 @@ type Candidate = {
   samples: number;
   firstTs: number;
   lastTs: number;
-  avgVolume: number;
-  avgLiquidity: number;
   avgMarketCap: number;
 };
+
+type FeedToken = { token_info?: Record<string, unknown>; market_info?: Record<string, unknown>; [key: string]: unknown };
 
 const MIN_MARKET_CAP_USD = 90_000;
 const MIN_HISTORY_SAMPLES = 12;
@@ -27,6 +27,81 @@ const MAX_CANDIDATES = 10;
 const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
 const MODEL_COOLDOWN_PREFIX = "ciel_model_cooldown:";
 const RUNTIME_KEY = "ciel_runtime_state";
+const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
+const MON_USD_KEY = "mon_usd";
+
+function num(value: unknown): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (typeof value !== "string") return 0;
+  const text = value.trim().replace(/[$,\s]/g, "");
+  if (!text) return 0;
+  const match = text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(K|M|B|T)?$/i);
+  if (!match) { const parsed = Number(text); return Number.isFinite(parsed) ? parsed : 0; }
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return 0;
+  const multipliers: Record<string, number> = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
+  return base * (match[2] ? multipliers[match[2].toUpperCase()] : 1);
+}
+
+function objectValue(source: unknown, keys: string[]): unknown {
+  if (!source || typeof source !== "object") return null;
+  const obj = source as Record<string, unknown>;
+  for (const key of keys) if (obj[key] !== undefined && obj[key] !== null && obj[key] !== "") return obj[key];
+  return null;
+}
+
+function nestedNumber(item: FeedToken, tokenKeys: string[], marketKeys: string[]): number {
+  return num(objectValue(item.market_info, marketKeys)) || num(objectValue(item.token_info, tokenKeys));
+}
+
+function feedTokenAddress(item: FeedToken): string | null {
+  const value = objectValue(item.token_info, ["token_id", "token_address", "tokenAddress"]) || objectValue(item.market_info, ["token_id", "token_address", "tokenAddress"]);
+  const text = typeof value === "string" ? value : "";
+  return /^0x[a-fA-F0-9]{40}$/.test(text) ? text.toLowerCase() : null;
+}
+
+function decodeApiBody(body: string): unknown | null {
+  const raw = body.trim();
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "string") return parsed;
+    return JSON.parse(parsed);
+  } catch {}
+  try {
+    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const bytes = atob(padded);
+    return JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes, c => c.charCodeAt(0))));
+  } catch { return null; }
+}
+
+function extractTokens(value: unknown, depth = 0): FeedToken[] {
+  if (depth > 6 || value == null) return [];
+  if (Array.isArray(value)) return value.filter(x => x && typeof x === "object") as FeedToken[];
+  if (typeof value !== "object") return [];
+  const object = value as Record<string, unknown>;
+  for (const key of ["tokens", "data", "result", "items", "markets"]) {
+    const found = extractTokens(object[key], depth + 1);
+    if (found.length) return found;
+  }
+  return [];
+}
+
+function feedVolumeUsd(item: FeedToken, monUsd: number): number {
+  const directUsd = nestedNumber(item, ["volume_5m_usd", "volume5mUsd", "volume_usd_5m"], ["volume_5m_usd", "volume5mUsd", "volume_usd_5m"]);
+  if (directUsd > 0) return directUsd;
+  const rawVolume = nestedNumber(item, [], ["volume_5m", "volume5m", "volume"]);
+  if (rawVolume <= 0 || monUsd <= 0) return 0;
+  return rawVolume >= 1e15 ? rawVolume / 1e18 * monUsd : rawVolume * monUsd;
+}
+
+function feedLiquidityUsd(item: FeedToken, monUsd: number): number {
+  const directUsd = nestedNumber(item, ["liquidity_usd", "liquidityUsd"], ["liquidity_usd", "liquidityUsd"]);
+  if (directUsd > 0) return directUsd;
+  const rawReserve = num(objectValue(item.market_info, ["reserve_native"])) || num(objectValue(item.token_info, ["reserve_native"]));
+  if (rawReserve <= 0 || monUsd <= 0) return 0;
+  return rawReserve >= 1e12 ? rawReserve / 1e18 * monUsd : rawReserve * monUsd;
+}
 
 async function readRuntime(env: ModelEnv): Promise<Record<string, unknown>> {
   const raw = await env.CIEL_STATE.get(RUNTIME_KEY);
@@ -39,15 +114,22 @@ async function writeRuntime(env: ModelEnv, patch: Record<string, unknown>): Prom
   await env.CIEL_STATE.put(RUNTIME_KEY, JSON.stringify({ ...current, ...patch }));
 }
 
+async function readCurrentFeed(env: ModelEnv): Promise<Map<string, FeedToken>> {
+  const raw = await env.CIEL_STATE.get(RANKING_CACHE_KEY);
+  if (!raw) return new Map();
+  try {
+    const tokens = extractTokens(JSON.parse(raw));
+    return new Map(tokens.map(item => [feedTokenAddress(item), item]).filter(([key]) => Boolean(key)) as Array<[string, FeedToken]>);
+  } catch { return new Map(); }
+}
+
 async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
   const rows = await env.DB.prepare(`
-    SELECT ms.token_address as token,
+    SELECT token_address as token,
       COUNT(*) as samples,
-      MIN(ms.ts_ms) as firstTs,
-      MAX(ms.ts_ms) as lastTs,
-      AVG(ms.volume_5m_usd) as avgVolume,
-      AVG(ms.liquidity_usd) as avgLiquidity,
-      AVG(ms.market_cap_usd) as avgMarketCap
+      MIN(ts_ms) as firstTs,
+      MAX(ts_ms) as lastTs,
+      AVG(market_cap_usd) as avgMarketCap
     FROM market_snapshots ms
     WHERE ms.price_usd>0
       AND ms.ts_ms >= (
@@ -60,59 +142,47 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
     GROUP BY ms.token_address
     HAVING COUNT(*)>=?
       AND (MAX(ms.ts_ms)-MIN(ms.ts_ms))>=?
-      AND AVG(ms.volume_5m_usd)>=?
-      AND AVG(ms.liquidity_usd)>=?
       AND AVG(ms.market_cap_usd)>=?
-    ORDER BY AVG(ms.volume_5m_usd) DESC
-    LIMIT ?`
-  ).bind(
+    ORDER BY AVG(ms.market_cap_usd) DESC
+    LIMIT ?`).bind(
     MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SPAN_MS,
-    MIN_AVG_VOLUME_5M_USD,
-    MIN_AVG_LIQUIDITY_USD,
     MIN_MARKET_CAP_USD,
     MAX_CANDIDATES
   ).all<Candidate>();
   return rows.results || [];
 }
 
-async function writeEligibilityDiagnostics(env: ModelEnv): Promise<void> {
-  const row = await env.DB.prepare(`
-    SELECT
-      COUNT(*) as markets,
-      SUM(CASE WHEN samples>=? THEN 1 ELSE 0 END) as historyEligible,
-      SUM(CASE WHEN samples>=? AND spanMs>=? THEN 1 ELSE 0 END) as spanEligible,
-      SUM(CASE WHEN samples>=? AND spanMs>=? AND avgVolume>=? THEN 1 ELSE 0 END) as volumeEligible,
-      SUM(CASE WHEN samples>=? AND spanMs>=? AND avgVolume>=? AND avgLiquidity>=? THEN 1 ELSE 0 END) as liquidityEligible,
-      SUM(CASE WHEN samples>=? AND spanMs>=? AND avgVolume>=? AND avgLiquidity>=? AND avgMarketCap>=? THEN 1 ELSE 0 END) as establishedEligible
-    FROM (
-      SELECT ms.token_address,
-        COUNT(*) as samples,
-        MAX(ms.ts_ms)-MIN(ms.ts_ms) as spanMs,
-        AVG(ms.volume_5m_usd) as avgVolume,
-        AVG(ms.liquidity_usd) as avgLiquidity,
-        AVG(ms.market_cap_usd) as avgMarketCap
-      FROM market_snapshots ms
-      WHERE ms.price_usd>0
-        AND ms.ts_ms >= (
-          SELECT ts_ms
-          FROM market_snapshots
-          WHERE token_address=ms.token_address AND price_usd>0
-          ORDER BY ts_ms DESC
-          LIMIT 1 OFFSET 11
-        )
-      GROUP BY ms.token_address
-    )
-  `).bind(
-    MIN_HISTORY_SAMPLES,
-    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS,
-    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD,
-    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD,
-    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD, MIN_MARKET_CAP_USD
-  ).first<Record<string, number>>();
+async function writeEligibilityDiagnostics(env: ModelEnv, candidates: Candidate[]): Promise<void> {
+  const feed = await readCurrentFeed(env);
+  const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
+  let volumeEligible = 0;
+  let liquidityEligible = 0;
+  let establishedEligible = 0;
+  const samples: Array<Record<string, unknown>> = [];
+
+  for (const candidate of candidates) {
+    const item = feed.get(candidate.token.toLowerCase());
+    const volumeUsd = item ? feedVolumeUsd(item, monUsd) : 0;
+    const liquidityUsd = item ? feedLiquidityUsd(item, monUsd) : 0;
+    const volumeOk = volumeUsd >= MIN_AVG_VOLUME_5M_USD;
+    const liquidityOk = liquidityUsd >= MIN_AVG_LIQUIDITY_USD;
+    if (volumeOk) volumeEligible++;
+    if (volumeOk && liquidityOk) liquidityEligible++;
+    if (volumeOk && liquidityOk && candidate.avgMarketCap >= MIN_MARKET_CAP_USD) establishedEligible++;
+    if (samples.length < 10) samples.push({ token: candidate.token, volumeUsd, liquidityUsd, avgMarketCap: candidate.avgMarketCap });
+  }
 
   await writeRuntime(env, {
-    lastModelEligibilityDiagnostics: row || null,
+    lastModelEligibilityDiagnostics: {
+      markets: candidates.length,
+      historyEligible: candidates.length,
+      spanEligible: candidates.length,
+      volumeEligible,
+      liquidityEligible,
+      establishedEligible,
+      samples
+    },
     lastModelEligibilityWindowSamples: MIN_HISTORY_SAMPLES
   });
 }
@@ -124,8 +194,18 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
   }
 
   const candidates = await selectPatternCandidates(env);
-  await writeEligibilityDiagnostics(env);
-  if (!candidates.length) {
+  await writeEligibilityDiagnostics(env, candidates);
+  const feed = await readCurrentFeed(env);
+  const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
+
+  const established = candidates.filter(candidate => {
+    const item = feed.get(candidate.token.toLowerCase());
+    return Boolean(item)
+      && feedVolumeUsd(item, monUsd) >= MIN_AVG_VOLUME_5M_USD
+      && feedLiquidityUsd(item, monUsd) >= MIN_AVG_LIQUIDITY_USD;
+  });
+
+  if (!established.length) {
     await writeRuntime(env, { lastModelError: "No established high-volume meme candidates above $90,000 yet" });
     return;
   }
@@ -136,7 +216,7 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
   let analyzed = 0;
   let lastError: string | undefined;
 
-  for (const candidate of candidates) {
+  for (const candidate of established) {
     if (Date.now() - candidate.lastTs < 0) continue;
     const cooldownKey = `${MODEL_COOLDOWN_PREFIX}${candidate.token.toLowerCase()}`;
     const lastAnalyzed = Number(await env.CIEL_STATE.get(cooldownKey) || "0");
