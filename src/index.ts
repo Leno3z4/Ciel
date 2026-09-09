@@ -1,6 +1,6 @@
 import { indexNadFun } from "./indexer";
-import { publicClient, tokenBalance, quoteSell, walletAddress, sellToNative } from "./nadfun";
-import { buildBaseline, deviationScore, askGemini, type Snapshot } from "./model";
+import { publicClient, tokenBalance, quoteSell, walletAddress, sellToNative, quoteBuy } from "./nadfun";
+import { buildBaseline, deviationScore, buildPatternProfile, askGemini, type Snapshot } from "./model";
 import { riskGate } from "./risk";
 import { notifyTelegram, testTelegram } from "./telegram";
 
@@ -14,6 +14,11 @@ const RUNTIME_STATE_KEY = "ciel_runtime_state";
 const DB_SCHEMA_VERSION_KEY = "ciel_db_schema_version";
 const DB_SCHEMA_VERSION = "3";
 const RUNTIME_TELEMETRY_INTERVAL_MS = 10 * 60 * 1000;
+const PATTERN_MIN_HISTORY_SAMPLES = 12;
+const PATTERN_MIN_HISTORY_HOURS = 0.5;
+const PATTERN_MIN_AVG_VOLUME_5M_USD = 5000;
+const PATTERN_MIN_AVG_LIQUIDITY_USD = 10000;
+const PATTERN_MAX_CANDIDATES = 10;
 
 type PaperState = "CREATED" | "RISK_CHECKED" | "QUOTED" | "BALANCE_RESERVED" | "FILLED" | "POSITION_UPDATED" | "CONSUMED" | "REJECTED" | "FAILED";
 
@@ -76,9 +81,67 @@ async function runMarketCycle(env: Env) { const cycleAt = Date.now(); try { awai
 
 async function runPaperSignalCycle(env: Env) { if (env.TRADING_ENABLED === "true" || env.PAPER_TRADING !== "true") return; if (await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true") return; const rows = await env.DB.prepare("SELECT id FROM signals WHERE consumed_ts_ms IS NULL ORDER BY ts_ms ASC LIMIT 10").all<{ id: number }>(); for (const row of rows.results || []) await executePaperSignal(env, row.id); }
 
-async function runModelMaintenance(env: Env) { const maintenanceAt = Date.now(); try { await ensureDatabaseSchema(env); const latest = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders FROM market_snapshots WHERE price_usd>0 ORDER BY ts_ms DESC LIMIT 1`).first<Snapshot>(); if (!latest) { await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: "No positive-price market snapshot available" }); return; } const historyResult = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 50`).bind(latest.token).all<Snapshot>(); const history = historyResult.results || []; const current = history[0] || latest; const baseline = buildBaseline(history); const score = deviationScore(current, baseline); const apiKey = env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2; await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastGeminiAttempt: Date.now(), lastModelError: undefined }); if (!apiKey) { await writeRuntimeState(env, { lastGeminiError: "No Gemini API key configured" }); return; } const analysis = await askGemini(apiKey, env.GEMINI_MODEL, "market", current, baseline, score); if (!analysis) { await writeRuntimeState(env, { lastGeminiError: "Gemini returned no valid decision (request, response, or schema failure)" }); return; } await writeRuntimeState(env, { lastGeminiSuccess: Date.now(), lastGeminiError: undefined, lastModelAnalyzed: Date.now() }); const expectedLow = Number.isFinite(analysis.expectedLowUsd) ? analysis.expectedLowUsd.toFixed(8) : "n/a"; const expectedHigh = Number.isFinite(analysis.expectedHighUsd) ? analysis.expectedHighUsd.toFixed(8) : "n/a"; const confidencePct = (analysis.confidence * 100).toFixed(1); const anomalyPct = (analysis.anomalyScore * 100).toFixed(1); const message = `🧠 Ciel model\nToken: ${current.token}\nAction: ${analysis.action}\nConfidence: ${confidencePct}%\nAnomaly: ${anomalyPct}%\nRegime: ${analysis.regime}\nExpected: $${expectedLow} - $${expectedHigh}\nRationale: ${analysis.rationale}`; await notifyTelegram(env, message.slice(0, 3900)); } catch (error) { const message = String(error).slice(0, 1000); await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message }); console.error(`Model maintenance failed: ${message}`); } }
+async function selectPatternCandidates(env: Env): Promise<Array<{ token: string; samples: number; firstTs: number; lastTs: number; avgVolume: number; avgLiquidity: number }>> {
+  const rows = await env.DB.prepare(`SELECT token_address as token,COUNT(*) as samples,MIN(ts_ms) as firstTs,MAX(ts_ms) as lastTs,AVG(volume_5m_usd) as avgVolume,AVG(liquidity_usd) as avgLiquidity
+    FROM market_snapshots WHERE price_usd>0 GROUP BY token_address
+    HAVING COUNT(*)>=? AND (MAX(ts_ms)-MIN(ts_ms))>=? AND AVG(volume_5m_usd)>=? AND AVG(liquidity_usd)>=?
+    ORDER BY AVG(volume_5m_usd) DESC LIMIT ?`).bind(
+    PATTERN_MIN_HISTORY_SAMPLES,
+    PATTERN_MIN_HISTORY_HOURS * 3600000,
+    PATTERN_MIN_AVG_VOLUME_5M_USD,
+    PATTERN_MIN_AVG_LIQUIDITY_USD,
+    PATTERN_MAX_CANDIDATES
+  ).all<{ token: string; samples: number; firstTs: number; lastTs: number; avgVolume: number; avgLiquidity: number }>();
+  return rows.results || [];
+}
 
-async function status(env: Env) { const indexerRaw = await env.CIEL_STATE.get("indexer_state"); let indexerState: { lastRunMs?: number } = {}; try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {} const telegramRaw = await env.CIEL_STATE.get("ciel_telegram_runtime"); let telegramState: { lastAttemptAt?: number; lastSuccessAt?: number; lastFailureAt?: number; lastError?: string; lastTestAt?: number; lastTestSuccess?: boolean } = {}; try { if (telegramRaw) telegramState = JSON.parse(telegramRaw); } catch {} const state = await readRuntimeState(env); return { tradingEnabled: env.TRADING_ENABLED === "true", paperTrading: env.PAPER_TRADING === "true", telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID), telegramLastAttemptAt: telegramState.lastAttemptAt || null, telegramLastSuccessAt: telegramState.lastSuccessAt || null, telegramLastFailureAt: telegramState.lastFailureAt || null, telegramLastError: telegramState.lastError || null, telegramLastTestAt: telegramState.lastTestAt || null, telegramLastTestSuccess: telegramState.lastTestSuccess ?? null, paperBalanceMon: await getPaperBalance(env), paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"), paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"), paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true", lastHoldingCheck: state.lastHoldingCheck || null, lastMarketCycle: state.lastMarketCycle || indexerState.lastRunMs || null, lastMarketCycleError: state.lastMarketCycleError || null, lastModelMaintenance: state.lastModelMaintenance || null, lastModelAnalyzed: state.lastModelAnalyzed || null, lastModelError: state.lastModelError || null, lastIndexerAttempt: state.lastIndexerAttempt || null, lastIndexerSnapshots: state.lastIndexerSnapshots ?? null, lastIndexerCreates: state.lastIndexerCreates ?? null, lastIndexerBuys: state.lastIndexerBuys ?? null, lastIndexerSells: state.lastIndexerSells ?? null, lastGeminiAttempt: state.lastGeminiAttempt || null, lastGeminiSuccess: state.lastGeminiSuccess || null, lastGeminiError: state.lastGeminiError || null }; }
+async function maybeWriteModelSignal(env: Env, current: Snapshot, analysis: Awaited<ReturnType<typeof askGemini>>) {
+  if (!analysis || !["BUY", "SELL"].includes(analysis.action)) return;
+  const existingPosition = await env.DB.prepare("SELECT quantity FROM positions WHERE token_address=? AND quantity<>'0'").bind(current.token).first<{ quantity: string }>();
+  if (analysis.action === "BUY" && existingPosition) return;
+  if (analysis.action === "SELL" && !existingPosition) return;
+  const recent = await env.DB.prepare("SELECT id FROM signals WHERE token_address=? AND action=? AND ts_ms>? ORDER BY ts_ms DESC LIMIT 1").bind(current.token, analysis.action, Date.now() - 3600000).first<{ id: number }>();
+  if (recent) return;
+  await env.DB.prepare(`INSERT INTO signals(token_address,ts_ms,action,confidence,expected_low,expected_high,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?,?,?)`).bind(
+    current.token, Date.now(), analysis.action, analysis.confidence, analysis.expectedLowUsd, analysis.expectedHighUsd, analysis.anomalyScore, "gemini-established-pattern", `${analysis.regime}: ${analysis.rationale}`
+  ).run();
+}
+
+async function runModelMaintenance(env: Env) { const maintenanceAt = Date.now(); try {
+  await ensureDatabaseSchema(env);
+  const candidates = await selectPatternCandidates(env);
+  if (!candidates.length) { await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: "No established high-volume meme candidates yet" }); return; }
+  const apiKey = env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2;
+  await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastGeminiAttempt: Date.now(), lastModelError: undefined });
+  if (!apiKey) { await writeRuntimeState(env, { lastGeminiError: "No Gemini API key configured" }); return; }
+
+  let analyzed = 0;
+  const decisions: string[] = [];
+  for (const candidate of candidates) {
+    const historyResult = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders
+      FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 50`).bind(candidate.token).all<Snapshot>();
+    const history = historyResult.results || [];
+    if (history.length < PATTERN_MIN_HISTORY_SAMPLES) continue;
+    const current = history[0];
+    const baseline = buildBaseline(history);
+    const score = deviationScore(current, baseline);
+    const pattern = buildPatternProfile(history);
+    const analysis = await askGemini(apiKey, env.GEMINI_MODEL, "market", current, baseline, score, pattern);
+    if (!analysis) continue;
+    analyzed++;
+    await maybeWriteModelSignal(env, current, analysis);
+    decisions.push(`${current.token}:${analysis.action}:${(analysis.confidence * 100).toFixed(0)}%:${analysis.regime}`);
+  }
+
+  if (analyzed > 0) {
+    await writeRuntimeState(env, { lastGeminiSuccess: Date.now(), lastGeminiError: undefined, lastModelAnalyzed: Date.now() });
+    await notifyTelegram(env, `🧠 Ciel established-pattern scan\nCandidates: ${candidates.length}\nAnalyzed: ${analyzed}\n${decisions.slice(0, 10).join("\n")}`.slice(0, 3900));
+  } else {
+    await writeRuntimeState(env, { lastGeminiError: "Established candidates were found but none produced a valid Gemini decision" });
+  }
+} catch (error) { const message = String(error).slice(0, 1000); await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message }); console.error(`Model maintenance failed: ${message}`); } }
+
+async function status(env: Env) { const indexerRaw = await env.CIEL_STATE.get("indexer_state"); let indexerState: { lastRunMs?: number } = {}; try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {} const telegramRaw = await env.CIEL_STATE.get("ciel_telegram_runtime"); let telegramState: { lastAttemptAt?: number; lastSuccessAt?: number; lastFailureAt?: number; lastError?: string; lastTestAt?: number; lastTestSuccess?: boolean } = {}; try { if (telegramRaw) telegramState = JSON.parse(telegramRaw); } catch {} const state = await readRuntimeState(env); return { tradingEnabled: env.TRADING_ENABLED === "true", paperTrading: env.PAPER_TRADING === "true", telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID), telegramLastAttemptAt: telegramState.lastAttemptAt || null, telegramLastSuccessAt: telegramState.lastSuccessAt || null, telegramLastFailureAt: telegramState.lastFailureAt || null, telegramLastTestSuccess: telegramState.lastTestSuccess ?? null, telegramLastAttemptAt: telegramState.lastAttemptAt || null, telegramLastSuccessAt: telegramState.lastSuccessAt || null, telegramLastFailureAt: telegramState.lastFailureAt || null, telegramLastError: telegramState.lastError || null, telegramLastTestAt: telegramState.lastTestAt || null, paperBalanceMon: await getPaperBalance(env), paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"), paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"), paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true", lastHoldingCheck: state.lastHoldingCheck || null, lastMarketCycle: state.lastMarketCycle || indexerState.lastRunMs || null, lastMarketCycleError: state.lastMarketCycleError || null, lastModelMaintenance: state.lastModelMaintenance || null, lastModelAnalyzed: state.lastModelAnalyzed || null, lastModelError: state.lastModelError || null, lastIndexerAttempt: state.lastIndexerAttempt || null, lastIndexerSnapshots: state.lastIndexerSnapshots ?? null, lastIndexerCreates: state.lastIndexerCreates ?? null, lastIndexerBuys: state.lastIndexerBuys ?? null, lastIndexerSells: state.lastIndexerSells ?? null, lastGeminiAttempt: state.lastGeminiAttempt || null, lastGeminiSuccess: state.lastGeminiSuccess || null, lastGeminiError: state.lastGeminiError || null }; }
 
 function json(value: unknown) { return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } }); }
 
