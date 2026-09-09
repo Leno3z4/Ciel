@@ -20,6 +20,7 @@ const RANKING_FETCH_TS_KEY = "nadfun_market_ranking_fetch_ms";
 const MARKET_LIMIT = 50;
 const SNAPSHOT_LIMIT = 12;
 const MIN_MARKET_CAP_USD = 90_000;
+const NADFUN_TOTAL_SUPPLY = 1_000_000_000;
 const LOG_RANGE_BLOCKS = 100;
 const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
 const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
@@ -140,7 +141,11 @@ function totalSupply(item: TokenRecord): number {
   const raw = objectValue(item.token_info, ["total_supply", "totalSupply", "supply", "circulating_supply", "circulatingSupply"]);
   const decimals = Math.max(0, Math.floor(num(objectValue(item.token_info, ["decimals", "token_decimals", "tokenDecimals"])) || 18));
   const value = num(raw);
-  return value > 0 ? (value >= 1e15 ? value / 10 ** decimals : value) : 0;
+  if (value > 0) return value >= 1e15 ? value / 10 ** decimals : value;
+
+  // NadFun-created coins use a fixed 1B token supply. The market-cap feed
+  // returns price/supply data under market_info rather than a total_supply field.
+  return NADFUN_TOTAL_SUPPLY;
 }
 
 function marketCap(item: TokenRecord): number {
