@@ -14,17 +14,17 @@ jobs:
           node-version: 22
       - run: npm install
       - name: Patch source
-        shell: python
+        shell: bash
         run: |
+          python - <<'PY'
           from pathlib import Path
           import re
 
           indexer = Path('src/indexer.ts')
           s = indexer.read_text()
 
-          s = s.replace(
-              'function decode(text: string): unknown | null { try { return JSON.parse(text); } catch {} try { const b = atob(text.trim()); return JSON.parse(new TextDecoder().decode(Uint8Array.from(b, c => c.charCodeAt(0)))); } catch { return null; } }',
-              '''function decode(text: string): unknown | null {
+          old_decode = 'function decode(text: string): unknown | null { try { return JSON.parse(text); } catch {} try { const b = atob(text.trim()); return JSON.parse(new TextDecoder().decode(Uint8Array.from(b, c => c.charCodeAt(0)))); } catch { return null; } }'
+          new_decode = '''function decode(text: string): unknown | null {
             let raw = text.trim();
             try {
               const parsed = JSON.parse(raw);
@@ -37,13 +37,13 @@ jobs:
               const b = atob(padded);
               return JSON.parse(new TextDecoder().decode(Uint8Array.from(b, c => c.charCodeAt(0))));
             } catch { return null; }
-          }''')
+          }'''
+          if old_decode in s:
+              s = s.replace(old_decode, new_decode)
 
-          # Remove the expensive factory bootstrap from the hot market cycle.
           s = re.sub(r'\nasync function bootstrapFactory\(env: IndexEnv, client: ReturnType<typeof publicClient>\): Promise<void> \{.*?\n\}\n\nexport async function indexNadFun', '\nexport async function indexNadFun', s, flags=re.S)
           s = s.replace('  await bootstrapFactory(env, client);\n\n', '')
 
-          # One event scan is enough for token creation telemetry; market intelligence comes from market-cap snapshots.
           old_logs = re.compile(r'  const \[creates, buys, sells, graduates, syncs, pairs, ranked\] = await Promise\.all\(\[.*?\n  \]\);', re.S)
           new_logs = '''  const creates = await client.getLogs({ address: NADFUN_BONDING, event: createEvent, fromBlock, toBlock });
   const buys: any[] = [];
@@ -55,9 +55,7 @@ jobs:
           s, count = old_logs.subn(new_logs, s, count=1)
           if count != 1:
               raise SystemExit('log scan block not found')
-
           s = s.replace('if (chartAttempts < 6)', 'if (chartAttempts < 3)')
-
           indexer.write_text(s)
 
           main = Path('src/index.ts')
@@ -68,8 +66,8 @@ jobs:
               s = s.replace('const PATTERN_MAX_CANDIDATES = 10;\n', 'const PATTERN_MAX_CANDIDATES = 10;\nconst MARKET_MONITOR_INTERVAL_MS = 15 * 60 * 1000;\n')
           s = s.replace('`No established high-volume meme candidates above $${PATTERN_MIN_MARKET_CAP_USD.toLocaleString()} yet`', '`No established market-cap snapshots met the $${PATTERN_MIN_MARKET_CAP_USD.toLocaleString()} / history / volume / liquidity gates`')
 
-          marker = 'async function runMarketCycle(env: Env) {'
           if 'async function buildMarketMonitorReport' not in s:
+              marker = 'async function runMarketCycle(env: Env) {'
               helper = '''async function buildMarketMonitorReport(env: Env): Promise<string | null> {
             const lastSent = Number(await env.CIEL_STATE.get("ciel_market_monitor_last_sent_ms") || "0");
             if (lastSent > 0 && Date.now() - lastSent < MARKET_MONITOR_INTERVAL_MS) return null;
@@ -95,6 +93,7 @@ jobs:
 
           '''
               s = s.replace(marker, helper + marker)
+
           old_telemetry = 'if (result && (result.snapshots > 0 || result.buys > 0 || result.sells > 0)) await notifyTelegram(env, `📡 Ciel indexer\\nBlocks: ${result.fromBlock.toString()} - ${result.toBlock.toString()}\\nCreates: ${result.creates}\\nBuys: ${result.buys}\\nSells: ${result.sells}\\nSnapshots: ${result.snapshots}`);'
           new_telemetry = '''if (result && result.snapshots > 0) {
               const report = await buildMarketMonitorReport(env);
@@ -108,15 +107,15 @@ jobs:
           status_repl = 'lastIndexerSells: state.lastIndexerSells ?? null, lastIndexerDiscoveryCount: state.lastIndexerDiscoveryCount ?? null, lastIndexerValidAddressCount: state.lastIndexerValidAddressCount ?? null, lastIndexerCandidateCount: state.lastIndexerCandidateCount ?? null, lastIndexerDirectEligible: state.lastIndexerDirectEligible ?? null, lastIndexerCapEligible: state.lastIndexerCapEligible ?? null, lastIndexerChartAttempts: state.lastIndexerChartAttempts ?? null, lastIndexerChartHits: state.lastIndexerChartHits ?? null, lastIndexerSkipReason: state.lastIndexerSkipReason ?? null, lastGeminiAttempt:'
           s = s.replace(status_anchor, status_repl)
           main.write_text(s)
-      - name: Verify
+      - name: Verify and commit
+        shell: bash
         run: |
+          set -e
           git diff --check
           npm run typecheck
-      - name: Commit directly to main
-        run: |
+          rm -f .github/workflows/repair-main.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          rm -f .github/workflows/repair-main.yml
           git add src/indexer.ts src/index.ts .github/workflows/repair-main.yml
           git diff --cached --quiet && exit 0
           git commit -m "fix: reduce worker subrequests and restore market monitoring"
