@@ -10,7 +10,6 @@ type ModelEnv = {
   GEMINI_API_KEY_5?: string;
   GEMINI_API_KEY_6?: string;
   GEMINI_API_KEY_7?: string;
-  GEMINI_API_KEY_8?: string;
   GEMINI_MODEL: string;
 };
 
@@ -39,6 +38,7 @@ const MODEL_KEY_CURSOR = "ciel_gemini_key_cursor";
 const RUNTIME_KEY = "ciel_runtime_state";
 const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
 const MON_USD_KEY = "mon_usd";
+const DECISION_KEY_COUNT = 7;
 
 function num(value: unknown): number {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
@@ -194,7 +194,8 @@ async function writeEligibilityDiagnostics(env: ModelEnv, candidates: Candidate[
       samples
     },
     lastModelEligibilityWindowSamples: MIN_HISTORY_SAMPLES,
-    lastModelDecisionBudgetPerCycle: MAX_DECISIONS_PER_CYCLE
+    lastModelDecisionBudgetPerCycle: MAX_DECISIONS_PER_CYCLE,
+    lastModelDecisionKeyCount: DECISION_KEY_COUNT
   });
 }
 
@@ -211,8 +212,7 @@ async function getKeySlots(env: ModelEnv): Promise<Array<{ index: number; key: s
     env.GEMINI_API_KEY_4,
     env.GEMINI_API_KEY_5,
     env.GEMINI_API_KEY_6,
-    env.GEMINI_API_KEY_7,
-    env.GEMINI_API_KEY_8
+    env.GEMINI_API_KEY_7
   ].map(key => (key || "").trim()).filter(Boolean);
   if (!keys.length) return [];
   const cursor = Math.max(0, Math.min(keys.length - 1, Number(await env.CIEL_STATE.get(MODEL_KEY_CURSOR) || "0")));
@@ -241,7 +241,7 @@ async function askGeminiWithFallbacks(
     attempted++;
     try {
       const decision = await askGemini(slot.key, model, "market", snapshot, baseline, score, pattern);
-      await env.CIEL_STATE.put(MODEL_KEY_CURSOR, String(slot.index % 8), { expirationTtl: 86400 });
+      await env.CIEL_STATE.put(MODEL_KEY_CURSOR, String(slot.index % DECISION_KEY_COUNT), { expirationTtl: 86400 });
       await writeRuntime(env, { lastGeminiKeyUsed: slot.index, lastGeminiFallbacks: Math.max(0, attempted - 1) });
       return { decision, keyIndex: slot.index };
     } catch (error) {
@@ -361,7 +361,7 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
         lastModelDecisionConfidence: analysis.confidence
       });
     } catch (error) {
-      lastError = `${candidate.token}: ${String(error).slice(0, 1000)}`;
+      lastError = `${candidate.token}: ${String(error).slice(0, 700)}`;
       await writeRuntime(env, { lastGeminiError: lastError });
     }
   }
