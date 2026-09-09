@@ -1,4 +1,4 @@
-import { indexNadFun } from "./indexer";
+import { indexNadFun } from "./indexer_v2";
 import { publicClient, tokenBalance, quoteSell, walletAddress, sellToNative, quoteBuy } from "./nadfun";
 import { buildBaseline, deviationScore, buildPatternProfile, askGemini, type Snapshot } from "./model";
 import { riskGate } from "./risk";
@@ -111,67 +111,109 @@ async function selectPatternCandidates(env: Env): Promise<Array<{ token: string;
 }
 
 async function maybeWriteModelSignal(env: Env, current: Snapshot, analysis: Awaited<ReturnType<typeof askGemini>>) {
-  if (!analysis || !["BUY", "SELL"].includes(analysis.action)) return;
-  const existingPosition = await env.DB.prepare("SELECT quantity FROM positions WHERE token_address=? AND quantity<>'0'").bind(current.token).first<{ quantity: string }>();
-  if (analysis.action === "BUY" && existingPosition) return;
-  if (analysis.action === "SELL" && !existingPosition) return;
-  const recent = await env.DB.prepare("SELECT id FROM signals WHERE token_address=? AND action=? AND ts_ms>? ORDER BY ts_ms DESC LIMIT 1").bind(current.token, analysis.action, Date.now() - 3600000).first<{ id: number }>();
-  if (recent) return;
-  await env.DB.prepare(`INSERT INTO signals(token_address,ts_ms,action,confidence,expected_low,expected_high,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?,?,?)`).bind(
-    current.token, Date.now(), analysis.action, analysis.confidence, analysis.expectedLowUsd, analysis.expectedHighUsd, analysis.anomalyScore, "gemini-established-pattern", `${analysis.regime}: ${analysis.rationale}`
-  ).run();
+  if (!analysis || !["BUY", "HOLD", "SELL", "IGNORE"].includes(analysis.action)) return;
+  await env.DB.prepare(`INSERT INTO signals(token_address,ts_ms,action,confidence,expected_low,expected_high,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?,?,?)`).bind(current.token, Date.now(), analysis.action, analysis.confidence, analysis.expectedLowUsd, analysis.expectedHighUsd, analysis.anomalyScore, env.GEMINI_MODEL, analysis.rationale).run();
 }
 
-async function runModelMaintenance(env: Env) { const maintenanceAt = Date.now(); try {
-  await ensureDatabaseSchema(env);
-  const candidates = await selectPatternCandidates(env);
-  if (!candidates.length) { await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: `No established high-volume meme candidates above $${PATTERN_MIN_MARKET_CAP_USD.toLocaleString()} yet` }); return; }
-  const apiKey = env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2;
-  await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastGeminiAttempt: Date.now(), lastModelError: undefined });
-  if (!apiKey) { await writeRuntimeState(env, { lastGeminiError: "No Gemini API key configured" }); return; }
-
-  let analyzed = 0;
-  const decisions: string[] = [];
-  for (const candidate of candidates) {
-    const historyResult = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders
-      FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 50`).bind(candidate.token).all<Snapshot>();
-    const history = historyResult.results || [];
-    if (history.length < PATTERN_MIN_HISTORY_SAMPLES) continue;
-    const current = history[0];
-    if (!(Number(current.marketCapUsd) >= PATTERN_MIN_MARKET_CAP_USD)) continue;
-    const baseline = buildBaseline(history);
-    const score = deviationScore(current, baseline);
-    const pattern = buildPatternProfile(history);
-    const analysis = await askGemini(apiKey, env.GEMINI_MODEL, "market", current, baseline, score, pattern);
-    if (!analysis) continue;
-    analyzed++;
-    await maybeWriteModelSignal(env, current, analysis);
-    decisions.push(`${current.token}:${analysis.action}:${(analysis.confidence * 100).toFixed(0)}%:${analysis.regime}`);
+async function runModelMaintenance(env: Env) {
+  const now = Date.now();
+  try {
+    await ensureDatabaseSchema(env);
+    await writeRuntimeState(env, { lastModelMaintenance: now });
+    const candidates = await selectPatternCandidates(env);
+    if (!candidates.length) {
+      await writeRuntimeState(env, { lastModelError: "No established high-volume meme candidates above $90,000 yet" });
+      return;
+    }
+    const apiKeys = [env.GEMINI_API_KEY_1, env.GEMINI_API_KEY_2].filter((key): key is string => !!key && key.trim().length > 0);
+    if (!apiKeys.length) throw new Error("No Gemini API keys configured");
+    let keyIndex = 0;
+    for (const candidate of candidates) {
+      const rows = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 1440`).bind(candidate.token).all<Snapshot>();
+      const history = rows.results || [];
+      if (!history.length) continue;
+      const baseline = buildBaseline(history);
+      const current = history[0];
+      const pattern = buildPatternProfile(history);
+      const score = deviationScore(current, baseline);
+      await writeRuntimeState(env, { lastGeminiAttempt: Date.now() });
+      const analysis = await askGemini(apiKeys[keyIndex % apiKeys.length], env.GEMINI_MODEL, "market", current, baseline, score, pattern);
+      keyIndex++;
+      if (analysis) {
+        await maybeWriteModelSignal(env, current, analysis);
+        await writeRuntimeState(env, { lastModelAnalyzed: Date.now(), lastGeminiSuccess: Date.now(), lastGeminiError: undefined, lastModelError: undefined });
+      }
+    }
+  } catch (error) {
+    const message = String(error).slice(0, 1000);
+    await writeRuntimeState(env, { lastModelError: message, lastGeminiError: message });
+    console.error(`Model maintenance failed: ${message}`);
   }
+}
 
-  if (analyzed > 0) {
-    await writeRuntimeState(env, { lastGeminiSuccess: Date.now(), lastGeminiError: undefined, lastModelAnalyzed: Date.now(), lastModelError: undefined });
-    await notifyTelegram(env, `🧠 Ciel established-pattern scan\nMarket-cap floor: $${PATTERN_MIN_MARKET_CAP_USD.toLocaleString()}\nCandidates: ${candidates.length}\nAnalyzed: ${analyzed}\n${decisions.slice(0, 10).join("\n")}`.slice(0, 3900));
+async function executePaperSignal(env: Env, signalId: number) {
+  const signal = await env.DB.prepare("SELECT * FROM signals WHERE id=?").bind(signalId).first<Record<string, unknown>>();
+  if (!signal) return { ok: false, error: "signal_not_found" };
+  const action = String(signal.action || "");
+  if (action !== "BUY" && action !== "SELL") { await env.DB.prepare("UPDATE signals SET consumed_ts_ms=? WHERE id=?").bind(Date.now(), signalId).run(); return { ok: true, skipped: true }; }
+  const token = String(signal.token_address);
+  const current = await env.DB.prepare("SELECT market_cap_usd,price_usd FROM market_snapshots WHERE token_address=? ORDER BY ts_ms DESC LIMIT 1").bind(token).first<{ market_cap_usd: number; price_usd: number }>();
+  if (!current || !(current.price_usd > 0)) { await env.DB.prepare("UPDATE signals SET consumed_ts_ms=? WHERE id=?").bind(Date.now(), signalId).run(); return { ok: false, error: "no_current_market" }; }
+  const balanceRaw = await env.CIEL_STATE.get(PAPER_BALANCE_KEY); const balance = balanceRaw ? Number(balanceRaw) : PAPER_INITIAL_BALANCE_MON;
+  if (action === "BUY") {
+    if (!(balance > 0)) { await env.DB.prepare("UPDATE signals SET consumed_ts_ms=? WHERE id=?").bind(Date.now(), signalId).run(); return { ok: false, error: "paper_balance_empty" }; }
+    const nextBalance = 0;
+    await env.CIEL_STATE.put(PAPER_BALANCE_KEY, String(nextBalance));
+    const quantity = balance * (1 - PAPER_SLIPPAGE_BPS / 10000) / current.price_usd;
+    await env.DB.prepare(`INSERT INTO positions(token_address,quantity,entry_price_usd,entry_ts_ms,last_price_usd,updated_ts_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(token_address) DO UPDATE SET quantity=positions.quantity+excluded.quantity,last_price_usd=excluded.last_price_usd,updated_ts_ms=excluded.updated_ts_ms`).bind(token, String(quantity), current.price_usd, Date.now(), current.price_usd, Date.now()).run();
+    await env.DB.prepare(`INSERT INTO paper_executions(signal_id,execution_key,token_address,side,state,balance_before_mon,balance_after_mon,quantity,fill_price_usd,error,created_ts_ms,updated_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(signal_id) DO NOTHING`).bind(signalId, `paper:${signalId}`, token, "BUY", "CONSUMED", balance, nextBalance, String(quantity), current.price_usd, null, Date.now(), Date.now()).run();
   } else {
-    await writeRuntimeState(env, { lastGeminiError: `Established candidates above $${PATTERN_MIN_MARKET_CAP_USD.toLocaleString()} were found but none produced a valid Gemini decision` });
+    const position = await env.DB.prepare("SELECT quantity,entry_price_usd FROM positions WHERE token_address=?").bind(token).first<{ quantity: string; entry_price_usd: number }>();
+    if (!position || !(Number(position.quantity) > 0)) { await env.DB.prepare("UPDATE signals SET consumed_ts_ms=? WHERE id=?").bind(Date.now(), signalId).run(); return { ok: false, error: "paper_position_missing" }; }
+    const proceeds = Number(position.quantity) * current.price_usd * (1 - PAPER_SLIPPAGE_BPS / 10000);
+    const nextBalance = balance + proceeds;
+    const realized = (current.price_usd - Number(position.entry_price_usd || current.price_usd)) * Number(position.quantity);
+    await env.CIEL_STATE.put(PAPER_BALANCE_KEY, String(nextBalance));
+    await env.CIEL_STATE.put(PAPER_REALIZED_PNL_KEY, String(Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || 0) + realized));
+    await env.DB.prepare("DELETE FROM positions WHERE token_address=?").bind(token).run();
+    await env.DB.prepare(`INSERT INTO paper_executions(signal_id,execution_key,token_address,side,state,balance_before_mon,balance_after_mon,quantity,fill_price_usd,realized_pnl_usd,error,created_ts_ms,updated_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?, ?,?) ON CONFLICT(signal_id) DO NOTHING`).bind(signalId, `paper:${signalId}`, token, "SELL", "CONSUMED", balance, nextBalance, position.quantity, current.price_usd, realized, null, Date.now(), Date.now()).run();
   }
-} catch (error) { const message = String(error).slice(0, 1000); await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message }); console.error(`Model maintenance failed: ${message}`); } }
+  await env.DB.prepare("UPDATE signals SET consumed_ts_ms=? WHERE id=?").bind(Date.now(), signalId).run();
+  return { ok: true, action, token };
+}
 
-async function status(env: Env) { const indexerRaw = await env.CIEL_STATE.get("indexer_state"); let indexerState: { lastRunMs?: number } = {}; try { if (indexerRaw) indexerState = JSON.parse(indexerRaw); } catch {} const telegramRaw = await env.CIEL_STATE.get("ciel_telegram_runtime"); let telegramState: { lastAttemptAt?: number; lastSuccessAt?: number; lastFailureAt?: number; lastTestAt?: number; lastTestSuccess?: boolean; lastError?: string } = {}; try { if (telegramRaw) telegramState = JSON.parse(telegramRaw); } catch {} const state = await readRuntimeState(env); return { tradingEnabled: env.TRADING_ENABLED === "true", paperTrading: env.PAPER_TRADING === "true", telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID), telegramLastAttemptAt: telegramState.lastAttemptAt || null, telegramLastSuccessAt: telegramState.lastSuccessAt || null, telegramLastFailureAt: telegramState.lastFailureAt || null, telegramLastError: telegramState.lastError || null, telegramLastTestAt: telegramState.lastTestAt || null, telegramLastTestSuccess: telegramState.lastTestSuccess ?? null, paperBalanceMon: await getPaperBalance(env), paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"), paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"), paperCircuitOpen: await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true", lastHoldingCheck: state.lastHoldingCheck || null, lastMarketCycle: state.lastMarketCycle || indexerState.lastRunMs || null, lastMarketCycleError: state.lastMarketCycleError || null, lastModelMaintenance: state.lastModelMaintenance || null, lastModelAnalyzed: state.lastModelAnalyzed || null, lastModelError: state.lastModelError || null, lastIndexerAttempt: state.lastIndexerAttempt || null, lastIndexerSnapshots: state.lastIndexerSnapshots ?? null, lastIndexerCreates: state.lastIndexerCreates ?? null, lastIndexerBuys: state.lastIndexerBuys ?? null, lastIndexerSells: state.lastIndexerSells ?? null, lastGeminiAttempt: state.lastGeminiAttempt || null, lastGeminiSuccess: state.lastGeminiSuccess || null, lastGeminiError: state.lastGeminiError || null }; }
+async function status(env: Env) {
+  const runtime = await readRuntimeState(env);
+  return {
+    tradingEnabled: env.TRADING_ENABLED === "true",
+    paperTrading: env.PAPER_TRADING === "true",
+    telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+    telegramLastAttemptAt: runtime.lastTelegramAttemptAt,
+    telegramLastSuccessAt: runtime.lastTelegramSuccessAt,
+    telegramLastFailureAt: runtime.lastTelegramFailureAt,
+    telegramLastError: runtime.lastTelegramError,
+    telegramLastTestAt: runtime.lastTelegramTestAt,
+    telegramLastTestSuccess: runtime.lastTelegramTestSuccess,
+    paperBalanceMon: Number(await env.CIEL_STATE.get(PAPER_BALANCE_KEY) || PAPER_INITIAL_BALANCE_MON),
+    paperRealizedPnlUsd: Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || 0),
+    paperFailureCount: Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || 0),
+    paperCircuitOpen: (await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY)) === "true",
+    lastHoldingCheck: runtime.lastHoldingCheck,
+    lastMarketCycle: runtime.lastMarketCycle,
+    lastMarketCycleError: runtime.lastMarketCycleError,
+    lastModelMaintenance: runtime.lastModelMaintenance,
+    lastModelAnalyzed: runtime.lastModelAnalyzed,
+    lastModelError: runtime.lastModelError,
+    lastIndexerAttempt: runtime.lastIndexerAttempt,
+    lastIndexerSnapshots: runtime.lastIndexerSnapshots,
+    lastIndexerCreates: runtime.lastIndexerCreates,
+    lastIndexerBuys: runtime.lastIndexerBuys,
+    lastIndexerSells: runtime.lastIndexerSells,
+    lastGeminiAttempt: runtime.lastGeminiAttempt,
+    lastGeminiSuccess: runtime.lastGeminiSuccess,
+    lastGeminiError: runtime.lastGeminiError,
+    paperUnrealizedPnlUsd: runtime.paperUnrealizedPnlUsd,
+  };
+}
 
-function json(value: unknown) { return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } }); }
-
-async function getPaperBalance(env: Env): Promise<number> { const raw = await env.CIEL_STATE.get(PAPER_BALANCE_KEY); if (raw === null) { await env.CIEL_STATE.put(PAPER_BALANCE_KEY, String(PAPER_INITIAL_BALANCE_MON)); return PAPER_INITIAL_BALANCE_MON; } const value = Number(raw); return Number.isFinite(value) ? value : PAPER_INITIAL_BALANCE_MON; }
-
-async function consumeSignal(env: Env, signalId: number, reason: string) { await env.DB.prepare("UPDATE signals SET consumed_ts_ms=? WHERE id=? AND consumed_ts_ms IS NULL").bind(Date.now(), signalId).run(); return { ok: true, skipped: reason }; }
-
-async function beginPaperExecution(env: Env, signal: { id: number; token_address: string; action: string }) { const key = `paper:${signal.id}`; const now = Date.now(); await env.DB.prepare(`INSERT INTO paper_executions(signal_id,execution_key,token_address,side,state,created_ts_ms,updated_ts_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(signal_id) DO NOTHING`).bind(signal.id, key, signal.token_address, signal.action, "CREATED", now, now).run(); return { key, row: await env.DB.prepare("SELECT * FROM paper_executions WHERE signal_id=?").bind(signal.id).first<any>() }; }
-
-async function setPaperState(env: Env, signalId: number, state: PaperState, fields: Record<string, unknown> = {}) { const keys = Object.keys(fields); const sets = ["state=?", "updated_ts_ms=?", ...keys.map(k => `${k}=?`)]; const values = [state, Date.now(), ...keys.map(k => fields[k])]; await env.DB.prepare(`UPDATE paper_executions SET ${sets.join(",")} WHERE signal_id=?`).bind(...values, signalId).run(); }
-
-async function failPaperExecution(env: Env, signalId: number, error: unknown) { const message = String(error).slice(0, 1000); await setPaperState(env, signalId, "FAILED", { error: message }); const raw = Number(await env.CIEL_STATE.get(PAPER_FAILURE_COUNT_KEY) || "0"); const count = Number.isFinite(raw) ? raw + 1 : 1; await env.CIEL_STATE.put(PAPER_FAILURE_COUNT_KEY, String(count)); if (count >= 3) await env.CIEL_STATE.put(PAPER_CIRCUIT_KEY, "true"); await writeRuntimeState(env, { paperFailureCount: count, paperCircuitOpen: count >= 3 }); }
-
-async function executePaperSignal(env: Env, signalId: number) { if (env.TRADING_ENABLED === "true") return { ok: false, skipped: "live trading flag is enabled; paper executor is disabled" }; if (env.PAPER_TRADING !== "true") return { ok: false, skipped: "paper trading disabled" }; if (await env.CIEL_STATE.get(PAPER_CIRCUIT_KEY) === "true") return { ok: false, skipped: "paper execution circuit breaker is open" }; const signal = await env.DB.prepare("SELECT id,token_address,action,confidence,consumed_ts_ms FROM signals WHERE id=?").bind(signalId).first<{ id: number; token_address: string; action: string; confidence: number; consumed_ts_ms: number | null }>(); if (!signal) return { ok: false, skipped: "signal missing" }; const execution = await beginPaperExecution(env, signal); const existing = execution.row; if (existing?.state === "CONSUMED") return { ok: true, skipped: "paper execution already consumed", executionState: existing.state }; if (existing?.state === "REJECTED") return { ok: false, skipped: existing.error || "paper execution rejected" }; if (signal.consumed_ts_ms !== null && existing?.state === "CREATED") { await setPaperState(env, signalId, "REJECTED", { error: "signal was already consumed" }); return { ok: false, skipped: "signal was already consumed" }; } const token = signal.token_address as `0x${string}`; const state = await readRuntimeState(env); const monUsd = Number(state.monUsd || await env.CIEL_STATE.get("mon_usd")); const meta = await env.DB.prepare("SELECT decimals,liquidity_usd FROM tokens WHERE address=?").bind(token).first<{ decimals: number; liquidity_usd: number }>(); const current = await env.DB.prepare("SELECT price_usd FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 1").bind(token).first<{ price_usd: number }>(); const previous = await env.DB.prepare("SELECT price_usd FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 1 OFFSET 1").bind(token).first<{ price_usd: number }>(); const liquidityUsd = Number(meta?.liquidity_usd || 0); const priceChangePct = previous?.price_usd && current?.price_usd ? ((current.price_usd - previous.price_usd) / previous.price_usd) * 100 : 0; const client = publicClient(env.NAD_RPC_URL); try { if (signal.action === "BUY") { const balance = await getPaperBalance(env); const amountMon = balance; if (!(amountMon > 0) || !(monUsd > 0)) return consumeSignal(env, signalId, "paper skipped: insufficient balance or MON/USD price"); const amountIn = BigInt(Math.floor(amountMon * 1e18)); const tokenOut = await quoteBuy(client, token, amountIn); if (tokenOut <= 0n) return consumeSignal(env, signalId, "paper skipped: fresh buy quote returned zero"); const decimals = Number(meta?.decimals || 18); const position = await env.DB.prepare("SELECT quantity,entry_price_usd FROM positions WHERE token_address=?").bind(token).first<{ quantity: string; entry_price_usd: number }>(); const existingQty = BigInt(position?.quantity || "0"); const quantity = existingQty + tokenOut; const fillPriceUsd = monUsd * amountMon / (Number(tokenOut) / 10 ** decimals); const risk = riskGate({ confidence: Number(signal.confidence || 0), liquidityUsd, slippageBps: PAPER_SLIPPAGE_BPS, portfolioExposurePct: 100, positionPct: 100, priceChangePct }); await setPaperState(env, signalId, "RISK_CHECKED", { balance_before_mon: balance, quantity: tokenOut.toString(), fill_price_usd: fillPriceUsd }); if (!risk.allowed) return consumeSignal(env, signalId, `paper skipped: risk gate rejected BUY: ${risk.reasons.join(", ")}`); await setPaperState(env, signalId, "QUOTED", { quote_out: tokenOut.toString() }); await env.CIEL_STATE.put(PAPER_BALANCE_KEY, "0"); await setPaperState(env, signalId, "BALANCE_RESERVED", { balance_after_mon: 0 }); const now = Date.now(); const entryPrice = existingQty > 0n && position?.entry_price_usd ? ((Number(existingQty) * Number(position.entry_price_usd)) + Number(tokenOut) * fillPriceUsd) / Number(quantity) : fillPriceUsd; await env.DB.prepare(`INSERT INTO positions(token_address,quantity,entry_price_usd,entry_ts_ms,last_price_usd,updated_ts_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(token_address) DO UPDATE SET quantity=excluded.quantity,entry_price_usd=excluded.entry_price_usd,last_price_usd=excluded.last_price_usd,updated_ts_ms=excluded.updated_ts_ms`).bind(token, quantity.toString(), entryPrice, now, fillPriceUsd, now).run(); await env.DB.prepare(`INSERT INTO trades(token_address,ts_ms,side,quantity,price_usd,mode,status,execution_key) VALUES(?,?,?,?,?,?,?,?)`).bind(token, now, "BUY", tokenOut.toString(), fillPriceUsd, "paper", "FILLED", `paper:${signal.id}`).run(); await setPaperState(env, signalId, "FILLED", { position_quantity_after: quantity.toString() }); await setPaperState(env, signalId, "POSITION_UPDATED"); await consumeSignal(env, signalId, "paper BUY filled"); await setPaperState(env, signalId, "CONSUMED"); await notifyTelegram(env, `📝 Ciel PAPER BUY\nToken: ${token}\nConfidence: ${Number(signal.confidence || 0) * 100}%\nFill: $${fillPriceUsd}`); return { ok: true, action: "BUY", token }; }
-    if (signal.action === "SELL") { const position = await env.DB.prepare("SELECT quantity,entry_price_usd FROM positions WHERE token_address=?").bind(token).first<{ quantity: string; entry_price_usd: number }>(); if (!position || position.quantity === "0") return consumeSignal(env, signalId, "paper skipped: no position to sell"); const quantity = BigInt(position.quantity); const quoteOut = await quoteSell(client, token, quantity); if (quoteOut <= 0n) return consumeSignal(env, signalId, "paper skipped: fresh sell quote returned zero"); const decimals = Number(meta?.decimals || 18); const exitPriceUsd = monUsd * (Number(quoteOut) / 1e18) / (Number(quantity) / 10 ** decimals); const proceedsMon = Number(quoteOut) / 1e18; const proceedsUsd = proceedsMon * monUsd; const realized = proceedsUsd - Number(position.entry_price_usd || 0) * (Number(quantity) / 10 ** decimals); const balance = await getPaperBalance(env); await env.CIEL_STATE.put(PAPER_BALANCE_KEY, String(balance + proceedsMon)); const oldPnl = Number(await env.CIEL_STATE.get(PAPER_REALIZED_PNL_KEY) || "0"); await env.CIEL_STATE.put(PAPER_REALIZED_PNL_KEY, String(oldPnl + realized)); await env.DB.prepare("DELETE FROM positions WHERE token_address=?").bind(token).run(); const now = Date.now(); await env.DB.prepare(`INSERT INTO trades(token_address,ts_ms,side,quantity,price_usd,mode,status,execution_key) VALUES(?,?,?,?,?,?,?,?)`).bind(token, now, "SELL", quantity.toString(), exitPriceUsd, "paper", "FILLED", `paper:${signal.id}`).run(); await setPaperState(env, signalId, "FILLED", { balance_after_mon: balance + proceedsMon, quantity: quantity.toString(), quote_out: quoteOut.toString(), realized_pnl_usd: realized }); await consumeSignal(env, signalId, "paper SELL filled"); await setPaperState(env, signalId, "CONSUMED"); await notifyTelegram(env, `📝 Ciel PAPER SELL\nToken: ${token}\nProceeds: ${proceedsMon} MON\nRealized PnL: $${realized.toFixed(4)}`); return { ok: true, action: "SELL", token }; }
-    return consumeSignal(env, signalId, "unsupported signal action");
-  } catch (error) { await failPaperExecution(env, signalId, error); return { ok: false, error: String(error).slice(0, 1000) }; } }
+function json(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } }); }
