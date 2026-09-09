@@ -1,5 +1,5 @@
 import { parseAbiItem, type Address } from "viem";
-import { NADFUN_BONDING, NADFUN_FACTORY, NADFUN_ROUTER, publicClient, quoteSell, WMON, LVMON } from "./nadfun";
+import { NADFUN_BONDING, NADFUN_FACTORY, NADFUN_ROUTER, publicClient, WMON, LVMON } from "./nadfun";
 
 const createEvent = parseAbiItem("event Create(address indexed creator,address indexed token,address indexed pair,address quoteToken,string name,string symbol,string tokenURI,uint256 virtualQuoteReserve,uint256 virtualTokenReserve,uint256 minTokenReserve)");
 const bondingBuyEvent = parseAbiItem("event Buy(address indexed token,address indexed buyer,uint256 quoteIn,uint256 tokenOut)");
@@ -18,19 +18,10 @@ const tokenMetaAbi = [
   { type: "function", name: "name", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }
 ] as const;
 
-const pairAbi = [
-  { type: "function", name: "token0", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
-  { type: "function", name: "token1", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
-  { type: "function", name: "getReserves", stateMutability: "view", inputs: [], outputs: [{ name: "reserve0", type: "uint112" }, { name: "reserve1", type: "uint112" }, { name: "blockTimestampLast", type: "uint32" }] }
-] as const;
-
-const factoryAbi = [
-  { type: "function", name: "allPairsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
-  { type: "function", name: "allPairs", stateMutability: "view", inputs: [{ name: "index", type: "uint256" }], outputs: [{ type: "address" }] }
-] as const;
-
 export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: number; buys: number; sells: number; graduates: number; syncs: number; snapshots: number; nextBlock: bigint; }
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
+type NadFunMarket = { market_type?: string; token_id?: string; quote_id?: string; market_id?: string; reserve_quote?: string; reserve_token?: string; price_usd?: string; quote_price?: string; price?: string; total_supply?: string; volume?: string; holder_count?: number };
+type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
 const INDEXER_STATE_KEY = "indexer_state";
 const RPC_LOG_RANGE_BLOCKS = 100;
@@ -39,43 +30,35 @@ const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
 const ESTABLISHED_TOKEN_LIMIT = 12;
 const FACTORY_BOOTSTRAP_PAIR_LIMIT = 8;
 const MIN_MARKET_CAP_USD = 90_000;
-type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
-
-async function monUsd(env: IndexEnv): Promise<number> {
-  const cached = Number(await env.CIEL_STATE.get("mon_usd"));
-  try {
-    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=monad&vs_currencies=usd", { cf: { cacheTtl: 60 } });
-    if (!r.ok) return cached > 0 ? cached : 0;
-    const j = await r.json() as { monad?: { usd?: number } };
-    const price = Number(j.monad?.usd || 0);
-    if (price > 0) await env.CIEL_STATE.put("mon_usd", String(price), { expirationTtl: 3600 });
-    return price > 0 ? price : cached > 0 ? cached : 0;
-  } catch { return cached > 0 ? cached : 0; }
-}
+const NADFUN_API_BASE = "https://api.nad.fun";
 
 function rawToUnits(value: bigint, decimals: number): number { return Number(value) / 10 ** decimals; }
+function apiSupplyToUnits(value: string | undefined, decimals: number): number { const n = Number(value || 0); if (!(n > 0)) return 0; return n >= 1e15 ? n / 10 ** decimals : n; }
 
-async function pairLiquidityUsd(client: ReturnType<typeof publicClient>, pair: Address, token: Address, quoteToken: Address, monUsdPrice: number): Promise<number> {
-  if (monUsdPrice <= 0 || (quoteToken.toLowerCase() !== WMON.toLowerCase() && quoteToken.toLowerCase() !== LVMON.toLowerCase())) return 0;
+async function fetchNadFunMarket(token: string): Promise<NadFunMarket | null> {
   try {
-    const [token0, reserves] = await Promise.all([
-      client.readContract({ address: pair, abi: pairAbi, functionName: "token0" }),
-      client.readContract({ address: pair, abi: pairAbi, functionName: "getReserves" })
-    ]);
-    const quoteReserve = token0.toLowerCase() === token.toLowerCase() ? reserves[1] : reserves[0];
-    return rawToUnits(quoteReserve, 18) * monUsdPrice * 2;
-  } catch { return 0; }
+    const response = await fetch(`${NADFUN_API_BASE}/trade/market/${token}`, { headers: { Accept: "application/json", Origin: "https://nad.fun" }, cf: { cacheTtl: 15 } });
+    if (!response.ok) return null;
+    const payload = await response.json() as { market_info?: NadFunMarket };
+    return payload.market_info ?? null;
+  } catch (error) { console.error(`NadFun market API failed for ${token}: ${String(error).slice(0, 300)}`); return null; }
 }
 
 async function bootstrapFactoryTokens(env: IndexEnv, client: ReturnType<typeof publicClient>): Promise<number> {
   const existing = await env.DB.prepare("SELECT COUNT(*) as count FROM tokens").first<{ count: number }>();
   if (Number(existing?.count || 0) > 0) return 0;
   try {
+    const factoryAbi = [
+      { type: "function", name: "allPairsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+      { type: "function", name: "allPairs", stateMutability: "view", inputs: [{ name: "index", type: "uint256" }], outputs: [{ type: "address" }] }
+    ] as const;
+    const pairAbi = [
+      { type: "function", name: "token0", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
+      { type: "function", name: "token1", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }
+    ] as const;
     const pairCount = await client.readContract({ address: NADFUN_FACTORY, abi: factoryAbi, functionName: "allPairsLength" });
-    const total = Number(pairCount);
-    if (!Number.isFinite(total) || total <= 0) return 0;
-    const start = Math.max(0, total - FACTORY_BOOTSTRAP_PAIR_LIMIT);
-    let inserted = 0;
+    const total = Number(pairCount); if (!Number.isFinite(total) || total <= 0) return 0;
+    const start = Math.max(0, total - FACTORY_BOOTSTRAP_PAIR_LIMIT); let inserted = 0;
     for (let i = start; i < total; i++) {
       const pair = await client.readContract({ address: NADFUN_FACTORY, abi: factoryAbi, functionName: "allPairs", args: [BigInt(i)] });
       const [token0, token1] = await Promise.all([
@@ -85,8 +68,7 @@ async function bootstrapFactoryTokens(env: IndexEnv, client: ReturnType<typeof p
       const token0IsQuote = token0.toLowerCase() === WMON.toLowerCase() || token0.toLowerCase() === LVMON.toLowerCase();
       const token1IsQuote = token1.toLowerCase() === WMON.toLowerCase() || token1.toLowerCase() === LVMON.toLowerCase();
       if (!token0IsQuote && !token1IsQuote) continue;
-      const quote = token0IsQuote ? token0 : token1;
-      const token = token0IsQuote ? token1 : token0;
+      const quote = token0IsQuote ? token0 : token1; const token = token0IsQuote ? token1 : token0;
       const [totalSupply, decimals, symbol, name] = await Promise.all([
         client.readContract({ address: token, abi: tokenMetaAbi, functionName: "totalSupply" }).catch(() => null),
         client.readContract({ address: token, abi: tokenMetaAbi, functionName: "decimals" }).catch(() => 18),
@@ -95,32 +77,24 @@ async function bootstrapFactoryTokens(env: IndexEnv, client: ReturnType<typeof p
       ]);
       const now = Date.now();
       await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO UPDATE SET pair_address=excluded.pair_address,quote_token=excluded.quote_token,graduated=1,last_seen_ms=excluded.last_seen_ms`).bind(
-        token, symbol, name, 0, 0, now, now, totalSupply?.toString() ?? null, Number(decimals), quote, pair, 1
-      ).run();
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO UPDATE SET pair_address=excluded.pair_address,quote_token=excluded.quote_token,graduated=1,last_seen_ms=excluded.last_seen_ms`).bind(token, symbol, name, 0, 0, now, now, totalSupply?.toString() ?? null, Number(decimals), quote, pair, 1).run();
       inserted++;
     }
     return inserted;
-  } catch (error) {
-    console.error(`Factory bootstrap failed: ${String(error).slice(0, 500)}`);
-    return 0;
-  }
+  } catch (error) { console.error(`Factory bootstrap failed: ${String(error).slice(0, 500)}`); return 0; }
 }
 
 export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCKS): Promise<IndexResult | null> {
-  const client = publicClient(env.NAD_RPC_URL);
-  const latest = await client.getBlockNumber();
-  const stateRaw = await env.CIEL_STATE.get(INDEXER_STATE_KEY);
-  const state = stateRaw ? JSON.parse(stateRaw) as IndexerState : null;
+  const client = publicClient(env.NAD_RPC_URL); const latest = await client.getBlockNumber();
+  const stateRaw = await env.CIEL_STATE.get(INDEXER_STATE_KEY); const state = stateRaw ? JSON.parse(stateRaw) as IndexerState : null;
   const cursorRaw = state?.nextBlock ?? await env.CIEL_STATE.get("indexer_next_block");
   let fromBlock = cursorRaw ? BigInt(cursorRaw) : (latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n);
   if (latest > fromBlock && latest - fromBlock > MAX_ACCEPTABLE_LAG_BLOCKS) fromBlock = latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n;
   if (fromBlock > latest) return null;
-
   const requestedBlocks = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS));
   const toBlock = fromBlock + BigInt(requestedBlocks - 1) > latest ? latest : fromBlock + BigInt(requestedBlocks - 1);
 
-  const [creates, bondingBuys, bondingSells, routerBuys, routerSells, graduates, syncs, snipingPenalties, pairCreates, monPrice] = await Promise.all([
+  const [creates, bondingBuys, bondingSells, routerBuys, routerSells, graduates, syncs, snipingPenalties, pairCreates] = await Promise.all([
     client.getLogs({ address: NADFUN_BONDING, event: createEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: bondingBuyEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: bondingSellEvent, fromBlock, toBlock }),
@@ -129,114 +103,73 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
     client.getLogs({ address: NADFUN_BONDING, event: graduateEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: syncEvent, fromBlock, toBlock }),
     client.getLogs({ address: NADFUN_BONDING, event: snipingEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_FACTORY, event: pairCreatedEvent, fromBlock, toBlock }),
-    monUsd(env)
+    client.getLogs({ address: NADFUN_FACTORY, event: pairCreatedEvent, fromBlock, toBlock })
   ]);
 
   const stats = new Map<string, { buyVolume: bigint; sellVolume: bigint; buys: number; sells: number; liquidityQuote: bigint }>();
-  const touch = (token: string) => {
-    let s = stats.get(token);
-    if (!s) { s = { buyVolume: 0n, sellVolume: 0n, buys: 0, sells: 0, liquidityQuote: 0n }; stats.set(token, s); }
-    return s;
-  };
+  const touch = (token: string) => { let s = stats.get(token); if (!s) { s = { buyVolume: 0n, sellVolume: 0n, buys: 0, sells: 0, liquidityQuote: 0n }; stats.set(token, s); } return s; };
 
   for (const log of creates) {
-    const a = log.args;
-    if (!a.token || !a.quoteToken || !a.pair) continue;
+    const a = log.args; if (!a.token || !a.quoteToken || !a.pair) continue;
     const [totalSupply, decimals] = await Promise.all([
       client.readContract({ address: a.token, abi: tokenMetaAbi, functionName: "totalSupply" }).catch(() => null),
       client.readContract({ address: a.token, abi: tokenMetaAbi, functionName: "decimals" }).catch(() => 18)
     ]);
     await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(address) DO UPDATE SET symbol=excluded.symbol,name=excluded.name,last_seen_ms=excluded.last_seen_ms,total_supply=COALESCE(excluded.total_supply,tokens.total_supply),decimals=excluded.decimals,quote_token=excluded.quote_token,pair_address=excluded.pair_address,created_at_block=COALESCE(tokens.created_at_block,excluded.created_at_block)`)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(address) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,total_supply=COALESCE(excluded.total_supply,tokens.total_supply),decimals=excluded.decimals,quote_token=excluded.quote_token,pair_address=excluded.pair_address,created_at_block=COALESCE(tokens.created_at_block,excluded.created_at_block)`)
       .bind(a.token, a.symbol ?? null, a.name ?? null, 0, 0, Date.now(), Date.now(), totalSupply?.toString() ?? null, Number(decimals), a.quoteToken, a.pair, 0, Number(log.blockNumber)).run();
   }
 
   for (const log of pairCreates) {
-    const a = log.args;
-    if (!a.token0 || !a.token1 || !a.pair) continue;
+    const a = log.args; if (!a.token0 || !a.token1 || !a.pair) continue;
     const token0IsQuote = a.token0.toLowerCase() === WMON.toLowerCase() || a.token0.toLowerCase() === LVMON.toLowerCase();
     const token1IsQuote = a.token1.toLowerCase() === WMON.toLowerCase() || a.token1.toLowerCase() === LVMON.toLowerCase();
     if (!token0IsQuote && !token1IsQuote) continue;
-    const quote = token0IsQuote ? a.token0 : a.token1;
-    const token = token0IsQuote ? a.token1 : a.token0;
+    const quote = token0IsQuote ? a.token0 : a.token1; const token = token0IsQuote ? a.token1 : a.token0;
     await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO UPDATE SET pair_address=excluded.pair_address,quote_token=excluded.quote_token,graduated=1,last_seen_ms=excluded.last_seen_ms`).bind(
-      token, null, null, 0, 0, Date.now(), Date.now(), null, 18, quote, a.pair, 1
-    ).run();
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO UPDATE SET pair_address=excluded.pair_address,quote_token=excluded.quote_token,graduated=1,last_seen_ms=excluded.last_seen_ms`).bind(token, null, null, 0, 0, Date.now(), Date.now(), null, 18, quote, a.pair, 1).run();
   }
 
-  for (const log of routerBuys) {
-    const a = log.args; if (!a.token) continue;
-    const s = touch(a.token); s.buyVolume += a.amountIn ?? 0n; s.buys++;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-buy.json`, JSON.stringify({ type: "Buy", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, buyer: a.buyer, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated }));
-  }
-  for (const log of routerSells) {
-    const a = log.args; if (!a.token) continue;
-    const s = touch(a.token); s.sellVolume += a.amountOut ?? 0n; s.sells++;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated }));
-  }
+  for (const log of routerBuys) { const a = log.args; if (!a.token) continue; const s = touch(a.token); s.buyVolume += a.amountIn ?? 0n; s.buys++; await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-buy.json`, JSON.stringify({ type: "Buy", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, buyer: a.buyer, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated })); }
+  for (const log of routerSells) { const a = log.args; if (!a.token) continue; const s = touch(a.token); s.sellVolume += a.amountOut ?? 0n; s.sells++; await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated })); }
   if (routerBuys.length === 0) for (const log of bondingBuys) { const a = log.args; if (!a.token) continue; const s = touch(a.token); s.buyVolume += a.quoteIn ?? 0n; s.buys++; }
   if (routerSells.length === 0) for (const log of bondingSells) { const a = log.args; if (!a.token) continue; const s = touch(a.token); s.sellVolume += a.quoteOut ?? 0n; s.sells++; }
 
-  for (const log of syncs) {
-    const a = log.args; if (!a.token) continue;
-    touch(a.token).liquidityQuote = a.realQuoteReserve ?? 0n;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sync.json`, JSON.stringify({ type: "Sync", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, realQuoteReserve: a.realQuoteReserve?.toString(), realTokenReserve: a.realTokenReserve?.toString(), virtualQuoteReserve: a.virtualQuoteReserve?.toString(), virtualTokenReserve: a.virtualTokenReserve?.toString() }));
-  }
-  for (const log of graduates) {
-    const a = log.args; if (!a.token) continue;
-    await env.DB.prepare("UPDATE tokens SET graduated=1,pair_address=? WHERE address=?").bind(a.pair ?? null, a.token).run();
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-graduate.json`, JSON.stringify({ type: "Graduate", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, pair: a.pair }));
-  }
-  for (const log of snipingPenalties) {
-    const a = log.args; if (!a.token) continue;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
-  }
+  for (const log of syncs) { const a = log.args; if (!a.token) continue; touch(a.token).liquidityQuote = a.realQuoteReserve ?? 0n; await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sync.json`, JSON.stringify({ type: "Sync", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, realQuoteReserve: a.realQuoteReserve?.toString(), realTokenReserve: a.realTokenReserve?.toString(), virtualQuoteReserve: a.virtualQuoteReserve?.toString(), virtualTokenReserve: a.virtualTokenReserve?.toString() })); }
+  for (const log of graduates) { const a = log.args; if (!a.token) continue; await env.DB.prepare("UPDATE tokens SET graduated=1,pair_address=? WHERE address=?").bind(a.pair ?? null, a.token).run(); await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-graduate.json`, JSON.stringify({ type: "Graduate", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, pair: a.pair })); }
+  for (const log of snipingPenalties) { const a = log.args; if (!a.token) continue; await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() })); }
 
   await bootstrapFactoryTokens(env, client);
 
-  const existingTokens = await env.DB.prepare(`
-    SELECT t.address,t.total_supply,t.decimals,t.quote_token,t.pair_address,t.graduated,t.liquidity_usd
-    FROM tokens t
-    WHERE t.quote_token IS NOT NULL
-      AND (t.graduated=1 OR COALESCE(t.liquidity_usd,0) >= 1000)
-    ORDER BY COALESCE(t.market_cap_usd,0) DESC,
-             COALESCE(t.liquidity_usd,0) DESC,
-             t.last_seen_ms DESC
-    LIMIT ?
-  `).bind(ESTABLISHED_TOKEN_LIMIT).all<{
-    address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null;
-  }>();
-
+  const statKeys = [...stats.keys()];
+  const existingSql = `SELECT t.address,t.total_supply,t.decimals,t.quote_token,t.pair_address,t.graduated,t.liquidity_usd,t.market_cap_usd,t.last_seen_ms FROM tokens t WHERE t.quote_token IS NOT NULL ORDER BY COALESCE(t.market_cap_usd,0) DESC,COALESCE(t.liquidity_usd,0) DESC,t.last_seen_ms DESC LIMIT ?`;
+  const existingTokens = await env.DB.prepare(existingSql).bind(ESTABLISHED_TOKEN_LIMIT).all<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null; last_seen_ms: number }>();
   for (const row of existingTokens.results ?? []) touch(row.address);
 
-  const ts = Date.now();
-  let snapshots = 0;
-  for (const [token, s] of stats) {
-    if (snapshots >= ESTABLISHED_TOKEN_LIMIT) break;
-    const meta = await env.DB.prepare("SELECT total_supply, decimals, quote_token, pair_address, graduated, liquidity_usd FROM tokens WHERE address=?").bind(token).first<{
-      total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null;
-    }>();
-    if (!meta || !meta.quote_token) continue;
+  const snapshotTokens = [...stats.entries()].sort(([, a], [, b]) => (b.buys + b.sells) - (a.buys + a.sells)).slice(0, ESTABLISHED_TOKEN_LIMIT).map(([token]) => token);
+  const ts = Date.now(); let snapshots = 0;
+  for (const token of snapshotTokens) {
+    const s = stats.get(token) ?? { buyVolume: 0n, sellVolume: 0n, buys: 0, sells: 0, liquidityQuote: 0n };
+    const meta = await env.DB.prepare("SELECT total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE address=?").bind(token).first<{ total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
+    if (!meta?.quote_token) continue;
+    const apiMarket = await fetchNadFunMarket(token);
     const decimals = Number(meta.decimals || 18);
-    const quoteOut = await quoteSell(client, token as Address, 10n ** BigInt(decimals)).catch(() => 0n);
-    const quoteUsd = meta.quote_token.toLowerCase() === WMON.toLowerCase() || meta.quote_token.toLowerCase() === LVMON.toLowerCase() ? monPrice : 0;
-    const priceUsd = quoteUsd > 0 ? rawToUnits(quoteOut, 18) * quoteUsd : 0;
-    if (!(priceUsd > 0)) continue;
-    const supply = meta.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0;
-    const marketCapUsd = priceUsd * supply;
+    const priceUsd = Number(apiMarket?.price_usd || 0);
+    const apiSupply = apiSupplyToUnits(apiMarket?.total_supply, decimals);
+    const supply = apiSupply > 0 ? apiSupply : (meta.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0);
+    const marketCapUsd = priceUsd > 0 && supply > 0 ? priceUsd * supply : Number(meta.market_cap_usd || 0);
     if (!(marketCapUsd >= MIN_MARKET_CAP_USD)) continue;
-    let liquidityUsd = quoteUsd > 0 ? rawToUnits(s.liquidityQuote, 18) * quoteUsd * 2 : 0;
-    if (liquidityUsd <= 0 && meta.liquidity_usd) liquidityUsd = Number(meta.liquidity_usd);
-    if (Number(meta.graduated) === 1 && meta.pair_address) {
-      const pairLiquidity = await pairLiquidityUsd(client, meta.pair_address as Address, token as Address, meta.quote_token as Address, monPrice);
-      if (pairLiquidity > 0) liquidityUsd = pairLiquidity;
-    }
-    const buyVolumeUsd = quoteUsd > 0 ? rawToUnits(s.buyVolume, 18) * quoteUsd : 0;
-    const sellVolumeUsd = quoteUsd > 0 ? rawToUnits(s.sellVolume, 18) * quoteUsd : 0;
-    await env.DB.prepare(`INSERT INTO market_snapshots(token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,buys_5m,sells_5m,holders,quote_token,buy_volume_usd,sell_volume_usd,source_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(token, ts, priceUsd, marketCapUsd, liquidityUsd, buyVolumeUsd + sellVolumeUsd, s.buys, s.sells, 0, meta.quote_token, buyVolumeUsd, sellVolumeUsd, Number(toBlock)).run();
-    await env.DB.prepare("UPDATE tokens SET market_cap_usd=?,liquidity_usd=?,last_seen_ms=? WHERE address=?").bind(marketCapUsd, liquidityUsd, ts, token).run();
+    const reserveQuote = Number(apiMarket?.reserve_quote || 0);
+    const quotePriceUsd = Number(apiMarket?.quote_price || 0);
+    let liquidityUsd = reserveQuote > 0 && quotePriceUsd > 0 ? reserveQuote * quotePriceUsd * 2 : Number(meta.liquidity_usd || 0);
+    const buyVolumeUsd = Number(s.buyVolume) / 1e18 * quotePriceUsd;
+    const sellVolumeUsd = Number(s.sellVolume) / 1e18 * quotePriceUsd;
+    const graduated = apiMarket?.market_type?.includes("DEX") ? 1 : Number(meta.graduated || 0);
+    const pairAddress = apiMarket?.market_id || meta.pair_address;
+    const quoteToken = apiMarket?.quote_id || meta.quote_token;
+    const holders = Number(apiMarket?.holder_count || 0);
+    await env.DB.prepare(`INSERT INTO market_snapshots(token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,buys_5m,sells_5m,holders,quote_token,buy_volume_usd,sell_volume_usd,source_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(token, ts, priceUsd, marketCapUsd, liquidityUsd, buyVolumeUsd + sellVolumeUsd, s.buys, s.sells, holders, quoteToken, buyVolumeUsd, sellVolumeUsd, Number(toBlock)).run();
+    await env.DB.prepare("UPDATE tokens SET market_cap_usd=?,liquidity_usd=?,last_seen_ms=?,total_supply=COALESCE(?,total_supply),quote_token=COALESCE(?,quote_token),pair_address=COALESCE(?,pair_address),graduated=? WHERE address=?").bind(marketCapUsd, liquidityUsd, ts, apiMarket?.total_supply ?? null, quoteToken, pairAddress, graduated, token).run();
     snapshots++;
   }
 
