@@ -30,8 +30,19 @@ const WMON_ADDRESS = WMON.toLowerCase();
 const LVMON_ADDRESS = LVMON.toLowerCase();
 
 function num(value: unknown): number {
-  const parsed = Number(value ?? 0);
-  return Number.isFinite(parsed) ? parsed : 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (typeof value !== "string") return 0;
+  const text = value.trim().replace(/[$,\s]/g, "");
+  if (!text) return 0;
+  const match = text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(K|M|B|T)?$/i);
+  if (!match) {
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return 0;
+  const multipliers: Record<string, number> = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
+  return base * (match[2] ? multipliers[match[2].toUpperCase()] : 1);
 }
 
 function str(value: unknown): string | null {
@@ -142,16 +153,13 @@ function totalSupply(item: TokenRecord): number {
   const decimals = Math.max(0, Math.floor(num(objectValue(item.token_info, ["decimals", "token_decimals", "tokenDecimals"])) || 18));
   const value = num(raw);
   if (value > 0) return value >= 1e15 ? value / 10 ** decimals : value;
-
-  // NadFun-created coins use a fixed 1B token supply. The market-cap feed
-  // returns price/supply data under market_info rather than a total_supply field.
   return NADFUN_TOTAL_SUPPLY;
 }
 
 function marketCap(item: TokenRecord): number {
   const direct = nestedNumber(item, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"], ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"]);
   if (direct > 0) return direct;
-  const priceUsd = nestedNumber(item, ["price_usd", "priceUsd"], ["price_usd", "priceUsd"]);
+  const priceUsd = nestedNumber(item, ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"], ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]);
   const supply = totalSupply(item);
   return priceUsd > 0 && supply > 0 ? priceUsd * supply : 0;
 }
@@ -301,11 +309,14 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = LOG_RANGE_BLOCKS): 
   const runtimeRaw = await env.CIEL_STATE.get("ciel_runtime_state");
   let runtime: Record<string, unknown> = {};
   try { runtime = runtimeRaw ? JSON.parse(runtimeRaw) as Record<string, unknown> : {}; } catch {}
+  const topCandidate = orderedCandidates[0]?.[1];
   runtime.lastIndexerDiscoveryCount = discovery.length;
   runtime.lastIndexerValidAddressCount = validAddressCount;
   runtime.lastIndexerCandidateCount = orderedCandidates.length;
   runtime.lastIndexerDirectEligible = directEligible;
   runtime.lastIndexerCapEligible = capEligible;
+  runtime.lastIndexerTopMarketCapUsd = topCandidate ? marketCap(topCandidate) : 0;
+  runtime.lastIndexerTopMarketCapSymbol = topCandidate ? symbol(topCandidate) : null;
   runtime.lastIndexerChartAttempts = 0;
   runtime.lastIndexerChartHits = 0;
   runtime.lastIndexerSkipReason = lastSkipReason;
