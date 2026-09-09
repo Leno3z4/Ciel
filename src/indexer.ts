@@ -29,6 +29,8 @@ const RPC_LOG_RANGE_BLOCKS = 100;
 // Do not spend days replaying obsolete history after a stale deployment/outage.
 const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
 const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
+// Keep the quiet-window fallback bounded so every 3-minute cycle stays cheap.
+const EXISTING_TOKEN_SNAPSHOT_LIMIT = 50;
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
 async function monUsd(env: IndexEnv): Promise<number> {
@@ -140,10 +142,23 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
     await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
   }
 
-  let snapshots = 0;
+  // A quiet 100-block window must not produce zero snapshots. Pull a bounded set of
+  // recently tracked tokens from D1 and merge them with tokens touched by fresh events.
+  // This keeps Telegram/model reporting alive even when no trade happened this cycle.
+  const existingTokens = await env.DB.prepare(`SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,symbol,name
+    FROM tokens WHERE quote_token IS NOT NULL ORDER BY last_seen_ms DESC LIMIT ?`).bind(EXISTING_TOKEN_SNAPSHOT_LIMIT).all<{
+      address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null;
+      graduated: number; liquidity_usd: number | null; symbol: string | null; name: string | null;
+    }>();
+
+  for (const row of existingTokens.results ?? []) touch(row.address);
+
   const ts = Date.now();
+  let snapshots = 0;
   for (const [token, s] of stats) {
-    const meta = await env.DB.prepare("SELECT total_supply, decimals, quote_token, pair_address, graduated FROM tokens WHERE address=?").bind(token).first<{ total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number }>();
+    const meta = await env.DB.prepare("SELECT total_supply, decimals, quote_token, pair_address, graduated, liquidity_usd FROM tokens WHERE address=?").bind(token).first<{
+      total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null;
+    }>();
     if (!meta || !meta.quote_token) continue;
     const decimals = Number(meta.decimals || 18);
     const quoteOut = await quoteSell(client, token as Address, 10n ** BigInt(decimals)).catch(() => 0n);
@@ -152,7 +167,11 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
     const supply = meta.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0;
     const marketCapUsd = priceUsd * supply;
     let liquidityUsd = quoteUsd > 0 ? rawToUnits(s.liquidityQuote, 18) * quoteUsd * 2 : 0;
-    if (Number(meta.graduated) === 1 && meta.pair_address) liquidityUsd = await pairLiquidityUsd(client, meta.pair_address as Address, token as Address, meta.quote_token as Address, monPrice);
+    if (liquidityUsd <= 0 && meta.liquidity_usd) liquidityUsd = Number(meta.liquidity_usd);
+    if (Number(meta.graduated) === 1 && meta.pair_address) {
+      const pairLiquidity = await pairLiquidityUsd(client, meta.pair_address as Address, token as Address, meta.quote_token as Address, monPrice);
+      if (pairLiquidity > 0) liquidityUsd = pairLiquidity;
+    }
     const buyVolumeUsd = quoteUsd > 0 ? rawToUnits(s.buyVolume, 18) * quoteUsd : 0;
     const sellVolumeUsd = quoteUsd > 0 ? rawToUnits(s.sellVolume, 18) * quoteUsd : 0;
     await env.DB.prepare(`INSERT INTO market_snapshots(token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,buys_5m,sells_5m,holders,quote_token,buy_volume_usd,sell_volume_usd,source_block)
