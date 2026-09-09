@@ -1,4 +1,4 @@
-import { parseAbiItem, type Address } from "viem";
+import { parseAbiItem } from "viem";
 import { NADFUN_BONDING, NADFUN_FACTORY, NADFUN_ROUTER, publicClient, WMON, LVMON } from "./nadfun";
 
 const createEvent = parseAbiItem("event Create(address indexed creator,address indexed token,address indexed pair,address quoteToken,string name,string symbol,string tokenURI,uint256 virtualQuoteReserve,uint256 virtualTokenReserve,uint256 minTokenReserve)");
@@ -184,27 +184,27 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   for (const item of rankedMarkets) { const id = tokenId(item); if (id) marketByToken.set(id.toLowerCase(), item); }
   const existingTokens = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE quote_token IS NOT NULL ORDER BY COALESCE(market_cap_usd,0) DESC,COALESCE(liquidity_usd,0) DESC,last_seen_ms DESC LIMIT ?").bind(ESTABLISHED_TOKEN_LIMIT).all<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
   for (const row of existingTokens.results ?? []) touch(row.address);
-  for (const item of rankedMarkets.slice(0, NADFUN_MARKET_LIMIT)) { const id = tokenId(item); if (id) touch(id); }
+  for (const item of rankedMarkets.slice(0, NADFUN_MARKET_LIMIT)) { const id = tokenId(item); if (id && /^0x[a-fA-F0-9]{40}$/.test(id)) touch(id); }
 
   const ts = Date.now(); let snapshots = 0;
   for (const [token, s] of stats) {
     if (snapshots >= ESTABLISHED_TOKEN_LIMIT) break;
     const meta = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE address=?").bind(token).first<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
-    if (!meta?.quote_token) continue;
     const apiMarket = marketByToken.get(token.toLowerCase());
-    const decimals = Number(meta.decimals || 18);
+    if (!meta && !apiMarket) continue;
+    const decimals = Number(meta?.decimals || 18);
     const priceUsd = tokenPriceUsd(apiMarket ?? {});
-    const supply = apiSupplyToUnits(apiMarket?.market_info?.total_supply ?? apiMarket?.token_info?.total_supply, decimals) || (meta.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0);
-    const marketCapUsd = tokenMarketCap(apiMarket ?? {}, decimals) || (priceUsd > 0 && supply > 0 ? priceUsd * supply : Number(meta.market_cap_usd || 0));
+    const supply = apiSupplyToUnits(apiMarket?.market_info?.total_supply ?? apiMarket?.token_info?.total_supply, decimals) || (meta?.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0);
+    const marketCapUsd = tokenMarketCap(apiMarket ?? {}, decimals) || (priceUsd > 0 && supply > 0 ? priceUsd * supply : Number(meta?.market_cap_usd || 0));
     if (!(marketCapUsd >= MIN_MARKET_CAP_USD)) continue;
     const quotePriceUsd = tokenQuotePriceUsd(apiMarket ?? {});
-    const liquidityUsd = tokenLiquidityUsd(apiMarket ?? {}) || Number(meta.liquidity_usd || 0);
+    const liquidityUsd = tokenLiquidityUsd(apiMarket ?? {}) || Number(meta?.liquidity_usd || 0);
     const fallbackVolumeUsd = (Number(s.buyVolume) + Number(s.sellVolume)) / 1e18 * quotePriceUsd;
     const volume5mUsd = tokenVolume5mUsd(apiMarket ?? {}, fallbackVolumeUsd);
     const holders = tokenHolders(apiMarket ?? {});
-    const graduated = apiMarket ? tokenGraduated(apiMarket) : Number(meta.graduated || 0);
-    const quoteToken = tokenQuote(apiMarket ?? {}) || meta.quote_token;
-    const pairAddress = tokenPair(apiMarket ?? {}) || meta.pair_address;
+    const graduated = apiMarket ? tokenGraduated(apiMarket) : Number(meta?.graduated || 0);
+    const quoteToken = tokenQuote(apiMarket ?? {}) || meta?.quote_token || "NADFUN";
+    const pairAddress = tokenPair(apiMarket ?? {}) || meta?.pair_address || null;
     const cached = await env.DB.prepare("SELECT price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,holders FROM market_snapshots WHERE token_address=? ORDER BY ts_ms DESC LIMIT 1").bind(token).first<{ price_usd: number; market_cap_usd: number; liquidity_usd: number; volume_5m_usd: number; holders: number }>();
     const finalPrice = priceUsd || Number(cached?.price_usd || 0);
     const finalCap = marketCapUsd || Number(cached?.market_cap_usd || 0);
