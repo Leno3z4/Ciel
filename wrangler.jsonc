@@ -27,6 +27,11 @@
     "required": [
       "GEMINI_API_KEY_1",
       "GEMINI_API_KEY_2",
+      "GEMINI_API_KEY_3",
+      "GEMINI_API_KEY_4",
+      "GEMINI_API_KEY_5",
+      "GEMINI_API_KEY_6",
+      "GEMINI_API_KEY_7",
       "WALLET_PRIVATE_KEY",
       "TELEGRAM_BOT_TOKEN",
       "TELEGRAM_CHAT_ID"
