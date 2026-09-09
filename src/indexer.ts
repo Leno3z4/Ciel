@@ -36,7 +36,6 @@ const INDEXER_STATE_KEY = "indexer_state";
 const RPC_LOG_RANGE_BLOCKS = 100;
 const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
 const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
-// Keep scheduled scans small enough for Cloudflare subrequest limits while focusing on established markets.
 const ESTABLISHED_TOKEN_LIMIT = 12;
 const FACTORY_BOOTSTRAP_PAIR_LIMIT = 8;
 const MIN_MARKET_CAP_USD = 90_000;
@@ -192,13 +191,11 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   }
   for (const log of snipingPenalties) {
     const a = log.args; if (!a.token) continue;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
   }
 
   await bootstrapFactoryTokens(env, client);
 
-  // Snapshot only established information-rich markets. Tokens are still discovered and
-  // stored for history, but only markets clearing the $90k market-cap floor enter the model dataset.
   const existingTokens = await env.DB.prepare(`
     SELECT t.address,t.total_supply,t.decimals,t.quote_token,t.pair_address,t.graduated,t.liquidity_usd
     FROM tokens t
