@@ -25,6 +25,20 @@ export interface Baseline {
   priceP90: number;
 }
 
+export interface PatternProfile {
+  historySamples: number;
+  ageHours: number;
+  currentReturn5mPct: number;
+  currentReturn30mPct: number;
+  currentReturn2hPct: number;
+  volumeVsBaseline: number;
+  liquidityVsBaseline: number;
+  buyPressure: number;
+  priceVsMedian: number;
+  drawdownFromHistoryPeakPct: number;
+  regimeHint: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";
+}
+
 export interface GeminiDecision {
   action: "BUY" | "HOLD" | "SELL" | "IGNORE";
   confidence: number;
@@ -46,6 +60,59 @@ function percentile(xs: number[], p: number): number {
   const lo = Math.floor(index);
   const hi = Math.ceil(index);
   return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (index - lo);
+}
+
+function pctChange(current: number, previous: number): number {
+  return previous > 0 ? ((current - previous) / previous) * 100 : 0;
+}
+
+function historyPriceBefore(rows: Snapshot[], msAgo: number): number {
+  const newestTs = rows[0]?.tsMs || 0;
+  const target = newestTs - msAgo;
+  return rows.find(r => r.tsMs <= target && r.priceUsd > 0)?.priceUsd || 0;
+}
+
+export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
+  if (!rows.length) return {
+    historySamples: 0, ageHours: 0, currentReturn5mPct: 0, currentReturn30mPct: 0, currentReturn2hPct: 0,
+    volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0, priceVsMedian: 0, drawdownFromHistoryPeakPct: 0, regimeHint: "UNKNOWN"
+  };
+  const current = rows[0];
+  const oldest = rows[rows.length - 1];
+  const fiveMin = historyPriceBefore(rows, 5 * 60 * 1000);
+  const thirtyMin = historyPriceBefore(rows, 30 * 60 * 1000);
+  const twoHour = historyPriceBefore(rows, 2 * 60 * 60 * 1000);
+  const volumes = rows.map(r => Math.max(0, r.volume5mUsd));
+  const liquidity = rows.map(r => Math.max(0, r.liquidityUsd));
+  const meanVolume = mean(volumes);
+  const meanLiquidity = mean(liquidity);
+  const priceSeries = rows.map(r => r.priceUsd).filter(p => Number.isFinite(p) && p > 0);
+  const peak = priceSeries.length ? Math.max(...priceSeries) : current.priceUsd;
+  const drawdown = peak > 0 ? ((peak - current.priceUsd) / peak) * 100 : 0;
+  const flow = Math.max(0, current.buys5m) + Math.max(0, current.sells5m);
+  const buyPressure = flow > 0 ? current.buys5m / flow : 0.5;
+  const median = percentile(priceSeries, 0.5);
+  const currentReturn5mPct = pctChange(current.priceUsd, fiveMin);
+  const currentReturn30mPct = pctChange(current.priceUsd, thirtyMin);
+  const currentReturn2hPct = pctChange(current.priceUsd, twoHour);
+  let regimeHint: PatternProfile["regimeHint"] = "UNKNOWN";
+  if (drawdown >= 25 && buyPressure < 0.4) regimeHint = "PANIC";
+  else if (drawdown >= 15 && buyPressure < 0.45) regimeHint = "DISTRIBUTION";
+  else if (currentReturn30mPct > 8 && buyPressure >= 0.55) regimeHint = "TREND";
+  else if (Math.abs(currentReturn30mPct) <= 5 && buyPressure >= 0.55) regimeHint = "ACCUMULATION";
+  return {
+    historySamples: rows.length,
+    ageHours: Math.max(0, (Date.now() - oldest.tsMs) / 3600000),
+    currentReturn5mPct,
+    currentReturn30mPct,
+    currentReturn2hPct,
+    volumeVsBaseline: meanVolume > 0 ? current.volume5mUsd / meanVolume : 0,
+    liquidityVsBaseline: meanLiquidity > 0 ? current.liquidityUsd / meanLiquidity : 0,
+    buyPressure,
+    priceVsMedian: median > 0 ? current.priceUsd / median : 0,
+    drawdownFromHistoryPeakPct: drawdown,
+    regimeHint
+  };
 }
 
 export function buildBaseline(rows: Snapshot[]): Baseline {
@@ -102,13 +169,18 @@ function validDecision(value: unknown): value is GeminiDecision {
     typeof x.rationale === "string";
 }
 
-export async function askGemini(apiKey: string | undefined, model: string, role: "market" | "regime", snapshot: Snapshot, baseline: Baseline, score: number): Promise<GeminiDecision | null> {
+export async function askGemini(apiKey: string | undefined, model: string, role: "market" | "regime", snapshot: Snapshot, baseline: Baseline, score: number, pattern?: PatternProfile): Promise<GeminiDecision | null> {
   if (!apiKey) throw new Error("GEMINI_API_KEY_1 or GEMINI_API_KEY_2 is not configured");
   if (!model?.trim()) throw new Error("GEMINI_MODEL is not configured");
   if (!Number.isFinite(score)) throw new Error("Gemini anomaly score is not finite");
 
   const ai = new GoogleGenAI({ apiKey });
-  const prompt = `${role === "market" ? "You are Ciel's market analyst." : "You are Ciel's regime/deviation analyst."}\nAnalyze the supplied token data against its token-specific historical baseline. Do not claim certainty or profitability. Never invent market data. BUY only when evidence supports a favorable risk/reward versus the observed baseline; otherwise prefer HOLD or IGNORE. SELL is for evidence of distribution, panic, or a deteriorating held position. Return only the requested JSON.\nSnapshot: ${JSON.stringify(snapshot)}\nBaseline: ${JSON.stringify(baseline)}\nDeterministic anomaly score: ${score.toFixed(4)}`;
+  const prompt = `${role === "market" ? "You are Ciel's established-meme market analyst." : "You are Ciel's established-meme regime/deviation analyst."}
+The token has already passed Ciel's mature/high-volume market filter. Analyze its current behavior against its own historical baseline and its recent multi-horizon pattern profile. Do not claim certainty or profitability. Never invent market data. Do not reward novelty alone. Favor BUY only when the established token shows a favorable risk/reward setup such as sustained buy pressure, constructive momentum, and stable/improving liquidity. Prefer HOLD or IGNORE when evidence is weak. SELL is for distribution, panic, or a deteriorating held position. Return only the requested JSON.
+Snapshot: ${JSON.stringify(snapshot)}
+Baseline: ${JSON.stringify(baseline)}
+Pattern profile: ${JSON.stringify(pattern || buildPatternProfile([snapshot]))}
+Deterministic anomaly score: ${score.toFixed(4)}`;
 
   try {
     const response = await ai.models.generateContent({
