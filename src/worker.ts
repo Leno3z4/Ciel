@@ -38,7 +38,14 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastIndexerChartHits",
       "lastIndexerSkipReason",
       "lastIndexerTopMarketCapUsd",
-      "lastIndexerTopMarketCapSymbol"
+      "lastIndexerTopMarketCapSymbol",
+      "lastGeminiAttempt",
+      "lastGeminiSuccess",
+      "lastGeminiError",
+      "lastModelAnalyzed",
+      "lastModelError",
+      "lastModelEligibilityDiagnostics",
+      "lastModelEligibilityWindowSamples"
     ];
     for (const key of diagnostics) if (runtime[key] !== undefined) payload[key] = runtime[key];
     payload.lastIndexerSnapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
