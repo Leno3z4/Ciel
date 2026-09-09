@@ -41,7 +41,13 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastIndexerTopMarketCapUsd",
       "lastIndexerTopMarketCapSymbol",
       "lastModelEligibilityDiagnostics",
-      "lastModelEligibilityWindowSamples"
+      "lastModelEligibilityWindowSamples",
+      "lastModelDecisionBudgetPerCycle",
+      "lastGeminiKeyUsed",
+      "lastGeminiFallbacks",
+      "lastModelDecisionCandidate",
+      "lastModelDecisionAction",
+      "lastModelDecisionConfidence"
     ];
     for (const key of diagnostics) if (runtime[key] !== undefined) payload[key] = runtime[key];
     payload.lastIndexerSnapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
@@ -72,13 +78,16 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const eligibilityLine = eligibility
     ? `\n\nModel eligibility (latest 12 snapshots)\nMarkets: ${Number(eligibility.markets || 0)}\nHistory ≥12: ${Number(eligibility.historyEligible || 0)}\nSpan ≥30m: ${Number(eligibility.spanEligible || 0)}\nAvg volume ≥$5K: ${Number(eligibility.volumeEligible || 0)}\nAvg liquidity ≥$10K: ${Number(eligibility.liquidityEligible || 0)}\nEstablished: ${Number(eligibility.establishedEligible || 0)}`
     : "";
+  const decisionLine = runtime.lastGeminiKeyUsed !== undefined || runtime.lastModelDecisionCandidate
+    ? `\n\nDecision engine\nBudget/cycle: ${Number(runtime.lastModelDecisionBudgetPerCycle || 0)}\nCandidate: ${typeof runtime.lastModelDecisionCandidate === "string" ? runtime.lastModelDecisionCandidate.slice(0, 10) : "n/a"}\nGemini key slot: ${Number(runtime.lastGeminiKeyUsed || 0) || "n/a"}\nFallbacks used: ${Number(runtime.lastGeminiFallbacks || 0)}`
+    : "";
   const capText = topCap > 0 ? `$${topCap >= 1_000_000 ? (topCap / 1_000_000).toFixed(2) + "M" : (topCap / 1_000).toFixed(1) + "K"}` : "n/a";
   const snapshots = await snapshotDiagnostics(env);
   const topHistory = snapshots.markets.slice(0, 5).map((row, i) => {
     const label = row.symbol && row.symbol.trim() ? row.symbol.trim() : row.token.slice(0, 10);
     return `${i + 1}. ${label} — ${row.samples} snapshots / ${row.ageMinutes.toFixed(1)}m`;
   }).join("\n");
-  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`);
+  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`);
 }
 
 const worker = {
