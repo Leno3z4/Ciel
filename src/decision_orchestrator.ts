@@ -11,6 +11,10 @@ export type CielDecision = {
   portfolioExposurePct?: number;
   positionPct?: number;
   priceChangePct?: number;
+  expectedLowUsd?: number;
+  expectedHighUsd?: number;
+  anomalyScore?: number;
+  regime?: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";
 };
 
 /**
