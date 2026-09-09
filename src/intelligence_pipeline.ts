@@ -17,6 +17,7 @@ export async function recordGeminiDecision(env: any, decision: any) {
     decision: decision.action,
     confidence: decision.confidence ?? 0,
     reason: decision.rationale ?? "",
+    timestamp: Date.now(),
     result: "pending"
   });
 }
