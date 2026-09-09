@@ -7,7 +7,10 @@ export async function handleTelegramCommand(
   const normalized = command.trim().toLowerCase();
 
   if (normalized === "/status" || normalized === "/ciel") {
-    return buildStatusReport(env);
+    // buildStatusReport formats StatusInput; the command handler currently has
+    // no status aggregation layer, so preserve the formatter's existing
+    // zero/default behavior rather than passing an incompatible Worker env.
+    return buildStatusReport({});
   }
 
   if (normalized === "/help") {
