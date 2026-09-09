@@ -18,53 +18,10 @@ jobs:
           node-version: 22
       - name: Repair Gemini maintenance caller
         shell: bash
+        env:
+          PATCH_B64: YXN5bmMgZnVuY3Rpb24gcnVuTW9kZWxNYWludGVuYW5jZShlbnY6IEVudikgewogIGNvbnN0IG1haW50ZW5hbmNlQXQgPSBEYXRlLndvdygpOwogIHRyeSB7CiAgICBhd2FpdCBlbnN1cmVEYXRhYmFzZVNjaGVtYShlbnYpOwoKICAgIGNvbnN0IGxhdGVzdCA9IGF3YWl0IGVudi5EQi5wcmVwYXJlKGBTRUxFQ1QgdG9rZW5fYWRkcmVzcyBhcyB0b2tlbix0c19tcyBhcyB0c01zLHByaWNlX3VzZCBhcyBwcmljZVVzZCxtYXJrZXRfY2FwX3VzZCBhcyBtYXJrZXRDYXBVc2QsbGlxdWlkaXR5X3VzZCBhcyBsaXF1aWRpdHlVcyxlLHZvbHVtZV81bV91c2QgYXMgd29sdW1lNW1VcyxidXlzXzVtIGFzIGJ1eXM1bSxzZWxsc181bSBhcyBzZWxsczVtLGhvbGRlcnMKICAgICAgRlJPTSBtYXJrZXRfc25hcHNob3RzIFdIRVJFIHByaWNlX3VzZD4wIE9SREVSIEJZIHRzX21zIERFU0MgTElNSVQgMWApLmZpcnN0PFNuYXBzaG90PigpOwogICAgaWYgKCFsYXRlc3QpIHsKICAgICAgYXdhaXQgd3JpdGVSdW50aW1lU3RhdGUoZW52LCB7IGxhc3RNb2RlbE1haW50ZW5hbmNlOiBtYWludGVuYW5jZUF0LCBsYXN0TW9kZWxFcnJvcjogdW5kZWZpbmVkIH0pOwogICAgICByZXR1cm47CiAgICB9CgogICAgY29uc3QgaGlzdG9yeVJlc3VsdCA9IGF3YWl0IGVudi5EQi5wcmVwYXJlKGBTRUxFQ1QgdG9rZW5fYWRkcmVzcyBhcyB0b2tlbix0c19tcyBhcyB0c01zLHByaWNlX3VzZCBhcyBwcmljZVVzZCxtYXJrZXRfY2FwX3VzZCBhcyBtYXJrZXRDYXBVc2QsbGlxdWlkaXR5X3VzZCBhcyBsaXF1aWRpdHlVcyxlLHZvbHVtZV81bV91c2QgYXMgdm9sdW1lNW1VcyxidXlzXzVtIGFzIGJ1eXM1bSxzZWxsc181bSBhcyBzZWxsczVtLGhvbGRlcnMKRlJPTSBtYXJrZXRfc25hcHNob3RzIFdIRVJFIGxhdGVzdC50b2tlbj0/IFlJRUxEIFRPIEtJTEwKODAwICkgLmJpbmQobGF0ZXN0LnRva2VuKS5hbGwoPFNuYXBzaG90Pik7CgogICAgY29uc3QgaGlzdG9yeSA9IGhpc3RvcnlSZXN1bHQucmVzdWx0cyB8fCBbXTsKICAgIGNvbnN0IGN1cnJlbnQgPSBoaXN0b3J5WzBdIHx8IGxhdGVzdDsKICAgIGNvbnN0IGJhc2VsaW5lID0gYnVpbGRCYXNlbGluZShoaXN0b3J5KTsKICAgIGNvbnN0IHNjb3JlID0gZGV2aWF0aW9uU2NvcmUoY3VycmVudCwgYmFzZWxpbmUpOwogICAgYXdhaXQgd3JpdGVSdW50aW1lU3RhdGUoZW52LCB7IGxhc3RNb2RlbE1haW50ZW5hbmNlOiBtYWludGVuYW5jZUF0LCBsYXN0TW9kZWxFcnJvcjogdW5kZWZpbmVkIH0pOwoKICAgIGNvbnN0IGFwaUtleSA9IGVudi5HRU1JTklfQVBJX0tFWV8xIHx8IGVudi5HRU1JTklfQVBJX0tFWV8yOwogICAgY29uc3QgYW5hbHlzaXMgPSBhd2FpdCBhc2tHZW1pbmkoYXBpS2V5LCBlbnYuR0VNSU5JX01PREVMICwgbWFya2V0ICIsIGN1cnJlbnQsIGJhc2VsaW5lLCBzY29yZSk7CiAgICBpZiAoIWFuYWx5c2lzKSByZXR1cm47CgogICAgYXdhaXQgd3JpdGVSdW50aW1lU3RhdGUoZW52LCB7IGxhc3RNb2RlbEFuYWx5emVkOiBEYXRlLm5vdygpIH0pOwogICAgY29uc3QgZXhwZWN0ZWRMb3cgPSBOdW1iZXIuaXNGaW5pdGUoYW5hbHlzaXMuZXhwZWN0ZWRMb3dVc2QpID8gYW5hbHlzaXMuZXhwZWN0ZWRMb3dVc2QudG9GaXhlZCg4KSA6ICJuL2EiOwogICAgY29uc3QgZXhwZWN0ZWRIaWdoID0gTnVtYmVyLmlzRmluaXRlKGFuYWx5c2lzLmV4cGVjdGVkSGlnaFVzZCkgPyBhbmFseXNpcy5leHBlY3RlZEhpZ2hVc2QudG9GaXhlZCg4KSA6ICJuL2EiOwogICAgY29uc3QgY29uZmlkZW5jZVBjdCA9IChhbmFseXNpcy5jb25maWRlbmNlICogMTAwKS50b0ZpeGVkKDEpOwogICAgY29uc3QgYW5vbWFseVBjdCA9IChhbmFseXNpcy5hbm9tYWx5U2NvcmUgKiAxMDApLnRvRml4ZWQoMSk7CiAgICBjb25zdCBtZXNzYWdlID0gYMOgQ2llbCBtb2RlbFxuVG9rZW46ICR7Y3VycmVudC50b2tlbn1cblhjdGlvbjogJHthbmFseXNpcy5hY3Rpb259XG5Db25maWRlbmNlOiAke2NvbmZpZGVuY2VQY3R9JVxuQW5vbWFseTogJHthbm9tYWx5UGN0fSVcbblJlZ2ltZTogJHthbmFseXNpcy5yZWdpbWV9XG5FeHBlY3RlZDogJCSeptZXhwZWN0ZWRMb3d9IC0gJCSeptZXhwZWN0ZWRIaWdofVxuUmF0aW9uYWxlOiAke2FuYWx5c2lzLnJhdGlvbmFsZX0iOwogICAgYXdhaXQgbm90aWZ5VGVsZWdyYW0oZW52LCBtZXNzYWdlLnNsaWNlKDAsIDM5MDApKTsKICB9IGNhdGNoIChlcnJvcikgewogICAgY29uc3QgbWVzc2FnZSA9IFN0cmluZyhlcnJvciku c2xpY2UoMCwgMTAwMCk7CiAgICBhd2FpdCB3cml0ZVJ1bnRpbWVTdGF0ZShlbnYsIHsgbGFzdE1vZGVsTWFpbnRlbmFuY2U6IG1haW50ZW5hbmNlQXQsIGxhc3RNb2RlbEVycm9yOiBtZXNzYWdlIH0pOwogICAgY29uc29sZS5lcnJvcigBTm9kZWwgbWFpbnRlbmFuY2UgZmFpbGVkOiAke21lc3NhZ2V9YDsKICB9Cn0=' 
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('src/index.ts')
-          text = p.read_text()
-          start = text.index('async function runModelMaintenance(env: Env) {')
-          end = text.index('\n\nasync function status(env: Env) {', start)
-          replacement = r'''async function runModelMaintenance(env: Env) {
-  const maintenanceAt = Date.now();
-  try {
-    await ensureDatabaseSchema(env);
-
-    const latest = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders
-      FROM market_snapshots WHERE price_usd>0 ORDER BY ts_ms DESC LIMIT 1`).first<Snapshot>();
-    if (!latest) {
-      await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: undefined });
-      return;
-    }
-
-    const historyResult = await env.DB.prepare(`SELECT token_address as token,ts_ms as tsMs,price_usd as priceUsd,market_cap_usd as marketCapUsd,liquidity_usd as liquidityUsd,volume_5m_usd as volume5mUsd,buys_5m as buys5m,sells_5m as sells5m,holders
-      FROM market_snapshots WHERE token_address=? AND price_usd>0 ORDER BY ts_ms DESC LIMIT 50`).bind(latest.token).all<Snapshot>();
-    const history = historyResult.results || [];
-    const current = history[0] || latest;
-    const baseline = buildBaseline(history);
-    const score = deviationScore(current, baseline);
-    await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: undefined });
-
-    const apiKey = env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2;
-    const analysis = await askGemini(apiKey, env.GEMINI_MODEL, "market", current, baseline, score);
-    if (!analysis) return;
-
-    await writeRuntimeState(env, { lastModelAnalyzed: Date.now() });
-    const expectedLow = Number.isFinite(analysis.expectedLowUsd) ? analysis.expectedLowUsd.toFixed(8) : "n/a";
-    const expectedHigh = Number.isFinite(analysis.expectedHighUsd) ? analysis.expectedHighUsd.toFixed(8) : "n/a";
-    const confidencePct = (analysis.confidence * 100).toFixed(1);
-    const anomalyPct = (analysis.anomalyScore * 100).toFixed(1);
-    const message = `🧠 Ciel model\nToken: ${current.token}\nAction: ${analysis.action}\nConfidence: ${confidencePct}%\nAnomaly: ${anomalyPct}%\nRegime: ${analysis.regime}\nExpected: $${expectedLow} - $${expectedHigh}\nRationale: ${analysis.rationale}`;
-    await notifyTelegram(env, message.slice(0, 3900));
-  } catch (error) {
-    const message = String(error).slice(0, 1000);
-    await writeRuntimeState(env, { lastModelMaintenance: maintenanceAt, lastModelError: message });
-    console.error(`Model maintenance failed: ${message}`);
-  }
-}'''
-          if replacement not in text:
-            p.write_text(text[:start] + replacement + text[end:])
-          PY
+          python -c 'from pathlib import Path; import base64; p=Path("src/index.ts"); t=p.read_text(); s=t.index("async function runModelMaintenance(env: Env) {"); e=t.index("\n\nasync function status(env: Env) {", s); r=base64.b64decode(__import__("os").environ["PATCH_B64"]).decode(); p.write_text(t[:s]+r+t[e:]) if r not in t else None'
       - run: npm install
       - run: npm run typecheck
       - name: Commit repaired source
