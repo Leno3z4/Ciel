@@ -36,10 +36,10 @@ const INDEXER_STATE_KEY = "indexer_state";
 const RPC_LOG_RANGE_BLOCKS = 100;
 const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
 const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
-// Keep every scheduled invocation well below Cloudflare's subrequest budget.
-// This is deliberately a small, established-market watchlist rather than a new-token scanner.
-const ESTABLISHED_TOKEN_LIMIT = 6;
+// Keep scheduled scans small enough for Cloudflare subrequest limits while focusing on established markets.
+const ESTABLISHED_TOKEN_LIMIT = 12;
 const FACTORY_BOOTSTRAP_PAIR_LIMIT = 8;
+const MIN_MARKET_CAP_USD = 90_000;
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
 async function monUsd(env: IndexEnv): Promise<number> {
@@ -192,32 +192,23 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   }
   for (const log of snipingPenalties) {
     const a = log.args; if (!a.token) continue;
-    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
+    await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-sniping.json`, JSON.stringify({ type: "SnipingPenalty", block: log.blockNumber.toString(), log.transactionHash, token: a.token, penaltyBps: a.penaltyBps?.toString() }));
   }
 
   await bootstrapFactoryTokens(env, client);
 
-  // Only monitor established, information-rich markets. Fresh/low-history tokens are
-  // intentionally excluded from the model watchlist; they are useful as discovery data,
-  // not as immediate trading candidates.
+  // Snapshot only established information-rich markets. Tokens are still discovered and
+  // stored for history, but only markets clearing the $90k market-cap floor enter the model dataset.
   const existingTokens = await env.DB.prepare(`
     SELECT t.address,t.total_supply,t.decimals,t.quote_token,t.pair_address,t.graduated,t.liquidity_usd
     FROM tokens t
     WHERE t.quote_token IS NOT NULL
-      AND (
-        t.graduated=1 OR t.liquidity_usd >= 1000
-      )
-      AND (
-        SELECT COUNT(*) FROM market_snapshots hs WHERE hs.token_address=t.address AND hs.price_usd>0
-      ) >= 3
-    ORDER BY (
-      SELECT COALESCE(SUM(hs.volume_5m_usd),0) FROM market_snapshots hs
-      WHERE hs.token_address=t.address AND hs.ts_ms >= ?
-    ) DESC,
-    COALESCE(t.liquidity_usd,0) DESC,
-    COALESCE(t.market_cap_usd,0) DESC
+      AND (t.graduated=1 OR COALESCE(t.liquidity_usd,0) >= 1000)
+    ORDER BY COALESCE(t.market_cap_usd,0) DESC,
+             COALESCE(t.liquidity_usd,0) DESC,
+             t.last_seen_ms DESC
     LIMIT ?
-  `).bind(Date.now() - 6 * 60 * 60 * 1000, ESTABLISHED_TOKEN_LIMIT).all<{
+  `).bind(ESTABLISHED_TOKEN_LIMIT).all<{
     address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null;
   }>();
 
@@ -231,8 +222,6 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
       total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null;
     }>();
     if (!meta || !meta.quote_token) continue;
-    const historicalSamples = await env.DB.prepare("SELECT COUNT(*) as count FROM market_snapshots WHERE token_address=? AND price_usd>0").bind(token).first<{ count: number }>();
-    if (Number(historicalSamples?.count || 0) < 3 && Number(meta.graduated) !== 1 && !(Number(meta.liquidity_usd || 0) >= 1000)) continue;
     const decimals = Number(meta.decimals || 18);
     const quoteOut = await quoteSell(client, token as Address, 10n ** BigInt(decimals)).catch(() => 0n);
     const quoteUsd = meta.quote_token.toLowerCase() === WMON.toLowerCase() || meta.quote_token.toLowerCase() === LVMON.toLowerCase() ? monPrice : 0;
@@ -240,6 +229,7 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
     if (!(priceUsd > 0)) continue;
     const supply = meta.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0;
     const marketCapUsd = priceUsd * supply;
+    if (!(marketCapUsd >= MIN_MARKET_CAP_USD)) continue;
     let liquidityUsd = quoteUsd > 0 ? rawToUnits(s.liquidityQuote, 18) * quoteUsd * 2 : 0;
     if (liquidityUsd <= 0 && meta.liquidity_usd) liquidityUsd = Number(meta.liquidity_usd);
     if (Number(meta.graduated) === 1 && meta.pair_address) {
