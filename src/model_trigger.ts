@@ -335,11 +335,22 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
           pattern
         );
     
+        const decision = response.decision;
+
+        if (!decision) {
+          throw new Error("Gemini returned no decision");
+        }
+        
+        const normalizedAction =
+          decision.action === "HOLD" || decision.action === "IGNORE"
+            ? "WAIT"
+            : decision.action;
+        
         return {
           token: candidate.token,
-          action: response.decision.action,
-          confidence: response.decision.confidence ?? 0,
-          rationale: response.decision.reason ?? "",
+          action: normalizedAction,
+          confidence: decision.confidence ?? 0,
+          rationale: decision.rationale ?? "",
           liquidityUsd: Number(current.liquidityUsd ?? 0),
           slippageBps: 0,
           portfolioExposurePct: 0,
