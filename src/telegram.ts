@@ -41,6 +41,35 @@ async function sendTelegram(env: Env, text: string): Promise<void> {
   await telegramRequest(env, "sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
 }
 
+function fmtUsd(value: number): string {
+  if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `$${(value / 1_000).toFixed(1)}K`;
+  return `$${Math.round(value)}`;
+}
+
+function fmtPct(value: number | null): string {
+  return Number.isFinite(Number(value)) ? `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(1)}%` : "n/a";
+}
+
+async function transformIndexerNotification(env: Env, text: string): Promise<string> {
+  if (!text.startsWith("📡 Ciel indexer")) return text;
+  try {
+    const established = await env.DB.prepare(`SELECT COUNT(*) as count FROM (SELECT token_address FROM market_snapshots WHERE price_usd>0 GROUP BY token_address HAVING COUNT(*)>=12 AND (MAX(ts_ms)-MIN(ts_ms))>=1800000 AND AVG(volume_5m_usd)>=5000 AND AVG(liquidity_usd)>=10000 AND AVG(market_cap_usd)>=90000)`).first<{ count: number }>();
+    const rows = await env.DB.prepare(`SELECT s.token_address as token, t.symbol as symbol, s.market_cap_usd as cap,
+      ((s.market_cap_usd - COALESCE((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-1800000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),s.market_cap_usd)) / NULLIF((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-1800000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),0))*100 as ret30,
+      ((s.market_cap_usd - COALESCE((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-7200000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),s.market_cap_usd)) / NULLIF((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-7200000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),0))*100 as ret2h
+      FROM market_snapshots s LEFT JOIN tokens t ON t.address=s.token_address
+      WHERE s.ts_ms=(SELECT MAX(x.ts_ms) FROM market_snapshots x WHERE x.token_address=s.token_address) AND s.market_cap_usd>=90000
+      ORDER BY s.market_cap_usd DESC LIMIT 5`).all<{ token: string; symbol: string | null; cap: number; ret30: number | null; ret2h: number | null }>();
+    if (!(rows.results?.length)) return "📊 Ciel market monitor\nEstablished markets: 0\nMarket-cap floor: ≥$90,000\n\nNo qualifying market-cap snapshots yet. Ciel is still building history.";
+    const top = (rows.results || []).map((row, i) => `${i + 1}. ${row.symbol || row.token.slice(0, 10)} — ${fmtUsd(Number(row.cap))} | ${fmtPct(row.ret30)} 30m | ${fmtPct(row.ret2h)} 2h`);
+    return `📊 Ciel market monitor\nEstablished markets: ${Number(established?.count || 0)}\nMarket-cap floor: ≥$90,000\n\nTop markets\n${top.join("\n")}`.slice(0, 3900);
+  } catch (error) {
+    console.error(`Market monitor Telegram formatting failed: ${String(error).slice(0, 500)}`);
+    return "📊 Ciel market monitor\nMarket-cap floor: ≥$90,000\n\nMarket snapshot data is not available yet; Ciel is still building its history.";
+  }
+}
+
 export async function testTelegram(env: Env): Promise<{ ok: boolean; bot?: string; chat?: string; error?: string }> {
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = env.TELEGRAM_CHAT_ID?.trim();
@@ -67,9 +96,10 @@ export async function testTelegram(env: Env): Promise<{ ok: boolean; bot?: strin
 export async function notifyTelegram(env: Env, text: string): Promise<void> {
   await recordTelegramRuntime(env, { lastAttemptAt: Date.now() });
   try {
-    await sendTelegram(env, text);
+    const outgoing = await transformIndexerNotification(env, text);
+    await sendTelegram(env, outgoing);
     await recordTelegramRuntime(env, { lastSuccessAt: Date.now(), lastError: undefined });
-    await reportAfterNotification(env, text, sendTelegram);
+    await reportAfterNotification(env, outgoing, sendTelegram);
   } catch (error) {
     const message = String(error).slice(0, 800);
     await recordTelegramRuntime(env, { lastFailureAt: Date.now(), lastError: message });
