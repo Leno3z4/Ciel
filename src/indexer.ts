@@ -24,10 +24,9 @@ export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: numb
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
 
 const INDEXER_STATE_KEY = "indexer_state";
-// Keep RPC ranges conservative, but large enough to catch up on Monad's fast block time.
-const RPC_LOG_RANGE_BLOCKS = 500;
-// If a stale cursor is thousands/millions of blocks behind, do not spend days replaying old history.
-// Jump close to the chain tip so live monitoring starts promptly after a fresh deployment/outage.
+// rpc.monad.xyz currently enforces a maximum eth_getLogs range of 100 blocks.
+const RPC_LOG_RANGE_BLOCKS = 100;
+// Do not spend days replaying obsolete history after a stale deployment/outage.
 const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
 const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
@@ -39,7 +38,7 @@ async function monUsd(env: IndexEnv): Promise<number> {
     if (!r.ok) return cached > 0 ? cached : 0;
     const j = await r.json() as { monad?: { usd?: number } };
     const price = Number(j.monad?.usd || 0);
-    if (price > 0 && !(cached > 0)) await env.CIEL_STATE.put("mon_usd", String(price), { expirationTtl: 3600 });
+    if (price > 0) await env.CIEL_STATE.put("mon_usd", String(price), { expirationTtl: 3600 });
     return price > 0 ? price : cached > 0 ? cached : 0;
   } catch { return cached > 0 ? cached : 0; }
 }
@@ -66,14 +65,12 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   const cursorRaw = state?.nextBlock ?? await env.CIEL_STATE.get("indexer_next_block");
   let fromBlock = cursorRaw ? BigInt(cursorRaw) : (latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n);
 
-  // Older deployments initialized around a fixed historical block. That is unsuitable for
-  // live monitoring on Monad because the chain advances extremely quickly. If the cursor is
-  // stale, deliberately re-anchor it near the tip instead of taking days to catch up.
   if (latest > fromBlock && latest - fromBlock > MAX_ACCEPTABLE_LAG_BLOCKS) {
     fromBlock = latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n;
   }
   if (fromBlock > latest) return null;
 
+  // Clamp every invocation to the RPC's hard eth_getLogs limit, regardless of callers.
   const requestedBlocks = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS));
   const toBlock = fromBlock + BigInt(requestedBlocks - 1) > latest ? latest : fromBlock + BigInt(requestedBlocks - 1);
 
@@ -109,9 +106,6 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
       .bind(a.token, a.symbol ?? null, a.name ?? null, 0, 0, Date.now(), Date.now(), totalSupply?.toString() ?? null, Number(decimals), a.quoteToken, a.pair, 0, Number(log.blockNumber)).run();
   }
 
-  // Router Buy/Sell events are the authoritative user-action feed across both
-  // pre-graduation bonding-curve and post-graduation DEX routes. Do not add
-  // bonding-curve Buy/Sell counts separately or pre-graduation trades would be double-counted.
   for (const log of routerBuys) {
     const a = log.args; if (!a.token) continue;
     const s = touch(a.token); s.buyVolume += a.amountIn ?? 0n; s.buys++;
@@ -122,18 +116,14 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
     const s = touch(a.token); s.sellVolume += a.amountOut ?? 0n; s.sells++;
     await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated }));
   }
-  if (routerBuys.length === 0) {
-    for (const log of bondingBuys) {
-      const a = log.args; if (!a.token) continue;
-      const s = touch(a.token); s.buyVolume += a.quoteIn ?? 0n; s.buys++;
-    }
-  }
-  if (routerSells.length === 0) {
-    for (const log of bondingSells) {
-      const a = log.args; if (!a.token) continue;
-      const s = touch(a.token); s.sellVolume += a.quoteOut ?? 0n; s.sells++;
-    }
-  }
+  if (routerBuys.length === 0) for (const log of bondingBuys) {
+    const a = log.args; if (!a.token) continue;
+    const s = touch(a.token); s.buyVolume += a.quoteIn ?? 0n; s.buys++;
+  };
+  if (routerSells.length === 0) for (const log of bondingSells) {
+    const a = log.args; if (!a.token) continue;
+    const s = touch(a.token); s.sellVolume += a.quoteOut ?? 0n; s.sells++;
+  };
 
   for (const log of syncs) {
     const a = log.args; if (!a.token) continue;
