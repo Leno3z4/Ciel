@@ -39,11 +39,6 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastIndexerSkipReason",
       "lastIndexerTopMarketCapUsd",
       "lastIndexerTopMarketCapSymbol",
-      "lastGeminiAttempt",
-      "lastGeminiSuccess",
-      "lastGeminiError",
-      "lastModelAnalyzed",
-      "lastModelError",
       "lastModelEligibilityDiagnostics",
       "lastModelEligibilityWindowSamples"
     ];
@@ -72,10 +67,14 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const snapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
   const topCap = Number(runtime.lastIndexerTopMarketCapUsd || 0);
   const topSymbol = typeof runtime.lastIndexerTopMarketCapSymbol === "string" ? runtime.lastIndexerTopMarketCapSymbol : "";
+  const eligibility = runtime.lastModelEligibilityDiagnostics as Record<string, unknown> | undefined;
+  const eligibilityLine = eligibility
+    ? `\n\nModel eligibility (latest 12 snapshots)\nMarkets: ${Number(eligibility.markets || 0)}\nHistory ≥12: ${Number(eligibility.historyEligible || 0)}\nSpan ≥30m: ${Number(eligibility.spanEligible || 0)}\nAvg volume ≥$5K: ${Number(eligibility.volumeEligible || 0)}\nAvg liquidity ≥$10K: ${Number(eligibility.liquidityEligible || 0)}\nEstablished: ${Number(eligibility.establishedEligible || 0)}`
+    : "";
   const capText = topCap > 0 ? `$${topCap >= 1_000_000 ? (topCap / 1_000_000).toFixed(2) + "M" : (topCap / 1_000).toFixed(1) + "K"}` : "n/a";
   const snapshots = await snapshotDiagnostics(env);
   const topHistory = snapshots.markets.slice(0, 5).map((row, i) => `${i + 1}. ${row.token.slice(0, 10)} — ${row.samples} snapshots / ${row.ageMinutes.toFixed(1)}m`).join("\n");
-  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`);
+  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`);
 }
 
 const worker = {
