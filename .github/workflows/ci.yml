@@ -5,9 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: write
-
 jobs:
   typecheck:
     runs-on: ubuntu-latest
@@ -16,15 +13,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Repair Gemini maintenance caller
-        run: node scripts/repair-model.mjs
       - run: npm install
       - run: npm run typecheck
-      - name: Commit repaired source
-        run: |
-          if git diff --quiet -- src/index.ts; then exit 0; fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/index.ts
-          git commit -m "fix: repair hourly Gemini model maintenance"
-          git push origin HEAD:main
