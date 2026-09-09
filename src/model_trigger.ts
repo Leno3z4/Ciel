@@ -51,14 +51,11 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
     FROM market_snapshots ms
     WHERE ms.price_usd>0
       AND ms.ts_ms >= (
-        SELECT MIN(recent.ts_ms)
-        FROM (
-          SELECT ts_ms
-          FROM market_snapshots
-          WHERE token_address=ms.token_address AND price_usd>0
-          ORDER BY ts_ms DESC
-          LIMIT ?
-        ) recent
+        SELECT ts_ms
+        FROM market_snapshots
+        WHERE token_address=ms.token_address AND price_usd>0
+        ORDER BY ts_ms DESC
+        LIMIT 1 OFFSET 11
       )
     GROUP BY ms.token_address
     HAVING COUNT(*)>=?
@@ -69,7 +66,6 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
     ORDER BY AVG(ms.volume_5m_usd) DESC
     LIMIT ?`
   ).bind(
-    MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SPAN_MS,
     MIN_AVG_VOLUME_5M_USD,
@@ -99,14 +95,11 @@ async function writeEligibilityDiagnostics(env: ModelEnv): Promise<void> {
       FROM market_snapshots ms
       WHERE ms.price_usd>0
         AND ms.ts_ms >= (
-          SELECT MIN(recent.ts_ms)
-          FROM (
-            SELECT ts_ms
-            FROM market_snapshots
-            WHERE token_address=ms.token_address AND price_usd>0
-            ORDER BY ts_ms DESC
-            LIMIT ?
-          ) recent
+          SELECT ts_ms
+          FROM market_snapshots
+          WHERE token_address=ms.token_address AND price_usd>0
+          ORDER BY ts_ms DESC
+          LIMIT 1 OFFSET 11
         )
       GROUP BY ms.token_address
     )
@@ -115,8 +108,7 @@ async function writeEligibilityDiagnostics(env: ModelEnv): Promise<void> {
     MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS,
     MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD,
     MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD,
-    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD, MIN_MARKET_CAP_USD,
-    MIN_HISTORY_SAMPLES
+    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD, MIN_MARKET_CAP_USD
   ).first<Record<string, number>>();
 
   await writeRuntime(env, {
