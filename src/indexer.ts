@@ -46,6 +46,7 @@ const NADFUN_API_BASE = "https://api.nadapp.net";
 
 function asNumber(value: unknown): number { const n = Number(value ?? 0); return Number.isFinite(n) ? n : 0; }
 function asString(value: unknown): string | null { return typeof value === "string" && value.length > 0 ? value : null; }
+function isAddress(value: string | null): value is `0x${string}` { return Boolean(value && /^0x[a-fA-F0-9]{40}$/.test(value)); }
 function rawToUnits(value: bigint, decimals: number): number { return Number(value) / 10 ** decimals; }
 function apiSupplyToUnits(value: unknown, decimals: number): number { const n = asNumber(value); if (!(n > 0)) return 0; return n >= 1e15 ? n / 10 ** decimals : n; }
 function decodeBase64Json(text: string): unknown | null {
@@ -73,7 +74,12 @@ async function fetchNadFunMarketRanking(env: IndexEnv): Promise<NadFunToken[]> {
   try { const parsed = JSON.parse(cached) as unknown; return Array.isArray(parsed) ? parsed as NadFunToken[] : []; } catch { return []; }
 }
 
-function tokenId(item: NadFunToken): string | null { return asString(item.token_info?.token_id) || asString(item.token_info?.address); }
+function tokenId(item: NadFunToken): string | null {
+  const address = asString(item.token_info?.address);
+  if (isAddress(address)) return address;
+  const tokenIdValue = asString(item.token_info?.token_id);
+  return isAddress(tokenIdValue) ? tokenIdValue : null;
+}
 function tokenSymbol(item: NadFunToken): string | null { return asString(item.token_info?.symbol); }
 function tokenName(item: NadFunToken): string | null { return asString(item.token_info?.name); }
 function tokenQuote(item: NadFunToken): string | null { return asString(item.market_info?.quote_id) || asString(item.market_info?.quote_token) || asString(item.token_info?.quote_token); }
@@ -183,20 +189,29 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   const marketByToken = new Map<string, NadFunToken>();
   for (const item of rankedMarkets) { const id = tokenId(item); if (id) marketByToken.set(id.toLowerCase(), item); }
   const existingTokens = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE quote_token IS NOT NULL ORDER BY COALESCE(market_cap_usd,0) DESC,COALESCE(liquidity_usd,0) DESC,last_seen_ms DESC LIMIT ?").bind(ESTABLISHED_TOKEN_LIMIT).all<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
-  for (const row of existingTokens.results ?? []) touch(row.address);
-  for (const item of rankedMarkets.slice(0, NADFUN_MARKET_LIMIT)) { const id = tokenId(item); if (id && /^0x[a-fA-F0-9]{40}$/.test(id)) touch(id); }
+  for (const item of rankedMarkets.slice(0, NADFUN_MARKET_LIMIT)) { const id = tokenId(item); if (id) touch(id); }
+  for (const row of existingTokens.results ?? []) if (!stats.has(row.address)) touch(row.address);
 
   const ts = Date.now(); let snapshots = 0;
   for (const [token, s] of stats) {
     if (snapshots >= ESTABLISHED_TOKEN_LIMIT) break;
-    const meta = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE address=?").bind(token).first<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
+    let meta = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE address=?").bind(token).first<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
     const apiMarket = marketByToken.get(token.toLowerCase());
+    if (!meta && apiMarket) {
+      const apiDecimals = Number(apiMarket.market_info?.decimals ?? apiMarket.token_info?.decimals ?? 18);
+      const seededQuote = tokenQuote(apiMarket) || "NADFUN";
+      const now = Date.now();
+      await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO NOTHING`).bind(token, tokenSymbol(apiMarket), tokenName(apiMarket), 0, 0, now, now, apiMarket.market_info?.total_supply ?? apiMarket.token_info?.total_supply ?? null, apiDecimals, seededQuote, tokenPair(apiMarket), tokenGraduated(apiMarket)).run();
+      meta = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,liquidity_usd,market_cap_usd FROM tokens WHERE address=?").bind(token).first<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; liquidity_usd: number | null; market_cap_usd: number | null }>();
+    }
     if (!meta && !apiMarket) continue;
     const decimals = Number(meta?.decimals || 18);
-    const priceUsd = tokenPriceUsd(apiMarket ?? {});
     const supply = apiSupplyToUnits(apiMarket?.market_info?.total_supply ?? apiMarket?.token_info?.total_supply, decimals) || (meta?.total_supply ? rawToUnits(BigInt(meta.total_supply), decimals) : 0);
-    const marketCapUsd = tokenMarketCap(apiMarket ?? {}, decimals) || (priceUsd > 0 && supply > 0 ? priceUsd * supply : Number(meta?.market_cap_usd || 0));
+    const reportedMarketCap = tokenMarketCap(apiMarket ?? {}, decimals);
+    const marketCapUsd = reportedMarketCap || Number(meta?.market_cap_usd || 0);
     if (!(marketCapUsd >= MIN_MARKET_CAP_USD)) continue;
+    const reportedPriceUsd = tokenPriceUsd(apiMarket ?? {});
+    const priceUsd = reportedPriceUsd || (marketCapUsd > 0 && supply > 0 ? marketCapUsd / supply : 0);
     const quotePriceUsd = tokenQuotePriceUsd(apiMarket ?? {});
     const liquidityUsd = tokenLiquidityUsd(apiMarket ?? {}) || Number(meta?.liquidity_usd || 0);
     const fallbackVolumeUsd = (Number(s.buyVolume) + Number(s.sellVolume)) / 1e18 * quotePriceUsd;
