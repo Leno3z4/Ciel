@@ -8,11 +8,12 @@ export { TradingEngine };
 const HEARTBEAT_KEY = "ciel_telegram_heartbeat_ms";
 const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
 
-async function snapshotDiagnostics(env: Env): Promise<{ total: number; markets: Array<{ token: string; samples: number; ageMinutes: number }> }> {
+async function snapshotDiagnostics(env: Env): Promise<{ total: number; markets: Array<{ token: string; symbol: string | null; samples: number; ageMinutes: number }> }> {
   try {
     const total = await env.DB.prepare("SELECT COUNT(*) as count FROM market_snapshots").first<{ count: number }>();
-    const rows = await env.DB.prepare(`SELECT token_address as token, COUNT(*) as samples, (MAX(ts_ms)-MIN(ts_ms))/60000.0 as ageMinutes
-      FROM market_snapshots WHERE price_usd>0 GROUP BY token_address ORDER BY COUNT(*) DESC LIMIT 10`).all<{ token: string; samples: number; ageMinutes: number }>();
+    const rows = await env.DB.prepare(`SELECT s.token_address as token, t.symbol as symbol, COUNT(*) as samples, (MAX(s.ts_ms)-MIN(s.ts_ms))/60000.0 as ageMinutes
+      FROM market_snapshots s LEFT JOIN tokens t ON lower(t.address)=lower(s.token_address)
+      WHERE s.price_usd>0 GROUP BY s.token_address, t.symbol ORDER BY COUNT(*) DESC LIMIT 10`).all<{ token: string; symbol: string | null; samples: number; ageMinutes: number }>();
     return { total: Number(total?.count || 0), markets: rows.results || [] };
   } catch {
     return { total: 0, markets: [] };
@@ -73,7 +74,10 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
     : "";
   const capText = topCap > 0 ? `$${topCap >= 1_000_000 ? (topCap / 1_000_000).toFixed(2) + "M" : (topCap / 1_000).toFixed(1) + "K"}` : "n/a";
   const snapshots = await snapshotDiagnostics(env);
-  const topHistory = snapshots.markets.slice(0, 5).map((row, i) => `${i + 1}. ${row.token.slice(0, 10)} — ${row.samples} snapshots / ${row.ageMinutes.toFixed(1)}m`).join("\n");
+  const topHistory = snapshots.markets.slice(0, 5).map((row, i) => {
+    const label = row.symbol && row.symbol.trim() ? row.symbol.trim() : row.token.slice(0, 10);
+    return `${i + 1}. ${label} — ${row.samples} snapshots / ${row.ageMinutes.toFixed(1)}m`;
+  }).join("\n");
   await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`);
 }
 
