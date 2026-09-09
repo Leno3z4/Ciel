@@ -100,7 +100,7 @@ export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
   const currentHour = new Date(current.tsMs).getUTCHours();
   const sameHour = rows.filter(r => new Date(r.tsMs).getUTCHours() === currentHour && r.marketCapUsd > 0).map(r => r.marketCapUsd);
   const sameHourMean = mean(sameHour);
-  const range = caps.length ? Math.max(caps[caps.length - 1] ?? 0, Math.max(...caps)) - Math.min(...caps) : 0;
+  const range = caps.length ? Math.max(...caps) - Math.min(...caps) : 0;
   const marketCapPositionPct = range > 0 ? ((current.marketCapUsd - Math.min(...caps)) / range) * 100 : 50;
   const flow = Math.max(0, current.buys5m) + Math.max(0, current.sells5m);
   const buyPressure = flow > 0 ? Math.max(0, current.buys5m) / flow : 0.5;
@@ -181,17 +181,58 @@ function validDecision(value: unknown): value is GeminiDecision {
     typeof x.rationale === "string";
 }
 
+function compactDecisionPacket(snapshot: Snapshot, baseline: Baseline, pattern: PatternProfile, score: number): Record<string, unknown> {
+  return {
+    current: {
+      marketCapUsd: Math.round(snapshot.marketCapUsd),
+      capReturn5mPct: Number(pattern.currentMarketCapReturn5mPct.toFixed(2)),
+      capReturn30mPct: Number(pattern.currentMarketCapReturn30mPct.toFixed(2)),
+      capReturn2hPct: Number(pattern.currentMarketCapReturn2hPct.toFixed(2)),
+      capVsMedian: Number(pattern.marketCapVsMedian.toFixed(3)),
+      capVsMean: Number(pattern.marketCapVsMean.toFixed(3)),
+      capVsSameHour: Number(pattern.sameHourMarketCapVsBaseline.toFixed(3)),
+      capPositionPct: Number(pattern.marketCapPositionPct.toFixed(1)),
+      drawdownPct: Number(pattern.drawdownFromMarketCapPeakPct.toFixed(2)),
+      regimeHint: pattern.regimeHint
+    },
+    liquidity: {
+      usd: Math.round(snapshot.liquidityUsd),
+      vsBaseline: Number(pattern.liquidityVsBaseline.toFixed(3)),
+      volume5mUsd: Math.round(snapshot.volume5mUsd),
+      volumeVsBaseline: Number(pattern.volumeVsBaseline.toFixed(3))
+    },
+    confirmation: {
+      buyPressure: Number(pattern.buyPressure.toFixed(3)),
+      priceVsMedian: Number(pattern.priceVsMedian.toFixed(3)),
+      sameHourSamples: pattern.sameHourSamples
+    },
+    baseline: {
+      samples: baseline.samples,
+      medianMarketCapUsd: Math.round(baseline.medianMarketCap),
+      p10MarketCapUsd: Math.round(baseline.marketCapP10),
+      p90MarketCapUsd: Math.round(baseline.marketCapP90),
+      volatilityPct: Number(baseline.marketCapVolatilityPct.toFixed(2)),
+      maxDrawdownPct: Number(baseline.maxMarketCapDrawdownPct.toFixed(2))
+    },
+    history: {
+      samples: pattern.historySamples,
+      ageHours: Number(pattern.ageHours.toFixed(2)),
+      hourUtc: pattern.hourOfDayUtc
+    },
+    deterministicAnomalyScore: Number(score.toFixed(4))
+  };
+}
+
 export async function askGemini(apiKey: string | undefined, model: string, role: "market" | "regime", snapshot: Snapshot, baseline: Baseline, score: number, pattern?: PatternProfile): Promise<GeminiDecision | null> {
-  if (!apiKey) throw new Error("GEMINI_API_KEY_1 or GEMINI_API_KEY_2 is not configured");
+  if (!apiKey) throw new Error("Gemini API key is not configured");
   if (!model?.trim()) throw new Error("GEMINI_MODEL is not configured");
   if (!Number.isFinite(score)) throw new Error("Gemini anomaly score is not finite");
+  const effectivePattern = pattern || buildPatternProfile([snapshot]);
+  const packet = compactDecisionPacket(snapshot, baseline, effectivePattern, score);
   const ai = new GoogleGenAI({ apiKey });
-  const prompt = `${role === "market" ? "You are Ciel's established-meme market analyst." : "You are Ciel's established-meme regime/deviation analyst."}
-The primary signal is the token's MARKET CAP path over time. Ciel is studying already-created, established, high-volume meme markets, not chasing new launches. Use market-cap level, market-cap momentum, market-cap drawdown, market-cap position inside the token's historical range, and recurring UTC time-of-day behavior as the main evidence. Use price, liquidity, and volume as secondary context. Treat buys/sells and buy pressure only as confirmation, not as the main reason to enter. Compare current behavior with this token's own history and same-hour historical baseline. Favor BUY only when the market-cap pattern suggests a repeatable favorable entry regime with sufficient liquidity and risk/reward. Favor HOLD or IGNORE when evidence is weak or the setup depends mainly on novelty. SELL is for market-cap distribution, panic, or a deteriorating held position. Do not claim certainty or profitability and never invent data. Return only the requested JSON.
-Snapshot: ${JSON.stringify(snapshot)}
-Baseline: ${JSON.stringify(baseline)}
-Pattern profile: ${JSON.stringify(pattern || buildPatternProfile([snapshot]))}
-Deterministic market-cap anomaly score: ${score.toFixed(4)}`;
+  const prompt = `${role === "market" ? "You are Ciel's established-meme market decision engine." : "You are Ciel's established-meme regime/deviation decision engine."}
+Decide from a compact feature packet derived from Ciel's full local history. The full raw history is intentionally not sent to you. MARKET CAP is the primary signal: use its multi-horizon movement, position in the token's own range, drawdown, same-hour behavior, and regime. Liquidity and 5m volume are risk/quality confirmation. Buy/sell flow and price are secondary confirmation only. These are already-created established markets; do not chase novelty or new launches. BUY only for a repeatable favorable entry regime with adequate liquidity and sensible risk/reward. HOLD/IGNORE when evidence is weak. SELL for distribution, panic, or deterioration of a held position. Never invent missing data or claim certainty/profitability. Return only the requested JSON.
+Decision packet: ${JSON.stringify(packet)}`;
   try {
     const response = await ai.models.generateContent({
       model,
