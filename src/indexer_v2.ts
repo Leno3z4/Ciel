@@ -228,7 +228,7 @@ function parseBondingLogs(logs: readonly { data: `0x${string}`; topics: readonly
   const stats = new Map<string, EventStats>();
   for (const log of logs) {
     try {
-      const decoded = decodeEventLog({ abi: bondingEvents, data: log.data, topics: log.topics });
+      const decoded = decodeEventLog({ abi: bondingEvents, data: log.data, topics: [...log.topics] as [] | [`0x${string}`, ...`0x${string}`[]] });
       const args = decoded.args as Record<string, unknown>;
       const token = address(args.token);
       if (!token) continue;
