@@ -16,7 +16,7 @@
       "head_sampling_rate": 1
     }
   },
-  "triggers": { "crons": ["*/2 * * * *", "*/10 * * * *", "0 * * * *"] },
+  "triggers": { "crons": ["*/2 * * * *", "*/3 * * * *", "*/10 * * * *", "0 * * * *"] },
   "vars": {
     "TRADING_ENABLED": "false",
     "PAPER_TRADING": "true",
