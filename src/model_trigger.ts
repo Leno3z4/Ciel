@@ -40,23 +40,36 @@ async function writeRuntime(env: ModelEnv, patch: Record<string, unknown>): Prom
 }
 
 async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
-  const rows = await env.DB.prepare(`SELECT token_address as token,
+  const rows = await env.DB.prepare(`
+    SELECT ms.token_address as token,
       COUNT(*) as samples,
-      MIN(ts_ms) as firstTs,
-      MAX(ts_ms) as lastTs,
-      AVG(volume_5m_usd) as avgVolume,
-      AVG(liquidity_usd) as avgLiquidity,
-      AVG(market_cap_usd) as avgMarketCap
-    FROM market_snapshots
-    WHERE price_usd>0
-    GROUP BY token_address
+      MIN(ms.ts_ms) as firstTs,
+      MAX(ms.ts_ms) as lastTs,
+      AVG(ms.volume_5m_usd) as avgVolume,
+      AVG(ms.liquidity_usd) as avgLiquidity,
+      AVG(ms.market_cap_usd) as avgMarketCap
+    FROM market_snapshots ms
+    WHERE ms.price_usd>0
+      AND ms.ts_ms >= (
+        SELECT MIN(recent.ts_ms)
+        FROM (
+          SELECT ts_ms
+          FROM market_snapshots
+          WHERE token_address=ms.token_address AND price_usd>0
+          ORDER BY ts_ms DESC
+          LIMIT ?
+        ) recent
+      )
+    GROUP BY ms.token_address
     HAVING COUNT(*)>=?
-      AND (MAX(ts_ms)-MIN(ts_ms))>=?
-      AND AVG(volume_5m_usd)>=?
-      AND AVG(liquidity_usd)>=?
-      AND AVG(market_cap_usd)>=?
-    ORDER BY AVG(volume_5m_usd) DESC
-    LIMIT ?`).bind(
+      AND (MAX(ms.ts_ms)-MIN(ms.ts_ms))>=?
+      AND AVG(ms.volume_5m_usd)>=?
+      AND AVG(ms.liquidity_usd)>=?
+      AND AVG(ms.market_cap_usd)>=?
+    ORDER BY AVG(ms.volume_5m_usd) DESC
+    LIMIT ?`
+  ).bind(
+    MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SPAN_MS,
     MIN_AVG_VOLUME_5M_USD,
@@ -67,6 +80,51 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
   return rows.results || [];
 }
 
+async function writeEligibilityDiagnostics(env: ModelEnv): Promise<void> {
+  const row = await env.DB.prepare(`
+    SELECT
+      COUNT(*) as markets,
+      SUM(CASE WHEN samples>=? THEN 1 ELSE 0 END) as historyEligible,
+      SUM(CASE WHEN samples>=? AND spanMs>=? THEN 1 ELSE 0 END) as spanEligible,
+      SUM(CASE WHEN samples>=? AND spanMs>=? AND avgVolume>=? THEN 1 ELSE 0 END) as volumeEligible,
+      SUM(CASE WHEN samples>=? AND spanMs>=? AND avgVolume>=? AND avgLiquidity>=? THEN 1 ELSE 0 END) as liquidityEligible,
+      SUM(CASE WHEN samples>=? AND spanMs>=? AND avgVolume>=? AND avgLiquidity>=? AND avgMarketCap>=? THEN 1 ELSE 0 END) as establishedEligible
+    FROM (
+      SELECT ms.token_address,
+        COUNT(*) as samples,
+        MAX(ms.ts_ms)-MIN(ms.ts_ms) as spanMs,
+        AVG(ms.volume_5m_usd) as avgVolume,
+        AVG(ms.liquidity_usd) as avgLiquidity,
+        AVG(ms.market_cap_usd) as avgMarketCap
+      FROM market_snapshots ms
+      WHERE ms.price_usd>0
+        AND ms.ts_ms >= (
+          SELECT MIN(recent.ts_ms)
+          FROM (
+            SELECT ts_ms
+            FROM market_snapshots
+            WHERE token_address=ms.token_address AND price_usd>0
+            ORDER BY ts_ms DESC
+            LIMIT ?
+          ) recent
+        )
+      GROUP BY ms.token_address
+    )
+  `).bind(
+    MIN_HISTORY_SAMPLES,
+    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS,
+    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD,
+    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD,
+    MIN_HISTORY_SAMPLES, MIN_HISTORY_SPAN_MS, MIN_AVG_VOLUME_5M_USD, MIN_AVG_LIQUIDITY_USD, MIN_MARKET_CAP_USD,
+    MIN_HISTORY_SAMPLES
+  ).first<Record<string, number>>();
+
+  await writeRuntime(env, {
+    lastModelEligibilityDiagnostics: row || null,
+    lastModelEligibilityWindowSamples: MIN_HISTORY_SAMPLES
+  });
+}
+
 export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<void> {
   if (!env.GEMINI_API_KEY_1 && !env.GEMINI_API_KEY_2) {
     await writeRuntime(env, { lastGeminiError: "No Gemini API key configured" });
@@ -74,7 +132,11 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
   }
 
   const candidates = await selectPatternCandidates(env);
-  if (!candidates.length) return;
+  await writeEligibilityDiagnostics(env);
+  if (!candidates.length) {
+    await writeRuntime(env, { lastModelError: "No established high-volume meme candidates above $90,000 yet" });
+    return;
+  }
 
   const apiKey = env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2;
   if (!apiKey) return;
