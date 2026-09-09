@@ -6,6 +6,8 @@ const RECOVERY_INTERVAL_MS = 15 * 60 * 1000;
 const FACTORY_PAIR_LIMIT = 48;
 const CHART_LIMIT = 48;
 const MIN_MARKET_CAP_USD = 90_000;
+const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
+const RANKING_FETCH_TS_KEY = "nadfun_market_ranking_fetch_ms";
 
 const factoryAbi = [
   { type: "function", name: "allPairsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
@@ -99,30 +101,28 @@ export async function recoverFactoryMarkets(env: Env): Promise<void> {
   }
 
   const seen = new Set<string>();
-  for (const item of tokens) {
-    const key = item.token.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const now = Date.now();
-    await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,total_supply=COALESCE(excluded.total_supply,tokens.total_supply),decimals=excluded.decimals,quote_token=excluded.quote_token,pair_address=excluded.pair_address,graduated=1`).bind(item.token, null, null, 0, 0, now, now, item.supply, Math.max(0, item.decimals), item.quote, item.pair, 1).run();
-  }
-
+  const ranking: Array<Record<string, unknown>> = [];
   for (let i = 0; i < Math.min(CHART_LIMIT, tokens.length); i += 8) {
     const batch = tokens.slice(i, i + 8);
     const data = await Promise.all(batch.map(async item => ({ ...item, market: await fetchMarketData(item.token) })));
     for (const item of data) {
-      if (!(item.market.cap >= MIN_MARKET_CAP_USD)) continue;
+      const key = item.token.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
       const tokenSupply = units(item.supply, item.decimals);
       const tokenPriceUsd = tokenSupply > 0 ? item.market.cap / tokenSupply : 0;
       const tokenReserve = units(item.tokenReserveRaw, item.decimals);
       const liquidityUsd = tokenReserve > 0 && tokenPriceUsd > 0 ? tokenReserve * tokenPriceUsd * 2 : 0;
-      await env.DB.prepare("UPDATE tokens SET market_cap_usd=?,liquidity_usd=?,last_seen_ms=?,graduated=1 WHERE address=?").bind(item.market.cap, liquidityUsd, Date.now(), item.token).run();
-      if (item.market.volume5m > 0 || liquidityUsd > 0) {
-        // Snapshot fields are populated by the normal indexer cycle; this recovery pass only ensures
-        // the token metadata is ranked correctly so that cycle can snapshot the highest-cap markets.
+      const now = Date.now();
+      await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(address) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,total_supply=COALESCE(excluded.total_supply,tokens.total_supply),decimals=excluded.decimals,quote_token=excluded.quote_token,pair_address=excluded.pair_address,graduated=1`).bind(item.token, null, null, item.market.cap, liquidityUsd, now, now, item.supply, Math.max(0, item.decimals), item.quote, item.pair, 1).run();
+      if (item.market.cap >= MIN_MARKET_CAP_USD) {
+        ranking.push({ token_info: { token_id: item.token, total_supply: item.supply, decimals: item.decimals }, market_info: { market_cap_usd: item.market.cap, liquidity_usd: liquidityUsd, volume_5m_usd: item.market.volume5m, quote_token: item.quote, pair_address: item.pair }, percent: 0 });
       }
     }
   }
 
+  ranking.sort((a, b) => n((b.market_info as Record<string, unknown>)?.market_cap_usd) - n((a.market_info as Record<string, unknown>)?.market_cap_usd));
+  await env.CIEL_STATE.put(RANKING_CACHE_KEY, JSON.stringify(ranking.slice(0, 50)), { expirationTtl: 3600 });
+  await env.CIEL_STATE.put(RANKING_FETCH_TS_KEY, String(Date.now()), { expirationTtl: 3600 });
   await env.CIEL_STATE.put(RECOVERY_STATE_KEY, String(Date.now()), { expirationTtl: 86400 });
 }
