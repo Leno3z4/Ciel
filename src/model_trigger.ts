@@ -5,6 +5,12 @@ type ModelEnv = {
   DB: D1Database;
   GEMINI_API_KEY_1?: string;
   GEMINI_API_KEY_2?: string;
+  GEMINI_API_KEY_3?: string;
+  GEMINI_API_KEY_4?: string;
+  GEMINI_API_KEY_5?: string;
+  GEMINI_API_KEY_6?: string;
+  GEMINI_API_KEY_7?: string;
+  GEMINI_API_KEY_8?: string;
   GEMINI_MODEL: string;
 };
 
@@ -24,8 +30,12 @@ const MIN_HISTORY_SPAN_MS = 30 * 60 * 1000;
 const MIN_AVG_VOLUME_5M_USD = 5_000;
 const MIN_AVG_LIQUIDITY_USD = 10_000;
 const MAX_CANDIDATES = 10;
+const MAX_DECISIONS_PER_CYCLE = 3;
 const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
+const MODEL_KEY_COOLDOWN_MS = 60 * 1000;
 const MODEL_COOLDOWN_PREFIX = "ciel_model_cooldown:";
+const MODEL_KEY_COOLDOWN_PREFIX = "ciel_gemini_key_cooldown:";
+const MODEL_KEY_CURSOR = "ciel_gemini_key_cursor";
 const RUNTIME_KEY = "ciel_runtime_state";
 const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
 const MON_USD_KEY = "mon_usd";
@@ -183,12 +193,72 @@ async function writeEligibilityDiagnostics(env: ModelEnv, candidates: Candidate[
       establishedEligible,
       samples
     },
-    lastModelEligibilityWindowSamples: MIN_HISTORY_SAMPLES
+    lastModelEligibilityWindowSamples: MIN_HISTORY_SAMPLES,
+    lastModelDecisionBudgetPerCycle: MAX_DECISIONS_PER_CYCLE
   });
 }
 
+function isFallbackWorthy(error: unknown): boolean {
+  const text = String(error);
+  return /429|RESOURCE_EXHAUSTED|quota|rate.?limit|401|403|api.?key|permission/i.test(text);
+}
+
+async function getKeySlots(env: ModelEnv): Promise<Array<{ index: number; key: string }>> {
+  const keys = [
+    env.GEMINI_API_KEY_1,
+    env.GEMINI_API_KEY_2,
+    env.GEMINI_API_KEY_3,
+    env.GEMINI_API_KEY_4,
+    env.GEMINI_API_KEY_5,
+    env.GEMINI_API_KEY_6,
+    env.GEMINI_API_KEY_7,
+    env.GEMINI_API_KEY_8
+  ].map(key => (key || "").trim()).filter(Boolean);
+  if (!keys.length) return [];
+  const cursor = Math.max(0, Math.min(keys.length - 1, Number(await env.CIEL_STATE.get(MODEL_KEY_CURSOR) || "0")));
+  const ordered: Array<{ index: number; key: string }> = [];
+  for (let offset = 0; offset < keys.length; offset++) {
+    const index = (cursor + offset) % keys.length;
+    ordered.push({ index: index + 1, key: keys[index] });
+  }
+  return ordered;
+}
+
+async function askGeminiWithFallbacks(
+  env: ModelEnv,
+  model: string,
+  snapshot: Snapshot,
+  baseline: ReturnType<typeof buildBaseline>,
+  score: number,
+  pattern: ReturnType<typeof buildPatternProfile>
+): Promise<{ decision: Awaited<ReturnType<typeof askGemini>>; keyIndex: number }> {
+  const slots = await getKeySlots(env);
+  let lastError: unknown = new Error("No Gemini API key configured");
+  let attempted = 0;
+  for (const slot of slots) {
+    const cooldown = Number(await env.CIEL_STATE.get(`${MODEL_KEY_COOLDOWN_PREFIX}${slot.index}`) || "0");
+    if (cooldown > Date.now()) continue;
+    attempted++;
+    try {
+      const decision = await askGemini(slot.key, model, "market", snapshot, baseline, score, pattern);
+      await env.CIEL_STATE.put(MODEL_KEY_CURSOR, String(slot.index % 8), { expirationTtl: 86400 });
+      await writeRuntime(env, { lastGeminiKeyUsed: slot.index, lastGeminiFallbacks: Math.max(0, attempted - 1) });
+      return { decision, keyIndex: slot.index };
+    } catch (error) {
+      lastError = error;
+      if (isFallbackWorthy(error)) {
+        await env.CIEL_STATE.put(`${MODEL_KEY_COOLDOWN_PREFIX}${slot.index}`, String(Date.now() + MODEL_KEY_COOLDOWN_MS), { expirationTtl: 300 });
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<void> {
-  if (!env.GEMINI_API_KEY_1 && !env.GEMINI_API_KEY_2) {
+  const keys = await getKeySlots(env);
+  if (!keys.length) {
     await writeRuntime(env, { lastGeminiError: "No Gemini API key configured" });
     return;
   }
@@ -198,30 +268,19 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
   const feed = await readCurrentFeed(env);
   const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
 
-  const established = candidates.filter(candidate => {
+  const established: Candidate[] = [];
+  for (const candidate of candidates) {
     const item = feed.get(candidate.token.toLowerCase());
-    return Boolean(item)
-      && feedVolumeUsd(item, monUsd) >= MIN_AVG_VOLUME_5M_USD
-      && feedLiquidityUsd(item, monUsd) >= MIN_AVG_LIQUIDITY_USD;
-  });
+    if (item && feedVolumeUsd(item, monUsd) >= MIN_AVG_VOLUME_5M_USD && feedLiquidityUsd(item, monUsd) >= MIN_AVG_LIQUIDITY_USD) established.push(candidate);
+  }
 
   if (!established.length) {
     await writeRuntime(env, { lastModelError: "No established high-volume meme candidates above $90,000 yet" });
     return;
   }
 
-  const apiKey = env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2;
-  if (!apiKey) return;
-
-  let analyzed = 0;
-  let lastError: string | undefined;
-
+  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
   for (const candidate of established) {
-    if (Date.now() - candidate.lastTs < 0) continue;
-    const cooldownKey = `${MODEL_COOLDOWN_PREFIX}${candidate.token.toLowerCase()}`;
-    const lastAnalyzed = Number(await env.CIEL_STATE.get(cooldownKey) || "0");
-    if (lastAnalyzed > 0 && Date.now() - lastAnalyzed < MODEL_COOLDOWN_MS) continue;
-
     const historyResult = await env.DB.prepare(`SELECT token_address as token,
         ts_ms as tsMs,
         price_usd as priceUsd,
@@ -236,21 +295,35 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
       ORDER BY ts_ms DESC LIMIT 50`).bind(candidate.token).all<Snapshot>();
     const history = historyResult.results || [];
     if (history.length < MIN_HISTORY_SAMPLES) continue;
-
     const current = history[0];
     if (!(Number(current.marketCapUsd) >= MIN_MARKET_CAP_USD)) continue;
+    const baseline = buildBaseline(history);
+    const score = deviationScore(current, baseline);
+    const pattern = buildPatternProfile(history);
+    ranked.push({ candidate, history, score, pattern, baseline });
+  }
+
+  ranked.sort((a, b) => b.score - a.score || b.candidate.avgMarketCap - a.candidate.avgMarketCap);
+  let analyzed = 0;
+  let lastError: string | undefined;
+
+  for (const entry of ranked.slice(0, MAX_DECISIONS_PER_CYCLE)) {
+    const { candidate, history, score, pattern, baseline } = entry;
+    const cooldownKey = `${MODEL_COOLDOWN_PREFIX}${candidate.token.toLowerCase()}`;
+    const lastAnalyzed = Number(await env.CIEL_STATE.get(cooldownKey) || "0");
+    if (lastAnalyzed > 0 && Date.now() - lastAnalyzed < MODEL_COOLDOWN_MS) continue;
+    const current = history[0];
 
     await writeRuntime(env, {
       lastGeminiAttempt: Date.now(),
       lastModelError: undefined,
-      lastGeminiError: undefined
+      lastGeminiError: undefined,
+      lastModelDecisionCandidate: candidate.token
     });
 
     try {
-      const baseline = buildBaseline(history);
-      const score = deviationScore(current, baseline);
-      const pattern = buildPatternProfile(history);
-      const analysis = await askGemini(apiKey, env.GEMINI_MODEL, "market", current, baseline, score, pattern);
+      const result = await askGeminiWithFallbacks(env, env.GEMINI_MODEL, current, baseline, score, pattern);
+      const analysis = result.decision;
       if (!analysis) {
         lastError = `${candidate.token}: Gemini returned no decision`;
         continue;
@@ -283,10 +356,12 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
         lastGeminiSuccess: Date.now(),
         lastModelAnalyzed: Date.now(),
         lastModelError: undefined,
-        lastGeminiError: undefined
+        lastGeminiError: undefined,
+        lastModelDecisionAction: analysis.action,
+        lastModelDecisionConfidence: analysis.confidence
       });
     } catch (error) {
-      lastError = `${candidate.token}: ${String(error).slice(0, 700)}`;
+      lastError = `${candidate.token}: ${String(error).slice(0, 1000)}`;
       await writeRuntime(env, { lastGeminiError: lastError });
     }
   }
