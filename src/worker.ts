@@ -1,5 +1,6 @@
 import base, { type Env, TradingEngine } from "./index";
 import { primeMarketDiscovery } from "./market_discovery";
+import { triggerEstablishedModelAnalysis } from "./model_trigger";
 import { notifyTelegram } from "./telegram";
 
 export { TradingEngine };
@@ -58,6 +59,13 @@ const worker = {
     return statusWithDiagnostics(request, env);
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (controller.cron === "*/3 * * * *") {
+      ctx.waitUntil((async () => {
+        await base.scheduled(controller, env, ctx);
+        try { await triggerEstablishedModelAnalysis(env); } catch (error) { console.error(`Established model trigger failed: ${String(error).slice(0, 1000)}`); }
+      })());
+      return;
+    }
     if (controller.cron === "*/10 * * * *") {
       ctx.waitUntil((async () => {
         try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery prime failed: ${String(error).slice(0, 500)}`); }
