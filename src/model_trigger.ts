@@ -1,5 +1,5 @@
 import { buildBaseline, deviationScore, buildPatternProfile, askGemini, type Snapshot } from "./model";
-
+import { runDecisionPipeline } from "./decision_orchestrator";
 type ModelEnv = {
   CIEL_STATE: KVNamespace;
   DB: D1Database;
@@ -322,8 +322,33 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
     });
 
     try {
-      const result = await askGeminiWithFallbacks(env, env.GEMINI_MODEL, current, baseline, score, pattern);
-      const analysis = result.decision;
+      const result = await runDecisionPipeline(
+  env,
+  [current],
+  async () => {
+    const response = await askGeminiWithFallbacks(
+          env,
+          env.GEMINI_MODEL,
+          current,
+          baseline,
+          score,
+          pattern
+        );
+    
+        return {
+          token: candidate.token,
+          action: response.decision.action,
+          confidence: response.decision.confidence ?? 0,
+          rationale: response.decision.reason ?? "",
+          liquidityUsd: Number(current.liquidityUsd ?? 0),
+          slippageBps: 0,
+          portfolioExposurePct: 0,
+          positionPct: 0,
+          priceChangePct: 0
+        };
+      }
+    );
+      const analysis = result;
       if (!analysis) {
         lastError = `${candidate.token}: Gemini returned no decision`;
         continue;
