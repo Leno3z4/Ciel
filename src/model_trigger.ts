@@ -323,42 +323,46 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
 
     try {
       const result = await runDecisionPipeline(
-  env,
-  [current],
-  async () => {
-    const response = await askGeminiWithFallbacks(
-          env,
-          env.GEMINI_MODEL,
-          current,
-          baseline,
-          score,
-          pattern
-        );
-    
-        const decision = response.decision;
+        env,
+        [current],
+        async () => {
+          const response = await askGeminiWithFallbacks(
+            env,
+            env.GEMINI_MODEL,
+            current,
+            baseline,
+            score,
+            pattern
+          );
 
-        if (!decision) {
-          throw new Error("Gemini returned no decision");
+          const decision = response.decision;
+
+          if (!decision) {
+            throw new Error("Gemini returned no decision");
+          }
+
+          const normalizedAction =
+            decision.action === "HOLD" || decision.action === "IGNORE"
+              ? "WAIT"
+              : decision.action;
+
+          return {
+            token: candidate.token,
+            action: normalizedAction,
+            confidence: decision.confidence ?? 0,
+            rationale: decision.rationale ?? "",
+            liquidityUsd: Number(current.liquidityUsd ?? 0),
+            slippageBps: 0,
+            portfolioExposurePct: 0,
+            positionPct: 0,
+            priceChangePct: 0,
+            expectedLowUsd: decision.expectedLowUsd ?? 0,
+            expectedHighUsd: decision.expectedHighUsd ?? 0,
+            anomalyScore: decision.anomalyScore ?? score,
+            regime: decision.regime ?? pattern.regimeHint
+          };
         }
-        
-        const normalizedAction =
-          decision.action === "HOLD" || decision.action === "IGNORE"
-            ? "WAIT"
-            : decision.action;
-        
-        return {
-          token: candidate.token,
-          action: normalizedAction,
-          confidence: decision.confidence ?? 0,
-          rationale: decision.rationale ?? "",
-          liquidityUsd: Number(current.liquidityUsd ?? 0),
-          slippageBps: 0,
-          portfolioExposurePct: 0,
-          positionPct: 0,
-          priceChangePct: 0
-        };
-      }
-    );
+      );
       const analysis = result;
       if (!analysis) {
         lastError = `${candidate.token}: Gemini returned no decision`;
