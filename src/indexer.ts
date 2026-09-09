@@ -24,7 +24,12 @@ export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: numb
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
 
 const INDEXER_STATE_KEY = "indexer_state";
-const RPC_LOG_RANGE_BLOCKS = 100;
+// Keep RPC ranges conservative, but large enough to catch up on Monad's fast block time.
+const RPC_LOG_RANGE_BLOCKS = 500;
+// If a stale cursor is thousands/millions of blocks behind, do not spend days replaying old history.
+// Jump close to the chain tip so live monitoring starts promptly after a fresh deployment/outage.
+const MAX_ACCEPTABLE_LAG_BLOCKS = 10_000n;
+const LIVE_BOOTSTRAP_BLOCKS = 5_000n;
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
 
 async function monUsd(env: IndexEnv): Promise<number> {
@@ -59,8 +64,16 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   const stateRaw = await env.CIEL_STATE.get(INDEXER_STATE_KEY);
   const state = stateRaw ? JSON.parse(stateRaw) as IndexerState : null;
   const cursorRaw = state?.nextBlock ?? await env.CIEL_STATE.get("indexer_next_block");
-  const fromBlock = cursorRaw ? BigInt(cursorRaw) : (latest > 216_000n ? latest - 216_000n : 73_857_231n);
+  let fromBlock = cursorRaw ? BigInt(cursorRaw) : (latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n);
+
+  // Older deployments initialized around a fixed historical block. That is unsuitable for
+  // live monitoring on Monad because the chain advances extremely quickly. If the cursor is
+  // stale, deliberately re-anchor it near the tip instead of taking days to catch up.
+  if (latest > fromBlock && latest - fromBlock > MAX_ACCEPTABLE_LAG_BLOCKS) {
+    fromBlock = latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n;
+  }
   if (fromBlock > latest) return null;
+
   const requestedBlocks = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS));
   const toBlock = fromBlock + BigInt(requestedBlocks - 1) > latest ? latest : fromBlock + BigInt(requestedBlocks - 1);
 
@@ -109,10 +122,6 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
     const s = touch(a.token); s.sellVolume += a.amountOut ?? 0n; s.sells++;
     await env.MARKET_DATA?.put(`events/${log.blockNumber}-${log.logIndex}-router-sell.json`, JSON.stringify({ type: "Sell", block: log.blockNumber.toString(), tx: log.transactionHash, token: a.token, seller: a.seller, amountIn: a.amountIn?.toString(), amountOut: a.amountOut?.toString(), graduated: a.graduated }));
   }
-  // Keep the bonding Buy/Sell queries above for compatibility with old deployments
-  // that may have router events unavailable, but only use them if the router returned
-  // no corresponding trade for that block. This avoids double counting while allowing
-  // the indexer to recover pre-router historical activity.
   if (routerBuys.length === 0) {
     for (const log of bondingBuys) {
       const a = log.args; if (!a.token) continue;
