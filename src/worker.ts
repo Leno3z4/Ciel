@@ -34,7 +34,7 @@ const worker = {
     return statusWithDiagnostics(request, env);
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    if (controller.cron === "*/3 * * * *") {
+    if (controller.cron === "*/10 * * * *") {
       ctx.waitUntil((async () => {
         try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery prime failed: ${String(error).slice(0, 500)}`); }
         await base.scheduled(controller, env, ctx);
