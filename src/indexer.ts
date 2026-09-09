@@ -1,30 +1,39 @@
 import { parseAbiItem } from "viem";
-import { NADFUN_BONDING, NADFUN_FACTORY, NADFUN_ROUTER, publicClient, WMON, LVMON } from "./nadfun";
+import { NADFUN_BONDING, publicClient } from "./nadfun";
 
 const createEvent = parseAbiItem("event Create(address indexed creator,address indexed token,address indexed pair,address quoteToken,string name,string symbol,string tokenURI,uint256 virtualQuoteReserve,uint256 virtualTokenReserve,uint256 minTokenReserve)");
-const routerBuyEvent = parseAbiItem("event Buy(address indexed buyer,address indexed token,uint256 amountIn,uint256 amountOut,bool graduated)");
-const routerSellEvent = parseAbiItem("event Sell(address indexed seller,address indexed token,uint256 amountIn,uint256 amountOut,bool graduated)");
-const graduateEvent = parseAbiItem("event Graduate(address indexed token,address indexed pair)");
-const syncEvent = parseAbiItem("event Sync(address indexed token,uint256 realQuoteReserve,uint256 realTokenReserve,uint256 virtualQuoteReserve,uint256 virtualTokenReserve)");
-const pairCreatedEvent = parseAbiItem("event PairCreated(address indexed token0,address indexed token1,address pair,uint256 pairCount)");
 const tokenMetaAbi = [
   { type: "function", name: "totalSupply", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }
 ] as const;
-const factoryAbi = [
-  { type: "function", name: "allPairsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
-  { type: "function", name: "allPairs", stateMutability: "view", inputs: [{ name: "index", type: "uint256" }], outputs: [{ type: "address" }] }
-] as const;
-const factoryPairAbi = [
-  { type: "function", name: "token0", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
-  { type: "function", name: "token1", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }
-] as const;
 
-export interface IndexResult { fromBlock: bigint; toBlock: bigint; creates: number; buys: number; sells: number; graduates: number; syncs: number; snapshots: number; nextBlock: bigint; }
+export interface IndexResult {
+  fromBlock: bigint;
+  toBlock: bigint;
+  creates: number;
+  buys: number;
+  sells: number;
+  graduates: number;
+  syncs: number;
+  snapshots: number;
+  nextBlock: bigint;
+}
+
 type IndexEnv = { CIEL_STATE: KVNamespace; DB: D1Database; MARKET_DATA?: R2Bucket; NAD_RPC_URL?: string };
 type NadFunToken = { token_info?: Record<string, unknown>; market_info?: Record<string, unknown>; percent?: number | string; [key: string]: unknown };
 type ChartRow = { t: number; c: number; v: number };
 type IndexerState = { nextBlock: string; latestBlock: string; lastSnapshotCount: number; lastRunMs?: number };
+
+type TokenMeta = {
+  address: string;
+  total_supply: string | null;
+  decimals: number;
+  quote_token: string | null;
+  pair_address: string | null;
+  graduated: number;
+  market_cap_usd: number | null;
+  liquidity_usd: number | null;
+};
 
 const INDEXER_STATE_KEY = "indexer_state";
 const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
@@ -41,60 +50,122 @@ const MIN_MARKET_CAP_USD = 90_000;
 const API_BASE = "https://api.nadapp.net";
 const RANKING_REFRESH_MS = 10 * 60 * 1000;
 const DISCOVERY_REFRESH_MS = 30 * 60 * 1000;
+const MAX_CHART_ATTEMPTS = 3;
 
-function num(v: unknown): number { const n = Number(v ?? 0); return Number.isFinite(n) ? n : 0; }
-function str(v: unknown): string | null { return typeof v === "string" && v.length ? v : null; }
-function isAddress(v: string | null): v is `0x${string}` { return !!v && /^0x[a-fA-F0-9]{40}$/.test(v); }
-function units(v: unknown, decimals: number): number { const n = num(v); if (!(n > 0)) return 0; return n >= 1e15 ? n / 10 ** decimals : n; }
-function decode(text: string): unknown | null { try { return JSON.parse(text); } catch {} try { const b = atob(text.trim()); return JSON.parse(new TextDecoder().decode(Uint8Array.from(b, c => c.charCodeAt(0)))); } catch { return null; } }
+function num(value: unknown): number {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function str(value: unknown): string | null {
+  return typeof value === "string" && value.length ? value : null;
+}
+
+function isAddress(value: string | null): value is `0x${string}` {
+  return !!value && /^0x[a-fA-F0-9]{40}$/.test(value);
+}
+
+function units(value: unknown, decimals: number): number {
+  const parsed = num(value);
+  if (!(parsed > 0)) return 0;
+  return parsed >= 1e15 ? parsed / 10 ** Math.max(0, decimals) : parsed;
+}
+
+function decode(text: string): unknown | null {
+  let raw = text.trim();
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "string") raw = parsed.trim();
+    else return parsed;
+  } catch {}
+  try {
+    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const bytes = atob(padded);
+    return JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes, c => c.charCodeAt(0))));
+  } catch {
+    return null;
+  }
+}
+
 function recordValue(item: NadFunToken, keys: string[]): unknown {
   const sources: unknown[] = [item.token_info, item.market_info, item.token, item.market, item];
-  for (const source of sources) if (source && typeof source === "object") for (const key of keys) {
-    const value = (source as Record<string, unknown>)[key];
-    if (value !== undefined && value !== null && value !== "") return value;
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    for (const key of keys) {
+      const value = (source as Record<string, unknown>)[key];
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
   }
   return null;
 }
+
 function tokenAddress(item: NadFunToken): string | null {
-  const a = str(recordValue(item, ["token_id", "token_address", "tokenAddress", "address", "mint", "id"]));
-  return isAddress(a) ? a : null;
+  const value = str(recordValue(item, ["token_id", "token_address", "tokenAddress", "address", "mint", "id"]));
+  return isAddress(value) ? value : null;
 }
+
 function marketCap(item: NadFunToken, decimals: number): number {
   const direct = num(recordValue(item, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap"]));
   if (direct > 0) return direct;
-  const p = num(recordValue(item, ["price_usd", "priceUsd", "price", "token_price_usd", "tokenPriceUsd"]));
+  const price = num(recordValue(item, ["price_usd", "priceUsd", "price", "token_price_usd", "tokenPriceUsd"]));
   const supply = units(recordValue(item, ["total_supply", "totalSupply", "supply"]), decimals);
-  return p > 0 && supply > 0 ? p * supply : 0;
+  return price > 0 && supply > 0 ? price * supply : 0;
 }
-function price(item: NadFunToken): number { return num(recordValue(item, ["price_usd", "priceUsd", "price", "token_price_usd", "tokenPriceUsd"])); }
-function totalSupply(item: NadFunToken | undefined, meta: { total_supply: string | null } | null, decimals: number): number {
-  if (item) { const direct = units(recordValue(item, ["total_supply", "totalSupply", "supply"]), decimals); if (direct > 0) return direct; }
+
+function price(item: NadFunToken): number {
+  return num(recordValue(item, ["price_usd", "priceUsd", "price", "token_price_usd", "tokenPriceUsd"]));
+}
+
+function totalSupply(item: NadFunToken | undefined, meta: TokenMeta | null, decimals: number): number {
+  if (item) {
+    const direct = units(recordValue(item, ["total_supply", "totalSupply", "supply"]), decimals);
+    if (direct > 0) return direct;
+  }
   return meta?.total_supply ? units(meta.total_supply, decimals) : 0;
 }
+
 function decimalsValue(item: NadFunToken | undefined, fallback: number): number {
   if (!item) return fallback;
-  const d = num(recordValue(item, ["decimals", "token_decimals", "tokenDecimals"]));
-  return d > 0 ? Math.floor(d) : fallback;
+  const value = num(recordValue(item, ["decimals", "token_decimals", "tokenDecimals"]));
+  return value > 0 ? Math.floor(value) : fallback;
 }
+
 function liquidity(item: NadFunToken): number {
-  const x = num(recordValue(item, ["liquidity_usd", "liquidityUsd", "liquidity"]));
-  if (x > 0) return x;
-  const r = num(recordValue(item, ["reserve_native_usd", "reserveNativeUsd"]));
-  return r > 0 ? r * 2 : 0;
+  const direct = num(recordValue(item, ["liquidity_usd", "liquidityUsd", "liquidity"]));
+  if (direct > 0) return direct;
+  const reserve = num(recordValue(item, ["reserve_native_usd", "reserveNativeUsd"]));
+  return reserve > 0 ? reserve * 2 : 0;
 }
-function volume5m(item: NadFunToken): number { return num(recordValue(item, ["volume_5m_usd", "volume5mUsd", "volume_5m", "volume5m"])); }
-function holders(item: NadFunToken): number { return num(recordValue(item, ["holder_count", "holderCount", "holders"])); }
-function quote(item: NadFunToken): string | null { return str(recordValue(item, ["quote_id", "quoteId", "quote_token", "quoteToken"])); }
-function pair(item: NadFunToken): string | null { return str(recordValue(item, ["pair_address", "pairAddress", "market_id", "marketId"])); }
-function graduated(item: NadFunToken): number { const t = str(recordValue(item, ["market_type", "marketType"])); return t?.toUpperCase().includes("DEX") || item.token_info?.is_graduated === true || item.token_info?.isGraduated === true ? 1 : 0; }
+
+function volume5m(item: NadFunToken): number {
+  return num(recordValue(item, ["volume_5m_usd", "volume5mUsd", "volume_5m", "volume5m"]));
+}
+
+function holders(item: NadFunToken): number {
+  return num(recordValue(item, ["holder_count", "holderCount", "holders"]));
+}
+
+function quote(item: NadFunToken): string | null {
+  return str(recordValue(item, ["quote_id", "quoteId", "quote_token", "quoteToken"]));
+}
+
+function pair(item: NadFunToken): string | null {
+  return str(recordValue(item, ["pair_address", "pairAddress", "market_id", "marketId"]));
+}
+
+function graduated(item: NadFunToken): number {
+  const marketType = str(recordValue(item, ["market_type", "marketType"]));
+  return marketType?.toUpperCase().includes("DEX") || item.token_info?.is_graduated === true || item.token_info?.isGraduated === true ? 1 : 0;
+}
 
 function extractTokenArray(value: unknown, depth = 0): NadFunToken[] {
-  if (depth > 4 || value == null) return [];
-  if (Array.isArray(value)) return value.filter(x => x && typeof x === "object") as NadFunToken[];
+  if (depth > 5 || value == null) return [];
+  if (Array.isArray(value)) return value.filter(item => item && typeof item === "object") as NadFunToken[];
   if (typeof value !== "object") return [];
-  const obj = value as Record<string, unknown>;
+  const object = value as Record<string, unknown>;
   for (const key of ["tokens", "data", "result", "items", "markets"]) {
-    const found = extractTokenArray(obj[key], depth + 1);
+    const found = extractTokenArray(object[key], depth + 1);
     if (found.length) return found;
   }
   return [];
@@ -102,133 +173,235 @@ function extractTokenArray(value: unknown, depth = 0): NadFunToken[] {
 
 async function fetchRanked(env: IndexEnv, creationFallback = false): Promise<NadFunToken[]> {
   const cacheKey = creationFallback ? CREATION_CACHE_KEY : RANKING_CACHE_KEY;
-  const tsKey = creationFallback ? CREATION_FETCH_TS_KEY : RANKING_FETCH_TS_KEY;
+  const timestampKey = creationFallback ? CREATION_FETCH_TS_KEY : RANKING_FETCH_TS_KEY;
   const refreshMs = creationFallback ? DISCOVERY_REFRESH_MS : RANKING_REFRESH_MS;
-  const path = creationFallback ? "/order/creation_time?page=1&limit=50&is_nsfw=false&direction=DESC" : `/order/market_cap?page=1&limit=${MARKET_LIMIT}&is_nsfw=false&direction=DESC`;
+  const path = creationFallback
+    ? "/order/creation_time?page=1&limit=50&is_nsfw=false&direction=DESC"
+    : `/order/market_cap?page=1&limit=${MARKET_LIMIT}&is_nsfw=false&direction=DESC`;
+
   const cached = await env.CIEL_STATE.get(cacheKey);
-  const lastFetch = num(await env.CIEL_STATE.get(tsKey));
+  const lastFetch = num(await env.CIEL_STATE.get(timestampKey));
   if (cached && Date.now() - lastFetch < refreshMs) {
-    try { const x = extractTokenArray(JSON.parse(cached)); if (x.length) return x; } catch {}
+    try {
+      const cachedTokens = extractTokenArray(JSON.parse(cached));
+      if (cachedTokens.length) return cachedTokens;
+    } catch {}
   }
+
   try {
-    const response = await fetch(`${API_BASE}${path}`, { headers: { Accept: "application/json", "User-Agent": "Ciel-NadFun/2.0" }, cf: { cacheTtl: creationFallback ? 1800 : 600 } });
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: { Accept: "application/json", "User-Agent": "Ciel-NadFun/2.0" },
+      cf: { cacheTtl: creationFallback ? 1800 : 600 }
+    });
     const body = await response.text();
     if (response.ok) {
       const tokens = extractTokenArray(decode(body));
       if (tokens.length) {
         await env.CIEL_STATE.put(cacheKey, JSON.stringify(tokens), { expirationTtl: 3600 });
-        await env.CIEL_STATE.put(tsKey, String(Date.now()), { expirationTtl: 3600 });
+        await env.CIEL_STATE.put(timestampKey, String(Date.now()), { expirationTtl: 3600 });
         return tokens;
       }
-      console.error(`NadFun discovery response parsed with no tokens (${creationFallback ? "creation_time" : "market_cap"})`);
-    } else console.error(`NadFun discovery HTTP ${response.status} (${creationFallback ? "creation_time" : "market_cap"})`);
-  } catch (e) { console.error(`NadFun discovery failed: ${String(e).slice(0, 300)}`); }
-  if (cached) { try { const x = extractTokenArray(JSON.parse(cached)); if (x.length) return x; } catch {} }
+      console.error(`NadFun discovery returned no tokens (${creationFallback ? "creation_time" : "market_cap"})`);
+    } else {
+      console.error(`NadFun discovery HTTP ${response.status} (${creationFallback ? "creation_time" : "market_cap"})`);
+    }
+  } catch (error) {
+    console.error(`NadFun discovery failed: ${String(error).slice(0, 400)}`);
+  }
+
+  if (cached) {
+    try {
+      const cachedTokens = extractTokenArray(JSON.parse(cached));
+      if (cachedTokens.length) return cachedTokens;
+    } catch {}
+  }
   return [];
 }
 
 async function fetchChart(token: string): Promise<ChartRow[]> {
-  const now = Math.floor(Date.now() / 1000); const from = now - 7 * 24 * 3600;
+  const now = Math.floor(Date.now() / 1000);
+  const from = now - 7 * 24 * 3600;
   try {
-    const r = await fetch(`${API_BASE}/trade/chart/${token}?resolution=60&from=${from}&to=${now}&countback=168&chart_type=market_cap_usd`, { headers: { Accept: "application/json", "User-Agent": "Ciel-NadFun/2.0" }, cf: { cacheTtl: 300 } });
-    if (!r.ok) return [];
-    const d = await r.json() as { s?: string; t?: unknown[]; c?: unknown[]; v?: unknown[] };
-    if (d.s !== "ok" || !Array.isArray(d.t) || !Array.isArray(d.c)) return [];
-    const out: ChartRow[] = [];
-    for (let i = 0; i < d.t.length; i++) { const c = num(d.c[i]); if (c > 0) out.push({ t: num(d.t[i]), c, v: num(d.v?.[i]) }); }
-    return out;
-  } catch { return []; }
-}
-
-async function seed(env: IndexEnv, token: string, item: NadFunToken | undefined): Promise<void> {
-  const exists = await env.DB.prepare("SELECT address FROM tokens WHERE address=?").bind(token).first<{ address: string }>();
-  if (exists) return;
-  const decimals = Math.max(0, decimalsValue(item, 18));
-  await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)`).bind(token, str(item ? recordValue(item, ["symbol"]) : null), str(item ? recordValue(item, ["name"]) : null), 0, 0, Date.now(), Date.now(), item ? recordValue(item, ["total_supply", "totalSupply", "supply"]) : null, decimals, item ? quote(item) : null, item ? pair(item) : null, item ? graduated(item) : 0).run();
-}
-
-async function bootstrapFactory(env: IndexEnv, client: ReturnType<typeof publicClient>): Promise<void> {
-  const count = num((await env.DB.prepare("SELECT COUNT(*) as count FROM tokens").first<{ count: number }>())?.count); if (count > 0) return;
-  try {
-    const total = Number(await client.readContract({ address: NADFUN_FACTORY, abi: factoryAbi, functionName: "allPairsLength" }));
-    for (let i = Math.max(0, total - 8); i < total; i++) {
-      const p = await client.readContract({ address: NADFUN_FACTORY, abi: factoryAbi, functionName: "allPairs", args: [BigInt(i)] });
-      const [a, b] = await Promise.all([client.readContract({ address: p, abi: factoryPairAbi, functionName: "token0" }), client.readContract({ address: p, abi: factoryPairAbi, functionName: "token1" })]);
-      const aq = a.toLowerCase() === WMON.toLowerCase() || a.toLowerCase() === LVMON.toLowerCase(); const bq = b.toLowerCase() === WMON.toLowerCase() || b.toLowerCase() === LVMON.toLowerCase(); if (!aq && !bq) continue;
-      await seed(env, aq ? b : a, undefined); await env.DB.prepare("UPDATE tokens SET quote_token=?,pair_address=?,graduated=1 WHERE address=?").bind(aq ? a : b, p, aq ? b : a).run();
+    const response = await fetch(`${API_BASE}/trade/chart/${token}?resolution=60&from=${from}&to=${now}&countback=168&chart_type=market_cap_usd`, {
+      headers: { Accept: "application/json", "User-Agent": "Ciel-NadFun/2.0" },
+      cf: { cacheTtl: 300 }
+    });
+    if (!response.ok) return [];
+    const data = await response.json() as { s?: string; t?: unknown[]; c?: unknown[]; v?: unknown[] };
+    if (data.s !== "ok" || !Array.isArray(data.t) || !Array.isArray(data.c)) return [];
+    const result: ChartRow[] = [];
+    for (let i = 0; i < data.t.length; i++) {
+      const cap = num(data.c[i]);
+      if (cap > 0) result.push({ t: num(data.t[i]), c: cap, v: num(data.v?.[i]) });
     }
-  } catch (e) { console.error(`Factory bootstrap failed: ${String(e).slice(0, 300)}`); }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+async function seed(env: IndexEnv, token: string, item?: NadFunToken, createdAtBlock?: bigint): Promise<void> {
+  const now = Date.now();
+  await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(address) DO UPDATE SET
+      symbol=COALESCE(excluded.symbol,tokens.symbol),
+      name=COALESCE(excluded.name,tokens.name),
+      last_seen_ms=excluded.last_seen_ms,
+      total_supply=COALESCE(excluded.total_supply,tokens.total_supply),
+      decimals=excluded.decimals,
+      quote_token=COALESCE(excluded.quote_token,tokens.quote_token),
+      pair_address=COALESCE(excluded.pair_address,tokens.pair_address),
+      graduated=MAX(tokens.graduated,excluded.graduated),
+      created_at_block=COALESCE(tokens.created_at_block,excluded.created_at_block)`).bind(
+    token,
+    item ? str(recordValue(item, ["symbol"])) : null,
+    item ? str(recordValue(item, ["name"])) : null,
+    item ? marketCap(item, decimalsValue(item, 18)) : 0,
+    item ? liquidity(item) : 0,
+    now,
+    now,
+    item ? recordValue(item, ["total_supply", "totalSupply", "supply"]) : null,
+    Math.max(0, decimalsValue(item, 18)),
+    item ? quote(item) : null,
+    item ? pair(item) : null,
+    item ? graduated(item) : 0,
+    createdAtBlock !== undefined ? Number(createdAtBlock) : null
+  ).run();
 }
 
 export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCKS): Promise<IndexResult | null> {
-  const client = publicClient(env.NAD_RPC_URL); const latest = await client.getBlockNumber();
-  const stateRaw = await env.CIEL_STATE.get(INDEXER_STATE_KEY); const state = stateRaw ? JSON.parse(stateRaw) as IndexerState : null;
+  const client = publicClient(env.NAD_RPC_URL);
+  const latest = await client.getBlockNumber();
+  const rawState = await env.CIEL_STATE.get(INDEXER_STATE_KEY);
+  const state = rawState ? JSON.parse(rawState) as IndexerState : null;
   const cursor = state?.nextBlock ?? await env.CIEL_STATE.get("indexer_next_block");
   let fromBlock = cursor ? BigInt(cursor) : (latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n);
   if (latest - fromBlock > MAX_ACCEPTABLE_LAG_BLOCKS) fromBlock = latest > LIVE_BOOTSTRAP_BLOCKS ? latest - LIVE_BOOTSTRAP_BLOCKS : 0n;
   if (fromBlock > latest) return null;
-  const n = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS)); const toBlock = fromBlock + BigInt(n - 1) > latest ? latest : fromBlock + BigInt(n - 1);
-  const [creates, buys, sells, graduates, syncs, pairs, ranked] = await Promise.all([
-    client.getLogs({ address: NADFUN_BONDING, event: createEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_ROUTER, event: routerBuyEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_ROUTER, event: routerSellEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_BONDING, event: graduateEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_BONDING, event: syncEvent, fromBlock, toBlock }),
-    client.getLogs({ address: NADFUN_FACTORY, event: pairCreatedEvent, fromBlock, toBlock }),
-    fetchRanked(env)
-  ]);
-  for (const x of creates) { const a = x.args; if (!a.token || !a.quoteToken || !a.pair) continue; const [s, d] = await Promise.all([client.readContract({ address: a.token, abi: tokenMetaAbi, functionName: "totalSupply" }).catch(() => null), client.readContract({ address: a.token, abi: tokenMetaAbi, functionName: "decimals" }).catch(() => 18)]); await env.DB.prepare(`INSERT INTO tokens(address,symbol,name,market_cap_usd,liquidity_usd,first_seen_ms,last_seen_ms,total_supply,decimals,quote_token,pair_address,graduated,created_at_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(address) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,total_supply=COALESCE(excluded.total_supply,tokens.total_supply),decimals=excluded.decimals,quote_token=excluded.quote_token,pair_address=excluded.pair_address`).bind(a.token, a.symbol ?? null, a.name ?? null, 0, 0, Date.now(), Date.now(), s?.toString() ?? null, Number(d), a.quoteToken, a.pair, 0, Number(x.blockNumber)).run(); }
-  for (const x of pairs) { const a = x.args; if (!a.token0 || !a.token1 || !a.pair) continue; const aq = a.token0.toLowerCase() === WMON.toLowerCase() || a.token0.toLowerCase() === LVMON.toLowerCase(); const bq = a.token1.toLowerCase() === WMON.toLowerCase() || a.token1.toLowerCase() === LVMON.toLowerCase(); if (aq || bq) await seed(env, aq ? a.token1 : a.token0, undefined); }
-  for (const x of graduates) { if (x.args.token) await env.DB.prepare("UPDATE tokens SET graduated=1,pair_address=? WHERE address=?").bind(x.args.pair ?? null, x.args.token).run(); }
-  await bootstrapFactory(env, client);
 
-  let discovery: NadFunToken[] = ranked;
+  const blockCount = Math.max(1, Math.min(Math.floor(maxBlocks), RPC_LOG_RANGE_BLOCKS));
+  const toBlock = fromBlock + BigInt(blockCount - 1) > latest ? latest : fromBlock + BigInt(blockCount - 1);
+
+  const creates = await client.getLogs({ address: NADFUN_BONDING, event: createEvent, fromBlock, toBlock });
+
+  for (const log of creates) {
+    const args = log.args;
+    if (!args.token || !args.quoteToken || !args.pair) continue;
+    const [supply, decimals] = await Promise.all([
+      client.readContract({ address: args.token, abi: tokenMetaAbi, functionName: "totalSupply" }).catch(() => null),
+      client.readContract({ address: args.token, abi: tokenMetaAbi, functionName: "decimals" }).catch(() => 18)
+    ]);
+    await seed(env, args.token, { token_info: { token_id: args.token, name: args.name, symbol: args.symbol, total_supply: supply?.toString() ?? null, decimals: Number(decimals) }, market_info: { quote_token: args.quoteToken, pair_address: args.pair } }, log.blockNumber);
+  }
+
+  let discovery = await fetchRanked(env);
   if (!discovery.length) discovery = await fetchRanked(env, true);
+
   const rankedByToken = new Map<string, NadFunToken>();
   let validAddressCount = 0;
-  for (const item of discovery) { const t = tokenAddress(item); if (t) { rankedByToken.set(t.toLowerCase(), item); validAddressCount++; } }
-  for (const item of discovery) { const t = tokenAddress(item); if (t) await seed(env, t, item); }
-  const existing = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,market_cap_usd,liquidity_usd FROM tokens ORDER BY COALESCE(market_cap_usd,0) DESC,last_seen_ms DESC LIMIT 24").all<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; market_cap_usd: number | null; liquidity_usd: number | null }>();
+  for (const item of discovery) {
+    const token = tokenAddress(item);
+    if (!token) continue;
+    rankedByToken.set(token.toLowerCase(), item);
+    validAddressCount++;
+  }
+  for (const item of discovery) {
+    const token = tokenAddress(item);
+    if (token) await seed(env, token, item);
+  }
+
+  const existing = await env.DB.prepare(`SELECT address,total_supply,decimals,quote_token,pair_address,graduated,market_cap_usd,liquidity_usd
+    FROM tokens ORDER BY COALESCE(market_cap_usd,0) DESC,last_seen_ms DESC LIMIT 24`).all<TokenMeta>();
+
   const candidates: string[] = [];
-  for (const item of discovery.slice(0, DISCOVERY_LIMIT)) { const t = tokenAddress(item); if (t && !candidates.includes(t)) candidates.push(t); }
+  for (const item of discovery.slice(0, DISCOVERY_LIMIT)) {
+    const token = tokenAddress(item);
+    if (token && !candidates.includes(token)) candidates.push(token);
+  }
   for (const row of existing.results ?? []) if (!candidates.includes(row.address)) candidates.push(row.address);
 
-  const now = Date.now(); let snapshots = 0;
-  let directEligible = 0; let capEligible = 0; let chartAttempts = 0; let chartHits = 0; let lastSkipReason = "no-candidates";
+  const now = Date.now();
+  let snapshots = 0;
+  let directEligible = 0;
+  let capEligible = 0;
+  let chartAttempts = 0;
+  let chartHits = 0;
+  let lastSkipReason = "no-candidates";
+
   for (const token of candidates) {
     if (snapshots >= SNAPSHOT_LIMIT) break;
+
     const item = rankedByToken.get(token.toLowerCase());
-    const meta = await env.DB.prepare("SELECT address,total_supply,decimals,quote_token,pair_address,graduated,market_cap_usd,liquidity_usd FROM tokens WHERE address=?").bind(token).first<{ address: string; total_supply: string | null; decimals: number; quote_token: string | null; pair_address: string | null; graduated: number; market_cap_usd: number | null; liquidity_usd: number | null }>();
+    const meta = await env.DB.prepare(`SELECT address,total_supply,decimals,quote_token,pair_address,graduated,market_cap_usd,liquidity_usd FROM tokens WHERE address=?`).bind(token).first<TokenMeta>();
     const decimals = Math.max(0, decimalsValue(item, Number(meta?.decimals || 18)));
     let cap = item ? marketCap(item, decimals) : Number(meta?.market_cap_usd || 0);
     let px = item ? price(item) : 0;
-    const supply = totalSupply(item, meta, decimals);
+    const supply = totalSupply(item, meta ?? null, decimals);
     let liq = item ? liquidity(item) : Number(meta?.liquidity_usd || 0);
     let vol = item ? volume5m(item) : 0;
     let hold = item ? holders(item) : 0;
+
     if (!(px > 0) && cap > 0 && supply > 0) px = cap / supply;
     if (cap >= MIN_MARKET_CAP_USD && px > 0) directEligible++;
 
-    let chart: ChartRow[] = [];
-    if (!(cap >= MIN_MARKET_CAP_USD) || !(px > 0)) {
-      if (chartAttempts < 6) { chartAttempts++; chart = await fetchChart(token); if (chart.length) chartHits++; }
+    if ((cap < MIN_MARKET_CAP_USD || !(px > 0)) && chartAttempts < MAX_CHART_ATTEMPTS) {
+      chartAttempts++;
+      const chart = await fetchChart(token);
+      if (chart.length) {
+        chartHits++;
+        const last = chart[chart.length - 1];
+        if (!(cap > 0)) cap = last.c;
+        if (!(px > 0) && supply > 0) px = cap / supply;
+        if (!(vol > 0)) vol = last.v;
+      }
     }
-    if (chart.length) {
-      const last = chart[chart.length - 1];
-      if (!(cap > 0)) cap = last.c;
-      if (!(px > 0) && supply > 0) px = cap / supply;
-      if (!(vol > 0)) vol = last.v;
-    }
+
     if (cap >= MIN_MARKET_CAP_USD) capEligible++;
-    if (!(cap >= MIN_MARKET_CAP_USD)) { lastSkipReason = `below-$90k:${Math.round(cap)}`; continue; }
-    if (!(px > 0)) { lastSkipReason = "missing-price"; continue; }
-    const q = quote(item || {}) || meta?.quote_token || "NADFUN";
-    const p = pair(item || {}) || meta?.pair_address || null;
-    await env.DB.prepare(`INSERT INTO market_snapshots(token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,buys_5m,sells_5m,holders,quote_token,buy_volume_usd,sell_volume_usd,source_block) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(token, now, px, cap, liq || Number(meta?.liquidity_usd || 0), vol, 0, 0, hold, q, 0, 0, Number(toBlock)).run();
-    await env.DB.prepare("UPDATE tokens SET market_cap_usd=?,liquidity_usd=?,last_seen_ms=?,quote_token=COALESCE(?,quote_token),pair_address=COALESCE(?,pair_address),graduated=? WHERE address=?").bind(cap, liq || Number(meta?.liquidity_usd || 0), now, q, p, item ? graduated(item) : Number(meta?.graduated || 0), token).run();
+    if (cap < MIN_MARKET_CAP_USD) {
+      lastSkipReason = `below-$90k:${Math.round(cap)}`;
+      continue;
+    }
+    if (!(px > 0)) {
+      lastSkipReason = "missing-price";
+      continue;
+    }
+
+    const quoteToken = quote(item ?? {}) || meta?.quote_token || "NADFUN";
+    const pairAddress = pair(item ?? {}) || meta?.pair_address || null;
+    const graduatedFlag = item ? graduated(item) : Number(meta?.graduated || 0);
+
+    await env.DB.prepare(`INSERT INTO market_snapshots(token_address,ts_ms,price_usd,market_cap_usd,liquidity_usd,volume_5m_usd,buys_5m,sells_5m,holders,quote_token,buy_volume_usd,sell_volume_usd,source_block)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+      token,
+      now,
+      px,
+      cap,
+      liq,
+      vol,
+      0,
+      0,
+      hold,
+      quoteToken,
+      0,
+      0,
+      Number(toBlock)
+    ).run();
+
+    await env.DB.prepare(`UPDATE tokens SET market_cap_usd=?,liquidity_usd=?,last_seen_ms=?,quote_token=COALESCE(?,quote_token),pair_address=COALESCE(?,pair_address),graduated=MAX(graduated,?) WHERE address=?`).bind(
+      cap,
+      liq,
+      now,
+      quoteToken,
+      pairAddress,
+      graduatedFlag,
+      token
+    ).run();
+
     snapshots++;
     lastSkipReason = "snapshot-written";
   }
+
   const runtimeRaw = await env.CIEL_STATE.get("ciel_runtime_state");
   let runtime: Record<string, unknown> = {};
   try { runtime = runtimeRaw ? JSON.parse(runtimeRaw) as Record<string, unknown> : {}; } catch {}
@@ -241,6 +414,23 @@ export async function indexNadFun(env: IndexEnv, maxBlocks = RPC_LOG_RANGE_BLOCK
   runtime.lastIndexerChartHits = chartHits;
   runtime.lastIndexerSkipReason = lastSkipReason;
   await env.CIEL_STATE.put("ciel_runtime_state", JSON.stringify(runtime));
-  await env.CIEL_STATE.put(INDEXER_STATE_KEY, JSON.stringify({ nextBlock: (toBlock + 1n).toString(), latestBlock: latest.toString(), lastSnapshotCount: snapshots, lastRunMs: now } satisfies IndexerState));
-  return { fromBlock, toBlock, creates: creates.length, buys: buys.length, sells: sells.length, graduates: graduates.length, syncs: syncs.length, snapshots, nextBlock: toBlock + 1n };
+
+  await env.CIEL_STATE.put(INDEXER_STATE_KEY, JSON.stringify({
+    nextBlock: (toBlock + 1n).toString(),
+    latestBlock: latest.toString(),
+    lastSnapshotCount: snapshots,
+    lastRunMs: now
+  } satisfies IndexerState));
+
+  return {
+    fromBlock,
+    toBlock,
+    creates: creates.length,
+    buys: 0,
+    sells: 0,
+    graduates: 0,
+    syncs: 0,
+    snapshots,
+    nextBlock: toBlock + 1n
+  };
 }
