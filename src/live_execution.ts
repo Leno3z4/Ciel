@@ -1313,7 +1313,10 @@ async function executeLiveSignal(
 
   if (
     signal.action === "SELL" &&
-    await hasEmergencyExitMarker(signal.token_address)
+    await hasEmergencyExitMarker(
+      env,
+      signal.token_address
+    )
   ) {
     await consumeLiveSignal(
       env,
