@@ -7,7 +7,7 @@ const MON_USD_KEY = "mon_usd";
 const HISTORY_PREFIX = "ciel_kv_history:";
 const PENDING_PREFIX = "ciel_kv_pending_signal:";
 const RUNTIME_KEY = "ciel_runtime_state";
-const MAX_HISTORY = 24;
+const MAX_HISTORY = 480;
 const MAX_MARKETS = 5;
 const KV_COOLDOWN_MS = 10 * 60 * 1000;
 const MIN_MARKET_CAP_USD = 50_000;
@@ -114,7 +114,7 @@ async function appendHistory(env: Env, snapshot: Snapshot): Promise<Snapshot[]> 
   history = history.filter(row => Number(row.tsMs) > 0 && Number(row.marketCapUsd) > 0);
   history.push(snapshot);
   history = history.sort((a, b) => Number(b.tsMs) - Number(a.tsMs)).slice(0, MAX_HISTORY);
-  await env.CIEL_STATE.put(key, JSON.stringify(history), { expirationTtl: 172800 });
+  await env.CIEL_STATE.put(key, JSON.stringify(history), { expirationTtl: 691200 });
   return history;
 }
 
