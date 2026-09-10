@@ -411,11 +411,15 @@ async function sendCachedPulse(env: Env): Promise<void> {
 }
 
 export async function primeMarketDiscovery(env: Env): Promise<void> {
+  const now = Date.now();
   const lastFetch = Number(
     await env.CIEL_STATE.get(FETCH_TS_KEY) || "0"
   );
 
-  if (lastFetch > 0 && Date.now() - lastFetch < DISCOVERY_REFRESH_MS) return;
+  if (lastFetch > 0 && now - lastFetch < DISCOVERY_REFRESH_MS) {
+    await sendCachedPulse(env);
+    return;
+  }
 
   const ranked = await fetchMarketCapFeed();
   if (ranked.length) {
