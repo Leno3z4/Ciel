@@ -8,6 +8,8 @@ declare module "./index" {
   }
 }
 
-declare const caches: CacheStorage & {
-  default: Cache;
-};
+declare global {
+  interface CacheStorage {
+    readonly default: Cache;
+  }
+}
