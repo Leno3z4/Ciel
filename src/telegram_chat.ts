@@ -9,6 +9,8 @@ const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
 const RUNTIME_KEY = "ciel_runtime_state";
 const FEED_HEALTH_KEY = "ciel_market_feed_health";
 
+type GeminiEnv = Env & Record<string, unknown>;
+
 function trimText(value: unknown, max = 1200): string {
   const text = typeof value === "string" ? value.trim() : "";
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -16,9 +18,7 @@ function trimText(value: unknown, max = 1200): string {
 
 function extractTokens(value: unknown, depth = 0): Array<Record<string, unknown>> {
   if (depth > 6 || value == null) return [];
-  if (Array.isArray(value)) {
-    return value.filter(item => item && typeof item === "object") as Array<Record<string, unknown>>;
-  }
+  if (Array.isArray(value)) return value.filter(item => item && typeof item === "object") as Array<Record<string, unknown>>;
   if (typeof value !== "object") return [];
   const object = value as Record<string, unknown>;
   for (const key of ["tokens", "data", "result", "items", "markets"]) {
@@ -39,8 +39,8 @@ function num(value: unknown): number {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   const base = Number(match[1]);
-  const multiplier = match[2] ? ({ K: 1e3, M: 1e6, B: 1e9, T: 1e12 } as Record<string, number>)[match[2].toUpperCase()] : 1;
-  return Number.isFinite(base * multiplier) ? base * multiplier : 0;
+  const multipliers: Record<string, number> = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
+  return base * (match[2] ? multipliers[match[2].toUpperCase()] : 1);
 }
 
 function objectValue(source: unknown, keys: string[]): unknown {
@@ -53,24 +53,21 @@ function objectValue(source: unknown, keys: string[]): unknown {
 }
 
 function tokenSymbol(item: Record<string, unknown>): string {
-  const info = item.token_info;
-  const symbol = objectValue(info, ["symbol"]);
+  const symbol = objectValue(item.token_info, ["symbol"]);
   return typeof symbol === "string" && symbol.trim() ? symbol.trim() : "unknown";
 }
 
 function tokenAddress(item: Record<string, unknown>): string | null {
-  const value = objectValue(item.token_info, ["token_id", "token_address", "tokenAddress"]) ||
-    objectValue(item.market_info, ["token_id", "token_address", "tokenAddress"]);
+  const value = objectValue(item.token_info, ["token_id", "token_address", "tokenAddress"]) || objectValue(item.market_info, ["token_id", "token_address", "tokenAddress"]);
   const text = typeof value === "string" ? value.trim() : "";
   return /^0x[a-fA-F0-9]{40}$/.test(text) ? text : null;
 }
 
 function marketCap(item: Record<string, unknown>): number {
-  return num(objectValue(item.market_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"])) ||
-    num(objectValue(item.token_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"]));
+  return num(objectValue(item.market_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"])) || num(objectValue(item.token_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"]));
 }
 
-async function contextForChat(env: Env): Promise<string> {
+async function contextForChat(env: GeminiEnv): Promise<string> {
   const parts: string[] = [];
   const feedRaw = await env.CIEL_STATE.get(RANKING_CACHE_KEY);
   const healthRaw = await env.CIEL_STATE.get(FEED_HEALTH_KEY);
@@ -96,11 +93,7 @@ async function contextForChat(env: Env): Promise<string> {
     try {
       const tokens = extractTokens(JSON.parse(feedRaw));
       const markets = tokens
-        .map(item => ({
-          symbol: tokenSymbol(item),
-          token: tokenAddress(item),
-          marketCapUsd: marketCap(item)
-        }))
+        .map(item => ({ symbol: tokenSymbol(item), token: tokenAddress(item), marketCapUsd: marketCap(item) }))
         .filter(item => item.token && item.marketCapUsd > 0)
         .sort((a, b) => b.marketCapUsd - a.marketCapUsd)
         .slice(0, 12);
@@ -120,8 +113,7 @@ async function contextForChat(env: Env): Promise<string> {
         lastModelDecisionAction: runtime.lastModelDecisionAction || null,
         lastModelDecisionConfidence: runtime.lastModelDecisionConfidence || 0,
         lastIndexerDiscoveryCount: runtime.lastIndexerDiscoveryCount || 0,
-        lastIndexerValidAddressCount: runtime.lastIndexerValidAddressCount || 0,
-        d1Degraded: runtime.d1Degraded || false
+        lastIndexerValidAddressCount: runtime.lastIndexerValidAddressCount || 0
       })}`);
     } catch {}
   }
@@ -129,41 +121,28 @@ async function contextForChat(env: Env): Promise<string> {
   return parts.join("\n").slice(0, 7000) || "No live Ciel context is currently available.";
 }
 
-async function loadHistory(env: Env, chatId: string): Promise<Array<{ role: "user" | "model"; text: string }>> {
+async function loadHistory(env: GeminiEnv, chatId: string): Promise<Array<{ role: "user" | "model"; text: string }>> {
   const raw = await env.CIEL_STATE.get(`${CHAT_HISTORY_PREFIX}${chatId}`);
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw) as Array<{ role?: string; text?: unknown }>;
-    return parsed
-      .filter(item => (item.role === "user" || item.role === "model") && typeof item.text === "string")
-      .map(item => ({ role: item.role as "user" | "model", text: trimText(item.text, 2000) }))
-      .slice(-MAX_HISTORY_MESSAGES);
+    return parsed.filter(item => (item.role === "user" || item.role === "model") && typeof item.text === "string").map(item => ({ role: item.role as "user" | "model", text: trimText(item.text, 2000) })).slice(-MAX_HISTORY_MESSAGES);
   } catch {
     return [];
   }
 }
 
-async function saveHistory(env: Env, chatId: string, history: Array<{ role: "user" | "model"; text: string }>): Promise<void> {
-  await env.CIEL_STATE.put(
-    `${CHAT_HISTORY_PREFIX}${chatId}`,
-    JSON.stringify(history.slice(-MAX_HISTORY_MESSAGES)),
-    { expirationTtl: CHAT_HISTORY_TTL_SECONDS }
-  );
+async function saveHistory(env: GeminiEnv, chatId: string, history: Array<{ role: "user" | "model"; text: string }>): Promise<void> {
+  await env.CIEL_STATE.put(`${CHAT_HISTORY_PREFIX}${chatId}`, JSON.stringify(history.slice(-MAX_HISTORY_MESSAGES)), { expirationTtl: CHAT_HISTORY_TTL_SECONDS });
 }
 
-function keySlots(env: Env): string[] {
-  return [
-    env.GEMINI_API_KEY_1,
-    env.GEMINI_API_KEY_2,
-    env.GEMINI_API_KEY_3,
-    env.GEMINI_API_KEY_4,
-    env.GEMINI_API_KEY_5,
-    env.GEMINI_API_KEY_6,
-    env.GEMINI_API_KEY_7
-  ].map(value => (value || "").trim()).filter(Boolean);
+function keySlots(env: GeminiEnv): string[] {
+  return [1, 2, 3, 4, 5, 6, 7]
+    .map(index => String(env[`GEMINI_API_KEY_${index}`] || "").trim())
+    .filter(Boolean);
 }
 
-async function answerWithGemini(env: Env, history: Array<{ role: "user" | "model"; text: string }>, userText: string): Promise<string> {
+async function answerWithGemini(env: GeminiEnv, history: Array<{ role: "user" | "model"; text: string }>, userText: string): Promise<string> {
   const keys = keySlots(env);
   if (!keys.length) throw new Error("No Gemini API key is configured");
 
@@ -183,10 +162,7 @@ async function answerWithGemini(env: Env, history: Array<{ role: "user" | "model
   for (const key of keys) {
     try {
       const ai = new GoogleGenAI({ apiKey: key });
-      const response = await ai.models.generateContent({
-        model: env.GEMINI_MODEL,
-        contents: prompt
-      });
+      const response = await ai.models.generateContent({ model: env.GEMINI_MODEL, contents: prompt });
       const text = trimText(response.text, 3500);
       if (!text) throw new Error("Gemini returned an empty response");
       return text;
@@ -198,24 +174,18 @@ async function answerWithGemini(env: Env, history: Array<{ role: "user" | "model
   throw lastError instanceof Error ? lastError : new Error(String(lastError || "Gemini request failed"));
 }
 
-export async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+export async function handleTelegramWebhook(request: Request, env: GeminiEnv): Promise<Response> {
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
 
   const update = await request.json().catch(() => null) as Record<string, unknown> | null;
   if (!update || typeof update !== "object") return new Response("Bad request", { status: 400 });
 
-  const message = update.message && typeof update.message === "object"
-    ? update.message as Record<string, unknown>
-    : null;
-  const chat = message?.chat && typeof message.chat === "object"
-    ? message.chat as Record<string, unknown>
-    : null;
+  const message = update.message && typeof update.message === "object" ? update.message as Record<string, unknown> : null;
+  const chat = message?.chat && typeof message.chat === "object" ? message.chat as Record<string, unknown> : null;
   const chatId = chat?.id;
   const configuredChatId = env.TELEGRAM_CHAT_ID?.trim();
 
-  if (chatId === undefined || chatId === null || String(chatId) !== configuredChatId) {
-    return new Response("Ignored", { status: 200 });
-  }
+  if (chatId === undefined || chatId === null || String(chatId) !== configuredChatId) return new Response("Ignored", { status: 200 });
 
   const text = typeof message?.text === "string" ? message.text.trim() : "";
   if (!text) return new Response("No text", { status: 200 });
@@ -234,11 +204,7 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
   try {
     const history = await loadHistory(env, String(chatId));
     const reply = await answerWithGemini(env, history, text);
-    await saveHistory(env, String(chatId), [
-      ...history,
-      { role: "user", text: trimText(text, 2000) },
-      { role: "model", text: reply }
-    ]);
+    await saveHistory(env, String(chatId), [...history, { role: "user", text: trimText(text, 2000) }, { role: "model", text: reply }]);
     await notifyTelegram(env, reply);
   } catch (error) {
     await notifyTelegram(env, `⚠️ Gemini chat error: ${trimText(String(error), 900)}`);
