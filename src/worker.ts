@@ -4,7 +4,7 @@ import { triggerEstablishedModelAnalysis } from "./model_trigger";
 import { notifyTelegram } from "./telegram";
 import { runLiveSignalCycle } from "./live_execution";
 import { runOptimizedHoldingCheck } from "./holding_monitor";
-import { runKvIntelligenceCycle } from "./kv_intelligence";
+import { runKvIntelligenceCycle, flushPendingKvSignals } from "./kv_intelligence";
 
 export { TradingEngine };
 
@@ -138,7 +138,10 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastKvIntelligenceRun",
       "lastKvIntelligenceAnalyzed",
       "lastKvIntelligenceCandidates",
-      "kvModelActive"
+      "kvModelActive",
+      "lastKvPendingFlush",
+      "lastKvPendingQueued",
+      "lastKvPendingDiscarded"
     ];
 
     for (const key of diagnostics) {
@@ -289,6 +292,9 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const kvModelLine = runtime.kvModelActive
     ? `\n\nKV intelligence\nCandidates: ${Number(runtime.lastKvIntelligenceCandidates || 0)}\nAnalyzed: ${Number(runtime.lastKvIntelligenceAnalyzed || 0)}\nActive: yes`
     : "";
+  const recoveryLine = runtime.lastKvPendingFlush
+    ? `\n\nKV signal recovery\nLast flush: ${new Date(Number(runtime.lastKvPendingFlush)).toISOString()}\nQueued: ${Number(runtime.lastKvPendingQueued || 0)}\nDiscarded: ${Number(runtime.lastKvPendingDiscarded || 0)}`
+    : "";
   const capText = topCap > 0 ? `$${topCap >= 1_000_000 ? (topCap / 1_000_000).toFixed(2) + "M" : (topCap / 1_000).toFixed(1) + "K"}` : "n/a";
   const d1Degraded = await isD1Degraded(env);
   const snapshots = d1Degraded
@@ -310,7 +316,7 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
 
   await notifyTelegram(
     env,
-    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`
+    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${recoveryLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`
   );
 }
 
@@ -436,6 +442,14 @@ const worker = {
           }
 
           return;
+        }
+
+        try {
+          await flushPendingKvSignals(env);
+        } catch (error) {
+          console.error(
+            `KV pending signal recovery failed: ${String(error).slice(0, 1000)}`
+          );
         }
 
         try {
