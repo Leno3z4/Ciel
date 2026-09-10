@@ -72,7 +72,7 @@ export const TRADING_CONFIG: Record<TradingMode, TradingConfig> = {
 
     maxPortfolioExposurePct: 60,
 
-    maxPositionPct: 15,
+    maxPositionPct: 25,
 
     allowAccumulationEntries: true,
 
