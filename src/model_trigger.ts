@@ -99,7 +99,7 @@ async function writeRuntime(env: ModelEnv, patch: Record<string, unknown>): Prom
 }
 
 async function readCurrentFeed(env: ModelEnv): Promise<Map<string, Record<string, unknown>>> {
-  const state = await getMarketState(env);
+  const state = await getMarketState(env as unknown as Parameters<typeof getMarketState>[0]);
   const tokens = state?.tokens || [];
   return new Map(tokens.map(item => [feedTokenAddress(item), item]).filter(([key]) => Boolean(key)) as Array<[string, Record<string, unknown>]>);
 }
@@ -191,9 +191,7 @@ async function getKeySlots(env: ModelEnv): Promise<Array<{ index: number; key: s
 
 async function askGeminiWithFallbacks(env: ModelEnv, model: string, snapshot: Snapshot, baseline: ReturnType<typeof buildBaseline>, score: number, pattern: ReturnType<typeof buildPatternProfile>): Promise<{ decision: Awaited<ReturnType<typeof askGemini>>; keyIndex: number }> {
   const lastGlobalCall = Number(await env.CIEL_STATE.get(GEMINI_GLOBAL_CALL_KEY) || "0");
-  if (lastGlobalCall > 0 && Date.now() - lastGlobalCall < GEMINI_GLOBAL_MIN_INTERVAL_MS) {
-    throw new Error("gemini_global_cooldown");
-  }
+  if (lastGlobalCall > 0 && Date.now() - lastGlobalCall < GEMINI_GLOBAL_MIN_INTERVAL_MS) throw new Error("gemini_global_cooldown");
 
   const slots = await getKeySlots(env);
   let lastError: unknown = new Error("No Gemini API key configured");
