@@ -16,8 +16,11 @@ const RUNTIME_KEY = "ciel_runtime_state";
 const EMERGENCY_QUEUE_KEY = "ciel_emergency_exit_queue";
 const EMERGENCY_MARKER_PREFIX = "ciel_emergency_exit:";
 const EXIT_LOCK_PREFIX = "ciel_live_exit_lock:";
+const LAST_PRICE_CACHE_PREFIX = "https://ciel.live/internal/position-price/";
 const EXIT_LOCK_TTL_SECONDS = 180;
 const EMERGENCY_MARKER_TTL_SECONDS = 86400;
+const POSITION_PERSIST_INTERVAL_MS = 5 * 60 * 1000;
+const RUNTIME_PERSIST_INTERVAL_MS = 10 * 60 * 1000;
 const DEFAULT_HARD_STOP_PCT = -20;
 const DEFAULT_RAPID_CRASH_PCT = -10;
 const RAPID_CRASH_WINDOW_MS = 3 * 60 * 1000;
@@ -38,18 +41,9 @@ export interface LivePositionMirror {
   lastCheckedTsMs: number;
 }
 
-interface HotMarketState {
-  symbol?: string;
-  snapshots?: Snapshot[];
-}
-
-interface HotState {
-  markets?: Record<string, HotMarketState>;
-}
-
-interface MarketState {
-  monUsd?: number;
-}
+interface HotMarketState { symbol?: string; snapshots?: Snapshot[]; }
+interface HotState { markets?: Record<string, HotMarketState>; }
+interface MarketState { monUsd?: number; }
 
 type GuardEnv = Env & {
   LIVE_HARD_STOP_PCT?: string;
@@ -77,17 +71,40 @@ async function readPositions(env: GuardEnv): Promise<LivePositionMirror[]> {
       .map(item => item as LivePositionMirror)
       .filter(item => /^0x[a-fA-F0-9]{40}$/.test(String(item.token || "")))
       .slice(0, MAX_GUARD_POSITIONS);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 async function writePositions(env: GuardEnv, positions: LivePositionMirror[]): Promise<void> {
-  await env.CIEL_STATE.put(
-    LIVE_POSITIONS_HOT_KEY,
-    JSON.stringify(positions.slice(0, MAX_GUARD_POSITIONS)),
-    { expirationTtl: 172800 }
-  );
+  await env.CIEL_STATE.put(LIVE_POSITIONS_HOT_KEY, JSON.stringify(positions.slice(0, MAX_GUARD_POSITIONS)), { expirationTtl: 172800 });
+}
+
+async function hydratePositionsFromD1(env: GuardEnv): Promise<LivePositionMirror[]> {
+  try {
+    const rows = await env.DB.prepare(`
+      SELECT token_address as token, quantity, entry_price_usd as entryPriceUsd, entry_ts_ms as entryTsMs, last_price_usd as lastPriceUsd, updated_ts_ms as updatedTsMs
+      FROM live_positions
+      WHERE quantity <> '0'
+      LIMIT ?
+    `).bind(MAX_GUARD_POSITIONS).all<{
+      token: string;
+      quantity: string;
+      entryPriceUsd: number;
+      entryTsMs: number;
+      lastPriceUsd: number;
+      updatedTsMs: number;
+    }>();
+    const positions = (rows.results || []).filter(row => /^0x[a-fA-F0-9]{40}$/.test(row.token)).map(row => ({
+      token: row.token,
+      quantity: row.quantity,
+      entryPriceUsd: num(row.entryPriceUsd),
+      entryTsMs: num(row.entryTsMs),
+      highWaterPriceUsd: Math.max(num(row.entryPriceUsd), num(row.lastPriceUsd)),
+      lastPriceUsd: num(row.lastPriceUsd),
+      lastCheckedTsMs: num(row.updatedTsMs)
+    }));
+    if (positions.length) await writePositions(env, positions);
+    return positions;
+  } catch { return []; }
 }
 
 export async function upsertLivePositionMirror(
@@ -128,9 +145,7 @@ async function readHotState(env: GuardEnv): Promise<HotState> {
   try {
     const state = JSON.parse(raw) as HotState;
     return state && state.markets ? state : { markets: {} };
-  } catch {
-    return { markets: {} };
-  }
+  } catch { return { markets: {} }; }
 }
 
 async function readMonUsd(env: GuardEnv): Promise<number> {
@@ -142,7 +157,6 @@ async function readMonUsd(env: GuardEnv): Promise<number> {
       if (value > 0) return value;
     } catch {}
   }
-
   const runtimeRaw = await env.CIEL_STATE.get(RUNTIME_KEY);
   if (runtimeRaw) {
     try {
@@ -151,7 +165,6 @@ async function readMonUsd(env: GuardEnv): Promise<number> {
       if (value > 0) return value;
     } catch {}
   }
-
   return Number(await env.CIEL_STATE.get("mon_usd") || "0");
 }
 
@@ -160,21 +173,33 @@ function minimumOut(quote: bigint, slippageBps: number): bigint {
   return quote * BigInt(10_000 - safeBps) / 10_000n;
 }
 
-async function enqueueEmergencyExit(env: GuardEnv, event: Record<string, unknown>): Promise<void> {
-  const raw = await env.CIEL_STATE.get(EMERGENCY_QUEUE_KEY);
-  let queue: Array<Record<string, unknown>> = [];
+async function readCachedLastPrice(token: string): Promise<number> {
   try {
-    queue = raw ? JSON.parse(raw) as Array<Record<string, unknown>> : [];
-    if (!Array.isArray(queue)) queue = [];
+    const response = await caches.default.match(new Request(`${LAST_PRICE_CACHE_PREFIX}${token.toLowerCase()}`));
+    if (!response) return 0;
+    const raw = await response.text();
+    const parsed = JSON.parse(raw) as { priceUsd?: number; tsMs?: number };
+    if (!num(parsed.tsMs) || Date.now() - num(parsed.tsMs) > RAPID_CRASH_WINDOW_MS) return 0;
+    return num(parsed.priceUsd);
+  } catch { return 0; }
+}
+
+async function writeCachedLastPrice(token: string, priceUsd: number): Promise<void> {
+  try {
+    await caches.default.put(
+      new Request(`${LAST_PRICE_CACHE_PREFIX}${token.toLowerCase()}`),
+      new Response(JSON.stringify({ priceUsd, tsMs: Date.now() }), {
+        headers: { "Cache-Control": `max-age=${Math.ceil(RAPID_CRASH_WINDOW_MS / 1000)}` }
+      })
+    );
   } catch {}
-  queue.push(event);
-  await env.CIEL_STATE.put(EMERGENCY_QUEUE_KEY, JSON.stringify(queue.slice(-20)), { expirationTtl: 604800 });
 }
 
 function exitReason(
   env: GuardEnv,
   position: LivePositionMirror,
   currentPriceUsd: number,
+  cachedPreviousPriceUsd: number,
   pnlPct: number,
   pattern: ReturnType<typeof buildPatternProfile>
 ): string | null {
@@ -182,15 +207,11 @@ function exitReason(
   if (pnlPct <= hardStopPct) return `hard stop ${pnlPct.toFixed(2)}%`;
 
   const rapidCrashPct = num(env.LIVE_RAPID_CRASH_PCT, DEFAULT_RAPID_CRASH_PCT);
-  const elapsed = Date.now() - position.lastCheckedTsMs;
   if (
-    position.lastPriceUsd > 0 &&
-    position.lastCheckedTsMs > 0 &&
-    elapsed >= 0 &&
-    elapsed <= RAPID_CRASH_WINDOW_MS &&
-    currentPriceUsd <= position.lastPriceUsd * (1 + rapidCrashPct / 100)
+    cachedPreviousPriceUsd > 0 &&
+    currentPriceUsd <= cachedPreviousPriceUsd * (1 + rapidCrashPct / 100)
   ) {
-    return `rapid crash ${(((currentPriceUsd / position.lastPriceUsd) - 1) * 100).toFixed(2)}%`;
+    return `rapid crash ${(((currentPriceUsd / cachedPreviousPriceUsd) - 1) * 100).toFixed(2)}%`;
   }
 
   const behavior = pattern.priceBehavior;
@@ -220,8 +241,18 @@ function exitReason(
   ) {
     return `historical high-zone profit exit ${pnlPct.toFixed(2)}%`;
   }
-
   return null;
+}
+
+async function enqueueEmergencyExit(env: GuardEnv, event: Record<string, unknown>): Promise<void> {
+  const raw = await env.CIEL_STATE.get(EMERGENCY_QUEUE_KEY);
+  let queue: Array<Record<string, unknown>> = [];
+  try {
+    queue = raw ? JSON.parse(raw) as Array<Record<string, unknown>> : [];
+    if (!Array.isArray(queue)) queue = [];
+  } catch {}
+  queue.push(event);
+  await env.CIEL_STATE.put(EMERGENCY_QUEUE_KEY, JSON.stringify(queue.slice(-20)), { expirationTtl: 604800 });
 }
 
 async function emergencySell(
@@ -238,7 +269,6 @@ async function emergencySell(
   const token = position.token.toLowerCase();
   const lockKey = `${EXIT_LOCK_PREFIX}${token}`;
   if (await env.CIEL_STATE.get(lockKey)) return false;
-
   await env.CIEL_STATE.put(lockKey, String(Date.now()), { expirationTtl: EXIT_LOCK_TTL_SECONDS });
   await env.CIEL_STATE.put(`${EMERGENCY_MARKER_PREFIX}${token}`, reason, { expirationTtl: EMERGENCY_MARKER_TTL_SECONDS });
 
@@ -255,24 +285,20 @@ async function emergencySell(
     });
     const receipt = await client.waitForTransactionReceipt({ hash: txHash });
     if (receipt.status !== "success") throw new Error(`emergency SELL reverted: ${txHash}`);
-
     const proceedsMon = Number(quote) / 1e18;
     const quantity = Number(balance) / 1e18;
     const exitPriceUsd = quantity > 0 && monUsd > 0 ? proceedsMon * monUsd / quantity : priceUsd;
-    const now = Date.now();
-
     await enqueueEmergencyExit(env, {
       token: position.token,
       quantity: balance.toString(),
       entryPriceUsd: position.entryPriceUsd,
       exitPriceUsd,
       txHash,
-      tsMs: now,
+      tsMs: Date.now(),
       reason,
       pnlPct,
       status: "PENDING_D1_RECONCILIATION"
     });
-
     await notifyTelegram(env, `🚨 CIEL LIVE SELL\nToken: ${position.token}\nPnL: ${pnlPct.toFixed(2)}%\nReason: ${reason}\nTX: ${txHash}\nD1 reconciliation: queued`);
     return true;
   } catch (error) {
@@ -286,7 +312,8 @@ async function emergencySell(
 export async function runLivePositionGuard(env: GuardEnv): Promise<void> {
   if (env.TRADING_ENABLED !== "true" || env.PAPER_TRADING === "true" || !env.WALLET_PRIVATE_KEY) return;
 
-  const positions = await readPositions(env);
+  let positions = await readPositions(env);
+  if (!positions.length) positions = await hydratePositionsFromD1(env);
   if (!positions.length) return;
 
   const monUsd = await readMonUsd(env);
@@ -296,13 +323,14 @@ export async function runLivePositionGuard(env: GuardEnv): Promise<void> {
 
   const client = publicClient(env.NAD_RPC_URL);
   const hotState = await readHotState(env);
+  const now = Date.now();
   let changed = false;
   let checked = 0;
   let exited = 0;
   const warnings: string[] = [];
   const remaining: LivePositionMirror[] = [];
 
-  for (const original of positions) {
+  for (const original of positions.slice(0, MAX_GUARD_POSITIONS)) {
     const token = original.token as `0x${string}`;
     try {
       const balance = await tokenBalance(client, token, address);
@@ -333,18 +361,14 @@ export async function runLivePositionGuard(env: GuardEnv): Promise<void> {
       const history = hotState.markets?.[key]?.snapshots || [];
       const pattern = buildPatternProfile(history);
       const pnlPct = original.entryPriceUsd > 0 ? ((priceUsd - original.entryPriceUsd) / original.entryPriceUsd) * 100 : 0;
+      const cachedPreviousPriceUsd = await readCachedLastPrice(key);
       const highWater = Math.max(original.highWaterPriceUsd || 0, priceUsd);
-      const updated: LivePositionMirror = {
-        ...original,
-        quantity: balance.toString(),
-        highWaterPriceUsd: highWater,
-        lastPriceUsd: priceUsd,
-        lastCheckedTsMs: Date.now()
-      };
+      const reason = exitReason(env, original, priceUsd, cachedPreviousPriceUsd, pnlPct, pattern);
 
-      const reason = exitReason(env, original, priceUsd, pnlPct, pattern);
+      await writeCachedLastPrice(key, priceUsd);
+
       if (reason) {
-        const didExit = await emergencySell(env, updated, priceUsd, pnlPct, reason, monUsd, balance, quote);
+        const didExit = await emergencySell(env, original, priceUsd, pnlPct, reason, monUsd, balance, quote);
         if (didExit) {
           exited++;
           changed = true;
@@ -352,11 +376,18 @@ export async function runLivePositionGuard(env: GuardEnv): Promise<void> {
         }
       }
 
-      if (
-        updated.quantity !== original.quantity ||
-        updated.highWaterPriceUsd !== original.highWaterPriceUsd ||
-        Math.abs(updated.lastPriceUsd - original.lastPriceUsd) > 0
-      ) changed = true;
+      const shouldPersist =
+        now - original.lastCheckedTsMs >= POSITION_PERSIST_INTERVAL_MS ||
+        highWater > (original.highWaterPriceUsd || 0) * 1.01;
+
+      const updated: LivePositionMirror = {
+        ...original,
+        quantity: balance.toString(),
+        highWaterPriceUsd: highWater,
+        lastPriceUsd: shouldPersist ? priceUsd : original.lastPriceUsd,
+        lastCheckedTsMs: shouldPersist ? now : original.lastCheckedTsMs
+      };
+      if (shouldPersist) changed = true;
       remaining.push(updated);
     } catch (error) {
       warnings.push(`${original.token}: ${String(error).slice(0, 500)}`);
@@ -370,17 +401,20 @@ export async function runLivePositionGuard(env: GuardEnv): Promise<void> {
     const raw = await env.CIEL_STATE.get(RUNTIME_KEY);
     let runtime: Record<string, unknown> = {};
     try { runtime = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
-    await env.CIEL_STATE.put(
-      RUNTIME_KEY,
-      JSON.stringify({
-        ...runtime,
-        lastLivePositionGuard: Date.now(),
-        lastLivePositionGuardChecked: checked,
-        lastLivePositionGuardExited: exited,
-        lastLivePositionGuardWarning: warnings[0] || null
-      }),
-      { expirationTtl: 172800 }
-    );
+    const lastRuntime = num(runtime.lastLivePositionGuard || 0);
+    if (exited || warnings.length || now - lastRuntime >= RUNTIME_PERSIST_INTERVAL_MS) {
+      await env.CIEL_STATE.put(
+        RUNTIME_KEY,
+        JSON.stringify({
+          ...runtime,
+          lastLivePositionGuard: now,
+          lastLivePositionGuardChecked: checked,
+          lastLivePositionGuardExited: exited,
+          lastLivePositionGuardWarning: warnings[0] || null
+        }),
+        { expirationTtl: 172800 }
+      );
+    }
   }
 }
 
@@ -394,7 +428,6 @@ export async function flushEmergencyExitQueue(env: GuardEnv): Promise<void> {
   try {
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS live_positions (token_address TEXT PRIMARY KEY, quantity TEXT NOT NULL, entry_price_usd REAL, entry_ts_ms INTEGER, last_price_usd REAL, updated_ts_ms INTEGER NOT NULL)`).run();
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, token_address TEXT NOT NULL, ts_ms INTEGER NOT NULL, side TEXT NOT NULL, quantity TEXT, price_usd REAL, tx_hash TEXT, mode TEXT, status TEXT, execution_key TEXT)`).run();
-
     const remaining: Array<Record<string, unknown>> = [];
     for (const event of queue) {
       const token = String(event.token || "");
@@ -418,7 +451,6 @@ export async function flushEmergencyExitQueue(env: GuardEnv): Promise<void> {
         remaining.push(event);
       }
     }
-
     if (remaining.length) await env.CIEL_STATE.put(EMERGENCY_QUEUE_KEY, JSON.stringify(remaining.slice(-20)), { expirationTtl: 604800 });
     else await env.CIEL_STATE.delete(EMERGENCY_QUEUE_KEY);
   } catch (error) {
