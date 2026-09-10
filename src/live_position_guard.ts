@@ -10,17 +10,17 @@ import { notifyTelegram } from "./telegram";
 import type { Env } from "./index";
 
 const LIVE_POSITIONS_HOT_KEY = "ciel_live_positions_hot";
+const HOT_STATE_KEY = "ciel_hot_intelligence_state";
+const MARKET_STATE_KEY = "ciel_market_state";
+const RUNTIME_KEY = "ciel_runtime_state";
 const EMERGENCY_QUEUE_KEY = "ciel_emergency_exit_queue";
 const EMERGENCY_MARKER_PREFIX = "ciel_emergency_exit:";
 const EXIT_LOCK_PREFIX = "ciel_live_exit_lock:";
-const HOT_STATE_KEY = "ciel_hot_intelligence_state";
-const MARKET_STATE_KEY = "ciel_market_state";
-const GUARD_RUNTIME_KEY = "ciel_runtime_state";
 const EXIT_LOCK_TTL_SECONDS = 180;
 const EMERGENCY_MARKER_TTL_SECONDS = 86400;
 const DEFAULT_HARD_STOP_PCT = -20;
 const DEFAULT_RAPID_CRASH_PCT = -10;
-const DEFAULT_RAPID_CRASH_WINDOW_MS = 3 * 60 * 1000;
+const RAPID_CRASH_WINDOW_MS = 3 * 60 * 1000;
 const DEFAULT_TAKE_PROFIT_PCT = 20;
 const DEFAULT_TRAILING_ACTIVATION_PCT = 15;
 const DEFAULT_TRAILING_DRAWDOWN_PCT = 7;
@@ -38,17 +38,17 @@ export interface LivePositionMirror {
   lastCheckedTsMs: number;
 }
 
-interface HotIntelligenceState {
-  version?: number;
-  updatedTsMs?: number;
-  markets?: Record<string, { symbol?: string; snapshots?: Snapshot[] }>;
+interface HotMarketState {
+  symbol?: string;
+  snapshots?: Snapshot[];
+}
+
+interface HotState {
+  markets?: Record<string, HotMarketState>;
 }
 
 interface MarketState {
-  tokens?: unknown;
-  normalized?: unknown;
   monUsd?: number;
-  fetchedAt?: number;
 }
 
 type GuardEnv = Env & {
@@ -66,27 +66,17 @@ function num(value: unknown, fallback = 0): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function envNumber(value: unknown, fallback: number): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function positiveQuantity(quantity: string): bigint {
-  try {
-    const value = BigInt(quantity);
-    return value > 0n ? value : 0n;
-  } catch {
-    return 0n;
-  }
-}
-
 async function readPositions(env: GuardEnv): Promise<LivePositionMirror[]> {
   const raw = await env.CIEL_STATE.get(LIVE_POSITIONS_HOT_KEY);
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(item => item && typeof item === "object").map(item => item as LivePositionMirror).slice(0, MAX_GUARD_POSITIONS);
+    return parsed
+      .filter(item => item && typeof item === "object")
+      .map(item => item as LivePositionMirror)
+      .filter(item => /^0x[a-fA-F0-9]{40}$/.test(String(item.token || "")))
+      .slice(0, MAX_GUARD_POSITIONS);
   } catch {
     return [];
   }
@@ -100,10 +90,14 @@ async function writePositions(env: GuardEnv, positions: LivePositionMirror[]): P
   );
 }
 
-export async function upsertLivePositionMirror(env: GuardEnv, position: Omit<LivePositionMirror, "highWaterPriceUsd" | "lastPriceUsd" | "lastCheckedTsMs">): Promise<void> {
+export async function upsertLivePositionMirror(
+  env: GuardEnv,
+  position: Omit<LivePositionMirror, "highWaterPriceUsd" | "lastPriceUsd" | "lastCheckedTsMs">
+): Promise<void> {
   const positions = await readPositions(env);
-  const index = positions.findIndex(item => item.token.toLowerCase() === position.token.toLowerCase());
-  const existing = index >= 0 ? positions[index] : null;
+  const key = position.token.toLowerCase();
+  const index = positions.findIndex(item => item.token.toLowerCase() === key);
+  const existing = index >= 0 ? positions[index] : undefined;
   const next: LivePositionMirror = {
     token: position.token,
     quantity: position.quantity,
@@ -128,29 +122,28 @@ export async function hasEmergencyExitMarker(env: GuardEnv, token: string): Prom
   return Boolean(await env.CIEL_STATE.get(`${EMERGENCY_MARKER_PREFIX}${token.toLowerCase()}`));
 }
 
-async function readHotHistory(env: GuardEnv, token: string): Promise<Snapshot[]> {
+async function readHotState(env: GuardEnv): Promise<HotState> {
   const raw = await env.CIEL_STATE.get(HOT_STATE_KEY);
-  if (!raw) return [];
+  if (!raw) return { markets: {} };
   try {
-    const state = JSON.parse(raw) as HotIntelligenceState;
-    const rows = state.markets?.[token.toLowerCase()]?.snapshots;
-    return Array.isArray(rows) ? rows : [];
+    const state = JSON.parse(raw) as HotState;
+    return state && state.markets ? state : { markets: {} };
   } catch {
-    return [];
+    return { markets: {} };
   }
 }
 
 async function readMonUsd(env: GuardEnv): Promise<number> {
-  const stateRaw = await env.CIEL_STATE.get(MARKET_STATE_KEY);
-  if (stateRaw) {
+  const marketRaw = await env.CIEL_STATE.get(MARKET_STATE_KEY);
+  if (marketRaw) {
     try {
-      const state = JSON.parse(stateRaw) as MarketState;
-      const value = num(state.monUsd);
+      const market = JSON.parse(marketRaw) as MarketState;
+      const value = num(market.monUsd);
       if (value > 0) return value;
     } catch {}
   }
 
-  const runtimeRaw = await env.CIEL_STATE.get(GUARD_RUNTIME_KEY);
+  const runtimeRaw = await env.CIEL_STATE.get(RUNTIME_KEY);
   if (runtimeRaw) {
     try {
       const runtime = JSON.parse(runtimeRaw) as Record<string, unknown>;
@@ -174,63 +167,93 @@ async function enqueueEmergencyExit(env: GuardEnv, event: Record<string, unknown
     queue = raw ? JSON.parse(raw) as Array<Record<string, unknown>> : [];
     if (!Array.isArray(queue)) queue = [];
   } catch {}
-
   queue.push(event);
-  queue = queue.slice(-20);
-  await env.CIEL_STATE.put(
-    EMERGENCY_QUEUE_KEY,
-    JSON.stringify(queue),
-    { expirationTtl: 604800 }
-  );
+  await env.CIEL_STATE.put(EMERGENCY_QUEUE_KEY, JSON.stringify(queue.slice(-20)), { expirationTtl: 604800 });
 }
 
-function decisionReason(pnlPct: number, price: number, position: LivePositionMirror, pattern: ReturnType<typeof buildPatternProfile>): string | null {
-  const hardStopPct = envNumber((globalThis as Record<string, unknown>).__cielHardStopPct, DEFAULT_HARD_STOP_PCT);
+function exitReason(
+  env: GuardEnv,
+  position: LivePositionMirror,
+  currentPriceUsd: number,
+  pnlPct: number,
+  pattern: ReturnType<typeof buildPatternProfile>
+): string | null {
+  const hardStopPct = num(env.LIVE_HARD_STOP_PCT, DEFAULT_HARD_STOP_PCT);
   if (pnlPct <= hardStopPct) return `hard stop ${pnlPct.toFixed(2)}%`;
-  if (position.lastPriceUsd > 0 && position.lastCheckedTsMs > 0) {
-    const elapsed = Date.now() - position.lastCheckedTsMs;
-    if (elapsed <= DEFAULT_RAPID_CRASH_WINDOW_MS && price <= position.lastPriceUsd * (1 + envNumber((globalThis as Record<string, unknown>).__cielRapidCrashPct, DEFAULT_RAPID_CRASH_PCT) / 100)) {
-      return `rapid crash ${((price / position.lastPriceUsd - 1) * 100).toFixed(2)}%`;
-    }
+
+  const rapidCrashPct = num(env.LIVE_RAPID_CRASH_PCT, DEFAULT_RAPID_CRASH_PCT);
+  const elapsed = Date.now() - position.lastCheckedTsMs;
+  if (
+    position.lastPriceUsd > 0 &&
+    position.lastCheckedTsMs > 0 &&
+    elapsed >= 0 &&
+    elapsed <= RAPID_CRASH_WINDOW_MS &&
+    currentPriceUsd <= position.lastPriceUsd * (1 + rapidCrashPct / 100)
+  ) {
+    return `rapid crash ${(((currentPriceUsd / position.lastPriceUsd) - 1) * 100).toFixed(2)}%`;
   }
+
   const behavior = pattern.priceBehavior;
-  const highZone = behavior.currentZone === "HIGH";
   const highLevel = behavior.avgHighPrice12h > 0 ? behavior.avgHighPrice12h : behavior.avgHighPrice24h;
-  const nearHistoricalHigh = highLevel > 0 && price >= highLevel * 0.95;
-  const takeProfitPct = envNumber((globalThis as Record<string, unknown>).__cielTakeProfitPct, DEFAULT_TAKE_PROFIT_PCT);
-  if (pnlPct >= takeProfitPct && (highZone || nearHistoricalHigh || pattern.regimeHint === "DISTRIBUTION")) return `take profit ${pnlPct.toFixed(2)}%`;
-  const trailingActivationPct = envNumber((globalThis as Record<string, unknown>).__cielTrailingActivationPct, DEFAULT_TRAILING_ACTIVATION_PCT);
-  const trailingDrawdownPct = envNumber((globalThis as Record<string, unknown>).__cielTrailingDrawdownPct, DEFAULT_TRAILING_DRAWDOWN_PCT);
-  if (pnlPct >= trailingActivationPct && position.highWaterPriceUsd > 0) {
-    const fromHighWaterPct = ((price - position.highWaterPriceUsd) / position.highWaterPriceUsd) * 100;
-    if (fromHighWaterPct <= -Math.abs(trailingDrawdownPct)) return `trailing profit protection ${fromHighWaterPct.toFixed(2)}% from high-water`;
+  const historicalHigh = highLevel > 0 && currentPriceUsd >= highLevel * 0.95;
+  const highZone = behavior.currentZone === "HIGH";
+  const takeProfitPct = num(env.LIVE_TAKE_PROFIT_PCT, DEFAULT_TAKE_PROFIT_PCT);
+  if (pnlPct >= takeProfitPct && (highZone || historicalHigh || pattern.regimeHint === "DISTRIBUTION")) {
+    return `take profit ${pnlPct.toFixed(2)}%`;
   }
-  const highZoneProfitPct = envNumber((globalThis as Record<string, unknown>).__cielHighZoneProfitPct, DEFAULT_HIGH_ZONE_PROFIT_PCT);
-  if (pnlPct >= highZoneProfitPct && highZone && behavior.currentMinutesInZone >= Math.max(5, behavior.avgMinutesNearHigh12h * 0.75)) return `historical high-zone profit exit ${pnlPct.toFixed(2)}%`;
+
+  const trailingActivationPct = num(env.LIVE_TRAILING_ACTIVATION_PCT, DEFAULT_TRAILING_ACTIVATION_PCT);
+  const trailingDrawdownPct = num(env.LIVE_TRAILING_DRAWDOWN_PCT, DEFAULT_TRAILING_DRAWDOWN_PCT);
+  if (
+    pnlPct >= trailingActivationPct &&
+    position.highWaterPriceUsd > 0 &&
+    ((currentPriceUsd - position.highWaterPriceUsd) / position.highWaterPriceUsd) * 100 <= -Math.abs(trailingDrawdownPct)
+  ) {
+    return `trailing profit protection ${(((currentPriceUsd / position.highWaterPriceUsd) - 1) * 100).toFixed(2)}% from high-water`;
+  }
+
+  const highZoneProfitPct = num(env.LIVE_HIGH_ZONE_PROFIT_PCT, DEFAULT_HIGH_ZONE_PROFIT_PCT);
+  if (
+    pnlPct >= highZoneProfitPct &&
+    highZone &&
+    behavior.currentMinutesInZone >= Math.max(5, behavior.avgMinutesNearHigh12h * 0.75)
+  ) {
+    return `historical high-zone profit exit ${pnlPct.toFixed(2)}%`;
+  }
+
   return null;
 }
 
-async function emergencySell(env: GuardEnv, position: LivePositionMirror, priceUsd: number, reason: string, monUsd: number, balance: bigint, quote: bigint): Promise<boolean> {
-  if (!env.WALLET_PRIVATE_KEY || !env.NAD_RPC_URL) return false;
+async function emergencySell(
+  env: GuardEnv,
+  position: LivePositionMirror,
+  priceUsd: number,
+  pnlPct: number,
+  reason: string,
+  monUsd: number,
+  balance: bigint,
+  quote: bigint
+): Promise<boolean> {
+  if (!env.WALLET_PRIVATE_KEY) return false;
   const token = position.token.toLowerCase();
   const lockKey = `${EXIT_LOCK_PREFIX}${token}`;
   if (await env.CIEL_STATE.get(lockKey)) return false;
+
   await env.CIEL_STATE.put(lockKey, String(Date.now()), { expirationTtl: EXIT_LOCK_TTL_SECONDS });
   await env.CIEL_STATE.put(`${EMERGENCY_MARKER_PREFIX}${token}`, reason, { expirationTtl: EMERGENCY_MARKER_TTL_SECONDS });
 
   try {
-    const slippageBps = envNumber(env.LIVE_EMERGENCY_SLIPPAGE_BPS, DEFAULT_EMERGENCY_SLIPPAGE_BPS);
-    const amountOutMin = minimumOut(quote, slippageBps);
+    const client = publicClient(env.NAD_RPC_URL);
+    const slippageBps = num(env.LIVE_EMERGENCY_SLIPPAGE_BPS, DEFAULT_EMERGENCY_SLIPPAGE_BPS);
     const txHash = await sellToNative({
       rpcUrl: env.NAD_RPC_URL,
       privateKey: env.WALLET_PRIVATE_KEY,
       token: position.token as `0x${string}`,
       amountIn: balance,
-      amountOutMin,
+      amountOutMin: minimumOut(quote, slippageBps),
       deadlineSeconds: 30
     });
-
-    const receipt = await publicClient(env.NAD_RPC_URL).waitForTransactionReceipt({ hash: txHash });
+    const receipt = await client.waitForTransactionReceipt({ hash: txHash });
     if (receipt.status !== "success") throw new Error(`emergency SELL reverted: ${txHash}`);
 
     const proceedsMon = Number(quote) / 1e18;
@@ -238,7 +261,6 @@ async function emergencySell(env: GuardEnv, position: LivePositionMirror, priceU
     const exitPriceUsd = quantity > 0 && monUsd > 0 ? proceedsMon * monUsd / quantity : priceUsd;
     const now = Date.now();
 
-    await removeLivePositionMirror(env, position.token);
     await enqueueEmergencyExit(env, {
       token: position.token,
       quantity: balance.toString(),
@@ -247,126 +269,125 @@ async function emergencySell(env: GuardEnv, position: LivePositionMirror, priceU
       txHash,
       tsMs: now,
       reason,
+      pnlPct,
       status: "PENDING_D1_RECONCILIATION"
     });
 
-    await notifyTelegram(
-      env,
-      `🚨 CIEL LIVE EMERGENCY SELL\nToken: ${position.token}\nPnL at trigger: ${(((priceUsd - position.entryPriceUsd) / Math.max(position.entryPriceUsd, 0.0000000000000001)) * 100).toFixed(2)}%\nReason: ${reason}\nTX: ${txHash}\nD1 ledger reconciliation: queued`
-    );
-
+    await notifyTelegram(env, `🚨 CIEL LIVE SELL\nToken: ${position.token}\nPnL: ${pnlPct.toFixed(2)}%\nReason: ${reason}\nTX: ${txHash}\nD1 reconciliation: queued`);
     return true;
   } catch (error) {
-    await notifyTelegram(env, `🛑 CIEL LIVE EXIT FAILED\nToken: ${position.token}\nReason: ${reason}\nError: ${String(error).slice(0, 700)}`);
+    await notifyTelegram(env, `🛑 CIEL LIVE SELL FAILED\nToken: ${position.token}\nReason: ${reason}\nError: ${String(error).slice(0, 700)}`);
     return false;
   } finally {
     await env.CIEL_STATE.delete(lockKey);
   }
 }
 
-async function monitorOnePosition(env: GuardEnv, position: LivePositionMirror, client: ReturnType<typeof publicClient>, monUsd: number): Promise<{ checked: boolean; exited: boolean; reason?: string }> {
-  const token = position.token as `0x${string}`;
-  if (!/^0x[a-fA-F0-9]{40}$/.test(token)) return { checked: false, exited: false };
-  const balance = await tokenBalance(client, token, walletAddress(env.WALLET_PRIVATE_KEY) as `0x${string}`);
-  if (balance <= 0n) {
-    return { checked: false, exited: false, reason: "wallet token balance is zero; reconciliation required" };
-  }
-
-  const quote = await quoteSell(client, token, balance);
-  if (quote <= 0n) return { checked: true, exited: false, reason: "sell quote unavailable" };
-  const proceedsMon = Number(quote) / 1e18;
-  const quantity = Number(balance) / 1e18;
-  const priceUsd = quantity > 0 && monUsd > 0 ? proceedsMon * monUsd / quantity : 0;
-  if (!(priceUsd > 0)) return { checked: true, exited: false, reason: "effective exit price unavailable" };
-
-  const history = await readHotHistory(env, token.toLowerCase());
-  const pattern = buildPatternProfile(history);
-  const pnlPct = position.entryPriceUsd > 0 ? ((priceUsd - position.entryPriceUsd) / position.entryPriceUsd) * 100 : 0;
-  const highWater = Math.max(position.highWaterPriceUsd || 0, priceUsd);
-  const updatedPosition: LivePositionMirror = {
-    ...position,
-    quantity: balance.toString(),
-    highWaterPriceUsd: highWater,
-    lastPriceUsd: priceUsd,
-    lastCheckedTsMs: Date.now()
-  };
-
-  const hardStopPct = envNumber(env.LIVE_HARD_STOP_PCT, DEFAULT_HARD_STOP_PCT);
-  const rapidCrashPct = envNumber(env.LIVE_RAPID_CRASH_PCT, DEFAULT_RAPID_CRASH_PCT);
-  const takeProfitPct = envNumber(env.LIVE_TAKE_PROFIT_PCT, DEFAULT_TAKE_PROFIT_PCT);
-  const trailingActivationPct = envNumber(env.LIVE_TRAILING_ACTIVATION_PCT, DEFAULT_TRAILING_ACTIVATION_PCT);
-  const trailingDrawdownPct = envNumber(env.LIVE_TRAILING_DRAWDOWN_PCT, DEFAULT_TRAILING_DRAWDOWN_PCT);
-  const highZoneProfitPct = envNumber(env.LIVE_HIGH_ZONE_PROFIT_PCT, DEFAULT_HIGH_ZONE_PROFIT_PCT);
-
-  const hardStop = pnlPct <= hardStopPct;
-  const rapidCrash = position.lastPriceUsd > 0 && position.lastCheckedTsMs > 0 && Date.now() - position.lastCheckedTsMs <= DEFAULT_RAPID_CRASH_WINDOW_MS && priceUsd <= position.lastPriceUsd * (1 + rapidCrashPct / 100);
-  const highLevel = pattern.priceBehavior.avgHighPrice12h > 0 ? pattern.priceBehavior.avgHighPrice12h : pattern.priceBehavior.avgHighPrice24h;
-  const historicalHigh = highLevel > 0 && priceUsd >= highLevel * 0.95;
-  const takeProfit = pnlPct >= takeProfitPct && (pattern.priceBehavior.currentZone === "HIGH" || historicalHigh || pattern.regimeHint === "DISTRIBUTION");
-  const trailing = pnlPct >= trailingActivationPct && highWater > 0 && ((priceUsd - highWater) / highWater) * 100 <= -Math.abs(trailingDrawdownPct);
-  const highZoneExit = pnlPct >= highZoneProfitPct && pattern.priceBehavior.currentZone === "HIGH" && pattern.priceBehavior.currentMinutesInZone >= Math.max(5, pattern.priceBehavior.avgMinutesNearHigh12h * 0.75);
-
-  const reason = hardStop
-    ? `hard stop ${pnlPct.toFixed(2)}%`
-    : rapidCrash
-      ? `rapid crash ${(((priceUsd / position.lastPriceUsd) - 1) * 100).toFixed(2)}%`
-      : takeProfit
-        ? `take profit ${pnlPct.toFixed(2)}%`
-        : trailing
-          ? `trailing profit protection ${(((priceUsd / highWater) - 1) * 100).toFixed(2)}% from high-water`
-          : highZoneExit
-            ? `historical high-zone profit exit ${pnlPct.toFixed(2)}%`
-            : null;
-
-  const positions = await readPositions(env);
-  const index = positions.findIndex(item => item.token.toLowerCase() === token.toLowerCase());
-  if (index >= 0) {
-    positions[index] = updatedPosition;
-    await writePositions(env, positions);
-  }
-
-  if (!reason) return { checked: true, exited: false };
-  const exited = await emergencySell(env, updatedPosition, priceUsd, reason, monUsd, balance, quote);
-  return { checked: true, exited, reason };
-}
-
 export async function runLivePositionGuard(env: GuardEnv): Promise<void> {
   if (env.TRADING_ENABLED !== "true" || env.PAPER_TRADING === "true" || !env.WALLET_PRIVATE_KEY) return;
+
   const positions = await readPositions(env);
   if (!positions.length) return;
-  const monUsd = await readMonUsd(env);
-  if (!(monUsd > 0)) {
-    await notifyTelegram(env, "🛑 CIEL LIVE POSITION GUARD\nMON/USD unavailable; live exit guard is waiting for a valid MON price.");
-    return;
-  }
 
+  const monUsd = await readMonUsd(env);
+  if (!(monUsd > 0)) return;
   const address = walletAddress(env.WALLET_PRIVATE_KEY);
   if (!address) return;
+
   const client = publicClient(env.NAD_RPC_URL);
+  const hotState = await readHotState(env);
+  let changed = false;
   let checked = 0;
   let exited = 0;
-  let warning: string | null = null;
+  const warnings: string[] = [];
+  const remaining: LivePositionMirror[] = [];
 
-  for (const position of positions.slice(0, MAX_GUARD_POSITIONS)) {
+  for (const original of positions) {
+    const token = original.token as `0x${string}`;
     try {
-      const result = await monitorOnePosition(env, position, client, monUsd);
-      if (result.checked) checked++;
-      if (result.exited) exited++;
-      if (result.reason && !result.exited) warning = `${position.token}: ${result.reason}`;
+      const balance = await tokenBalance(client, token, address);
+      if (balance <= 0n) {
+        warnings.push(`${original.token}: wallet balance is zero; reconciliation required`);
+        remaining.push(original);
+        continue;
+      }
+
+      const quote = await quoteSell(client, token, balance);
+      if (quote <= 0n) {
+        warnings.push(`${original.token}: sell quote unavailable`);
+        remaining.push(original);
+        continue;
+      }
+
+      const quantity = Number(balance) / 1e18;
+      const proceedsMon = Number(quote) / 1e18;
+      const priceUsd = quantity > 0 ? proceedsMon * monUsd / quantity : 0;
+      if (!(priceUsd > 0)) {
+        warnings.push(`${original.token}: effective exit price unavailable`);
+        remaining.push(original);
+        continue;
+      }
+
+      checked++;
+      const key = original.token.toLowerCase();
+      const history = hotState.markets?.[key]?.snapshots || [];
+      const pattern = buildPatternProfile(history);
+      const pnlPct = original.entryPriceUsd > 0 ? ((priceUsd - original.entryPriceUsd) / original.entryPriceUsd) * 100 : 0;
+      const highWater = Math.max(original.highWaterPriceUsd || 0, priceUsd);
+      const updated: LivePositionMirror = {
+        ...original,
+        quantity: balance.toString(),
+        highWaterPriceUsd: highWater,
+        lastPriceUsd: priceUsd,
+        lastCheckedTsMs: Date.now()
+      };
+
+      const reason = exitReason(env, original, priceUsd, pnlPct, pattern);
+      if (reason) {
+        const didExit = await emergencySell(env, updated, priceUsd, pnlPct, reason, monUsd, balance, quote);
+        if (didExit) {
+          exited++;
+          changed = true;
+          continue;
+        }
+      }
+
+      if (
+        updated.quantity !== original.quantity ||
+        updated.highWaterPriceUsd !== original.highWaterPriceUsd ||
+        Math.abs(updated.lastPriceUsd - original.lastPriceUsd) > 0
+      ) changed = true;
+      remaining.push(updated);
     } catch (error) {
-      warning = `${position.token}: ${String(error).slice(0, 400)}`;
+      warnings.push(`${original.token}: ${String(error).slice(0, 500)}`);
+      remaining.push(original);
     }
   }
 
-  if (warning) {
-    await notifyTelegram(env, `⚠️ CIEL LIVE POSITION GUARD\nChecked: ${checked}\nEmergency exits: ${exited}\nWarning: ${warning}`);
+  if (changed) await writePositions(env, remaining);
+
+  if (checked || exited || warnings.length) {
+    const raw = await env.CIEL_STATE.get(RUNTIME_KEY);
+    let runtime: Record<string, unknown> = {};
+    try { runtime = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
+    await env.CIEL_STATE.put(
+      RUNTIME_KEY,
+      JSON.stringify({
+        ...runtime,
+        lastLivePositionGuard: Date.now(),
+        lastLivePositionGuardChecked: checked,
+        lastLivePositionGuardExited: exited,
+        lastLivePositionGuardWarning: warnings[0] || null
+      }),
+      { expirationTtl: 172800 }
+    );
   }
 }
 
 export async function flushEmergencyExitQueue(env: GuardEnv): Promise<void> {
   const raw = await env.CIEL_STATE.get(EMERGENCY_QUEUE_KEY);
   if (!raw) return;
-  let queue: Array<Record<string, unknown>> = [];
+  let queue: Array<Record<string, unknown>>;
   try { queue = JSON.parse(raw) as Array<Record<string, unknown>>; } catch { return; }
   if (!Array.isArray(queue) || !queue.length) return;
 
@@ -398,7 +419,7 @@ export async function flushEmergencyExitQueue(env: GuardEnv): Promise<void> {
       }
     }
 
-    if (remaining.length) await env.CIEL_STATE.put(EMERGENCY_QUEUE_KEY, JSON.stringify(remaining), { expirationTtl: 604800 });
+    if (remaining.length) await env.CIEL_STATE.put(EMERGENCY_QUEUE_KEY, JSON.stringify(remaining.slice(-20)), { expirationTtl: 604800 });
     else await env.CIEL_STATE.delete(EMERGENCY_QUEUE_KEY);
   } catch (error) {
     console.error(`Emergency exit D1 reconciliation failed: ${String(error).slice(0, 1000)}`);
