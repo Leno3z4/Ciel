@@ -28,6 +28,7 @@ const MIN_HISTORY_SAMPLES = 12;
 const MIN_HISTORY_SPAN_MS = 30 * 60 * 1000;
 const MIN_AVG_VOLUME_5M_USD = 5_000;
 const MIN_AVG_LIQUIDITY_USD = 10_000;
+const MAX_CANDIDATE_POOL = 20;
 const MAX_CANDIDATES = 3;
 const MAX_DECISIONS_PER_CYCLE = 3;
 const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
@@ -113,6 +114,14 @@ function feedLiquidityUsd(item: FeedToken, monUsd: number): number {
   return rawReserve >= 1e12 ? rawReserve / 1e18 * monUsd : rawReserve * monUsd;
 }
 
+function feedMarketCapUsd(item: FeedToken): number {
+  return nestedNumber(
+    item,
+    ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"],
+    ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"]
+  );
+}
+
 async function readRuntime(env: ModelEnv): Promise<Record<string, unknown>> {
   const raw = await env.CIEL_STATE.get(RUNTIME_KEY);
   if (!raw) return {};
@@ -134,6 +143,21 @@ async function readCurrentFeed(env: ModelEnv): Promise<Map<string, FeedToken>> {
 }
 
 async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
+  const feed = await readCurrentFeed(env);
+  if (!feed.size) return [];
+
+  const pool = Array.from(feed.entries())
+    .map(([token, item]) => ({
+      token,
+      marketCap: feedMarketCapUsd(item)
+    }))
+    .filter(item => item.marketCap >= MIN_MARKET_CAP_USD)
+    .sort((a, b) => b.marketCap - a.marketCap)
+    .slice(0, MAX_CANDIDATE_POOL);
+
+  if (!pool.length) return [];
+
+  const placeholders = pool.map(() => "?").join(",");
   const rows = await env.DB.prepare(`
     SELECT token_address as token,
       COUNT(*) as samples,
@@ -143,6 +167,7 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
     FROM market_snapshots ms
     WHERE ms.price_usd>0
       AND ms.ts_ms >= ?
+      AND ms.token_address IN (${placeholders})
     GROUP BY ms.token_address
     HAVING COUNT(*)>=?
       AND (MAX(ms.ts_ms)-MIN(ms.ts_ms))>=?
@@ -150,11 +175,13 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
     ORDER BY AVG(ms.market_cap_usd) DESC
     LIMIT ?`).bind(
     Date.now() - 2 * 60 * 60 * 1000,
+    ...pool.map(item => item.token),
     MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SPAN_MS,
     MIN_MARKET_CAP_USD,
     MAX_CANDIDATES
   ).all<Candidate>();
+
   return rows.results || [];
 }
 
