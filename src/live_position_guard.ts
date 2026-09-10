@@ -19,8 +19,8 @@ const EXIT_LOCK_PREFIX = "ciel_live_exit_lock:";
 const LAST_PRICE_CACHE_PREFIX = "https://ciel.live/internal/position-price/";
 const EXIT_LOCK_TTL_SECONDS = 180;
 const EMERGENCY_MARKER_TTL_SECONDS = 86400;
-const POSITION_PERSIST_INTERVAL_MS = 5 * 60 * 1000;
-const RUNTIME_PERSIST_INTERVAL_MS = 10 * 60 * 1000;
+const POSITION_PERSIST_INTERVAL_MS = 15 * 60 * 1000;
+const RUNTIME_PERSIST_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_HARD_STOP_PCT = -20;
 const DEFAULT_RAPID_CRASH_PCT = -10;
 const RAPID_CRASH_WINDOW_MS = 3 * 60 * 1000;
@@ -93,15 +93,17 @@ async function hydratePositionsFromD1(env: GuardEnv): Promise<LivePositionMirror
       lastPriceUsd: number;
       updatedTsMs: number;
     }>();
-    const positions = (rows.results || []).filter(row => /^0x[a-fA-F0-9]{40}$/.test(row.token)).map(row => ({
-      token: row.token,
-      quantity: row.quantity,
-      entryPriceUsd: num(row.entryPriceUsd),
-      entryTsMs: num(row.entryTsMs),
-      highWaterPriceUsd: Math.max(num(row.entryPriceUsd), num(row.lastPriceUsd)),
-      lastPriceUsd: num(row.lastPriceUsd),
-      lastCheckedTsMs: num(row.updatedTsMs)
-    }));
+    const positions = (rows.results || [])
+      .filter(row => /^0x[a-fA-F0-9]{40}$/.test(row.token))
+      .map(row => ({
+        token: row.token,
+        quantity: row.quantity,
+        entryPriceUsd: num(row.entryPriceUsd),
+        entryTsMs: num(row.entryTsMs),
+        highWaterPriceUsd: Math.max(num(row.entryPriceUsd), num(row.lastPriceUsd)),
+        lastPriceUsd: num(row.lastPriceUsd),
+        lastCheckedTsMs: num(row.updatedTsMs)
+      }));
     if (positions.length) await writePositions(env, positions);
     return positions;
   } catch { return []; }
@@ -177,8 +179,7 @@ async function readCachedLastPrice(token: string): Promise<number> {
   try {
     const response = await caches.default.match(new Request(`${LAST_PRICE_CACHE_PREFIX}${token.toLowerCase()}`));
     if (!response) return 0;
-    const raw = await response.text();
-    const parsed = JSON.parse(raw) as { priceUsd?: number; tsMs?: number };
+    const parsed = JSON.parse(await response.text()) as { priceUsd?: number; tsMs?: number };
     if (!num(parsed.tsMs) || Date.now() - num(parsed.tsMs) > RAPID_CRASH_WINDOW_MS) return 0;
     return num(parsed.priceUsd);
   } catch { return 0; }
@@ -207,10 +208,7 @@ function exitReason(
   if (pnlPct <= hardStopPct) return `hard stop ${pnlPct.toFixed(2)}%`;
 
   const rapidCrashPct = num(env.LIVE_RAPID_CRASH_PCT, DEFAULT_RAPID_CRASH_PCT);
-  if (
-    cachedPreviousPriceUsd > 0 &&
-    currentPriceUsd <= cachedPreviousPriceUsd * (1 + rapidCrashPct / 100)
-  ) {
+  if (cachedPreviousPriceUsd > 0 && currentPriceUsd <= cachedPreviousPriceUsd * (1 + rapidCrashPct / 100)) {
     return `rapid crash ${(((currentPriceUsd / cachedPreviousPriceUsd) - 1) * 100).toFixed(2)}%`;
   }
 
@@ -270,7 +268,6 @@ async function emergencySell(
   const lockKey = `${EXIT_LOCK_PREFIX}${token}`;
   if (await env.CIEL_STATE.get(lockKey)) return false;
   await env.CIEL_STATE.put(lockKey, String(Date.now()), { expirationTtl: EXIT_LOCK_TTL_SECONDS });
-  await env.CIEL_STATE.put(`${EMERGENCY_MARKER_PREFIX}${token}`, reason, { expirationTtl: EMERGENCY_MARKER_TTL_SECONDS });
 
   try {
     const client = publicClient(env.NAD_RPC_URL);
@@ -285,16 +282,19 @@ async function emergencySell(
     });
     const receipt = await client.waitForTransactionReceipt({ hash: txHash });
     if (receipt.status !== "success") throw new Error(`emergency SELL reverted: ${txHash}`);
+
     const proceedsMon = Number(quote) / 1e18;
     const quantity = Number(balance) / 1e18;
     const exitPriceUsd = quantity > 0 && monUsd > 0 ? proceedsMon * monUsd / quantity : priceUsd;
+    const now = Date.now();
+    await env.CIEL_STATE.put(`${EMERGENCY_MARKER_PREFIX}${token}`, reason, { expirationTtl: EMERGENCY_MARKER_TTL_SECONDS });
     await enqueueEmergencyExit(env, {
       token: position.token,
       quantity: balance.toString(),
       entryPriceUsd: position.entryPriceUsd,
       exitPriceUsd,
       txHash,
-      tsMs: Date.now(),
+      tsMs: now,
       reason,
       pnlPct,
       status: "PENDING_D1_RECONCILIATION"
@@ -302,6 +302,7 @@ async function emergencySell(
     await notifyTelegram(env, `🚨 CIEL LIVE SELL\nToken: ${position.token}\nPnL: ${pnlPct.toFixed(2)}%\nReason: ${reason}\nTX: ${txHash}\nD1 reconciliation: queued`);
     return true;
   } catch (error) {
+    await env.CIEL_STATE.delete(`${EMERGENCY_MARKER_PREFIX}${token}`);
     await notifyTelegram(env, `🛑 CIEL LIVE SELL FAILED\nToken: ${position.token}\nReason: ${reason}\nError: ${String(error).slice(0, 700)}`);
     return false;
   } finally {
