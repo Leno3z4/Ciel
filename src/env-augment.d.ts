@@ -1,3 +1,5 @@
+export {};
+
 declare module "./index" {
   interface Env {
     GEMINI_API_KEY_3?: string;
