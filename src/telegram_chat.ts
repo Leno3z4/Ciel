@@ -10,8 +10,6 @@ const RUNTIME_KEY = "ciel_runtime_state";
 const HOT_STATE_KEY = "ciel_hot_intelligence_state";
 const CHAT_KEY_INDEX = 7;
 
-type GeminiEnv = Env & Record<string, unknown>;
-
 function trimText(value: unknown, max = 1200): string {
   const text = typeof value === "string" ? value.trim() : "";
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -22,7 +20,7 @@ function num(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-async function contextForChat(env: GeminiEnv): Promise<string> {
+async function contextForChat(env: Env): Promise<string> {
   const parts: string[] = [];
   const marketState = await getMarketState(env);
   const runtimeRaw = await env.CIEL_STATE.get(RUNTIME_KEY);
@@ -81,7 +79,7 @@ async function contextForChat(env: GeminiEnv): Promise<string> {
   return parts.join("\n").slice(0, 7000) || "No live Ciel context is currently available.";
 }
 
-async function loadHistory(env: GeminiEnv, chatId: string): Promise<Array<{ role: "user" | "model"; text: string }>> {
+async function loadHistory(env: Env, chatId: string): Promise<Array<{ role: "user" | "model"; text: string }>> {
   const raw = await env.CIEL_STATE.get(`${CHAT_HISTORY_PREFIX}${chatId}`);
   if (!raw) return [];
   try {
@@ -95,7 +93,7 @@ async function loadHistory(env: GeminiEnv, chatId: string): Promise<Array<{ role
   }
 }
 
-async function saveHistory(env: GeminiEnv, chatId: string, history: Array<{ role: "user" | "model"; text: string }>): Promise<void> {
+async function saveHistory(env: Env, chatId: string, history: Array<{ role: "user" | "model"; text: string }>): Promise<void> {
   await env.CIEL_STATE.put(
     `${CHAT_HISTORY_PREFIX}${chatId}`,
     JSON.stringify(history.slice(-MAX_HISTORY_MESSAGES)),
@@ -104,11 +102,12 @@ async function saveHistory(env: GeminiEnv, chatId: string, history: Array<{ role
 }
 
 async function answerWithGemini(
-  env: GeminiEnv,
+  env: Env,
   history: Array<{ role: "user" | "model"; text: string }>,
   userText: string
 ): Promise<string> {
-  const key = String(env[`GEMINI_API_KEY_${CHAT_KEY_INDEX}`] || "").trim();
+  const envRecord = env as unknown as Record<string, unknown>;
+  const key = String(envRecord[`GEMINI_API_KEY_${CHAT_KEY_INDEX}`] || "").trim();
   if (!key) throw new Error(`GEMINI_API_KEY_${CHAT_KEY_INDEX} is not configured for Telegram chat`);
 
   const context = await contextForChat(env);
@@ -116,7 +115,7 @@ async function answerWithGemini(
     "You are Ciel, a crypto market intelligence assistant running on Nad.fun.",
     "Answer the user's Telegram question directly and naturally.",
     "Use the supplied live Ciel context when it is relevant. Never invent live prices, trades, balances, transactions, or decisions.",
-    "You may explain Ciel's current state, market observations, model decisions, risk settings, positions, exits, or recent telemetry.",
+    "You may explain Ciel's current state, market observations, model decisions, trading state, positions, exits, or recent telemetry.",
     "Make clear when data is unavailable or stale. Keep responses under 3500 characters.",
     `LIVE CIEL CONTEXT:\n${context}`,
     `RECENT CHAT:\n${history.map(item => `${item.role === "user" ? "User" : "Ciel"}: ${item.text}`).join("\n") || "(none)"}`,
@@ -130,7 +129,7 @@ async function answerWithGemini(
   return text;
 }
 
-export async function handleTelegramWebhook(request: Request, env: GeminiEnv): Promise<Response> {
+export async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
 
   const update = await request.json().catch(() => null) as Record<string, unknown> | null;
@@ -139,7 +138,7 @@ export async function handleTelegramWebhook(request: Request, env: GeminiEnv): P
   const message = update.message && typeof update.message === "object" ? update.message as Record<string, unknown> : null;
   const chat = message?.chat && typeof message.chat === "object" ? message.chat as Record<string, unknown> : null;
   const chatId = chat?.id;
-  const configuredChatId = env.TELEGRAM_CHAT_ID?.trim();
+  const configuredChatId = (env.TELEGRAM_CHAT_ID || "").trim();
 
   if (chatId === undefined || chatId === null || String(chatId) !== configuredChatId) return new Response("Ignored", { status: 200 });
 
