@@ -18,8 +18,8 @@
   },
   "triggers": { "crons": ["*/2 * * * *", "*/3 * * * *", "*/10 * * * *", "0 * * * *"] },
   "vars": {
-    "TRADING_ENABLED": "false",
-    "PAPER_TRADING": "true",
+    "TRADING_ENABLED": "true",
+    "PAPER_TRADING": "false",
     "HOLDING_CHECK_MINUTES": "2",
     "GEMINI_MODEL": "gemini-3.8-flash"
   },
