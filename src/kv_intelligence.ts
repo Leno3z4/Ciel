@@ -239,28 +239,25 @@ async function callGeminiPool(
     if (!candidate) break;
     cursor = candidate.nextCursor;
     const slot = candidate.slot;
-    const cooldownUntil = num((poolState as unknown as Record<string, unknown>)[`keyCooldown_${slot.index}`] || 0);
     const stateKey = String(slot.index);
-    const persistedCooldowns = await env.CIEL_STATE.get(`${"ciel_gemini_key_cooldown:"}${stateKey}`);
-    const effectiveCooldown = Math.max(cooldownUntil, num(persistedCooldowns));
-    if (effectiveCooldown > now) continue;
+    const persistedCooldowns = await env.CIEL_STATE.get(`ciel_gemini_key_cooldown:${stateKey}`);
+    if (num(persistedCooldowns) > now) continue;
 
     attempts++;
     try {
       const role = pool === "DECISION" ? "regime" : "market";
       const decision = await askGemini(slot.key, env.GEMINI_MODEL, role, snapshot, baseline, score, pattern);
       if (!decision) throw new Error("Gemini returned no decision");
-      const nextCursor = slots.length ? (slots.findIndex(entry => entry.index === slot.index) + 1) % slots.length : 0;
-      setCursorForPool(poolState, pool, nextCursor);
+      const slotPosition = slots.findIndex(entry => entry.index === slot.index);
+      setCursorForPool(poolState, pool, slotPosition >= 0 ? (slotPosition + 1) % slots.length : 0);
       poolState.lastPoolCallAt[pool] = now;
       poolState.lastUsedKeyByPool[pool] = slot.index;
-      await env.CIEL_STATE.delete(`${"ciel_gemini_key_cooldown:"}${stateKey}`);
       await writePoolState(env, poolState);
       return { decision, keyIndex: slot.index, fallbacks: Math.max(0, attempts - 1) };
     } catch (error) {
       lastError = error;
       if (!isFallbackWorthy(error)) throw error;
-      await env.CIEL_STATE.put(`${"ciel_gemini_key_cooldown:"}${stateKey}`, String(now + GEMINI_KEY_COOLDOWN_MS), { expirationTtl: 3600 });
+      await env.CIEL_STATE.put(`ciel_gemini_key_cooldown:${stateKey}`, String(now + GEMINI_KEY_COOLDOWN_MS), { expirationTtl: 3600 });
     }
   }
 
@@ -307,14 +304,13 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastGeminiPool: "ANALYST"
   }, true);
 
-  if (!analystPass) {
-    return true;
-  }
+  if (!analystPass) return true;
 
   let finalResult: { decision: GeminiDecision; keyIndex: number; fallbacks: number };
   try {
     finalResult = await callGeminiPool(env, poolState, "DECISION", history[0], baseline, score, pattern);
   } catch (error) {
+    if (/decision_pool_cooldown/.test(String(error))) return true;
     try {
       finalResult = await callGeminiPool(env, poolState, "FALLBACK", history[0], baseline, score, pattern);
     } catch (fallbackError) {
