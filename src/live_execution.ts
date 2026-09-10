@@ -20,6 +20,12 @@ import {
   getTradingMode
 } from "./trading_mode";
 
+import {
+  hasEmergencyExitMarker,
+  upsertLivePositionMirror,
+  removeLivePositionMirror
+} from "./live_position_guard";
+
 import type { Env } from "./index";
 
 
@@ -874,6 +880,16 @@ async function executeLiveBuy(
     )
     .run();
 
+  await upsertLivePositionMirror(
+    env,
+    {
+      token,
+      quantity: tokenDelta.toString(),
+      entryPriceUsd: priceUsd,
+      entryTsMs: now
+    }
+  );
+
   await setExecutionState(
     env,
     signal.id,
@@ -990,6 +1006,11 @@ async function executeLiveSell(
       `)
       .bind(token)
       .run();
+
+    await removeLivePositionMirror(
+      env,
+      token
+    );
 
     throw new Error(
       "wallet has no token balance to sell"
@@ -1145,6 +1166,11 @@ async function executeLiveSell(
     .bind(token)
     .run();
 
+  await removeLivePositionMirror(
+    env,
+    token
+  );
+
   await setExecutionState(
     env,
     signal.id,
@@ -1282,6 +1308,21 @@ async function executeLiveSignal(
       ok: false,
       skipped:
         "unsupported live signal"
+    };
+  }
+
+  if (
+    signal.action === "SELL" &&
+    await hasEmergencyExitMarker(signal.token_address)
+  ) {
+    await consumeLiveSignal(
+      env,
+      signal.id
+    );
+    return {
+      ok: false,
+      skipped:
+        "position already exited by live position guard"
     };
   }
 
@@ -1493,6 +1534,7 @@ export async function runLiveSignalCycle(
           id
         FROM signals
         WHERE action IN ('BUY','SELL')
+          AND consumed_ts_ms IS NULL
           AND ts_ms>=?
         ORDER BY ts_ms ASC
         LIMIT 10
