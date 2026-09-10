@@ -24,16 +24,16 @@ type Candidate = {
 
 type FeedToken = { token_info?: Record<string, unknown>; market_info?: Record<string, unknown>; [key: string]: unknown };
 
-const MIN_MARKET_CAP_USD = 90_000;
-const MIN_HISTORY_SAMPLES = 12;
-const MIN_HISTORY_SPAN_MS = 30 * 60 * 1000;
-const MIN_AVG_VOLUME_5M_USD = 5_000;
-const MIN_AVG_LIQUIDITY_USD = 10_000;
-const MAX_CANDIDATE_POOL = 20;
+const MIN_MARKET_CAP_USD = 50_000;
+const MIN_HISTORY_SAMPLES = 8;
+const MIN_HISTORY_SPAN_MS = 15 * 60 * 1000;
+const MIN_AVG_VOLUME_5M_USD = 1_000;
+const MIN_AVG_LIQUIDITY_USD = 5_000;
+const MAX_CANDIDATE_POOL = 30;
 const MAX_CANDIDATE_HISTORY_ROWS = 24;
-const MAX_CANDIDATES = 3;
-const MAX_DECISIONS_PER_CYCLE = 3;
-const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
+const MAX_CANDIDATES = 5;
+const MAX_DECISIONS_PER_CYCLE = 5;
+const MODEL_COOLDOWN_MS = 10 * 60 * 1000;
 const MODEL_KEY_COOLDOWN_MS = 60 * 1000;
 const MODEL_COOLDOWN_PREFIX = "ciel_model_cooldown:";
 const MODEL_KEY_COOLDOWN_PREFIX = "ciel_gemini_key_cooldown:";
@@ -295,7 +295,7 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
   }
 
   if (!established.length) {
-    await writeRuntime(env, { lastModelError: "No established high-volume meme candidates above $90,000 yet" });
+    await writeRuntime(env, { lastModelError: "No established high-volume meme candidates above $50,000 yet" });
     return;
   }
 
