@@ -6,6 +6,7 @@ import { runLiveSignalCycle } from "./live_execution";
 import { runOptimizedHoldingCheck } from "./holding_monitor";
 import { runKvIntelligenceCycle, flushPendingKvSignals } from "./kv_intelligence";
 import { runLivePositionGuard, flushEmergencyExitQueue } from "./live_position_guard";
+import { syncLivePositionMirror } from "./live_position_sync";
 
 export { TradingEngine };
 
@@ -100,7 +101,6 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
     payload.lastIndexerSnapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
     payload.d1Degraded = await isD1Degraded(env);
     if (payload.d1Degraded) payload.d1DegradedError = await env.CIEL_STATE.get(D1_ERROR_KEY);
-
     const feedHealth = await readFeedHealth(env);
     payload.kvMarketFeed = {
       ok: feedHealth.ok === true,
@@ -121,7 +121,6 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       payload.lastIndexerTopMarketCapSymbol = feedHealth.topSymbol || null;
       payload.lastIndexerSkipReason = "d1-degraded-kv-discovery-active";
     }
-
     const snapshots = await snapshotDiagnostics(env);
     payload.marketSnapshotTotalCount = snapshots.total;
     payload.marketSnapshotHistory = snapshots.markets;
@@ -153,7 +152,6 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const last = Number(await env.CIEL_STATE.get(HEARTBEAT_KEY) || "0");
   if (last > 0 && Date.now() - last < HEARTBEAT_INTERVAL_MS) return;
   await env.CIEL_STATE.put(HEARTBEAT_KEY, String(Date.now()), { expirationTtl: 3600 });
-
   const raw = await env.CIEL_STATE.get("ciel_runtime_state");
   let runtime: Record<string, unknown> = {};
   try { runtime = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
@@ -178,7 +176,6 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const feedAge = feedHealth.fetchedAt ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000)) : null;
   const kvLine = feedHealth.ok === true ? `\n\nKV market feed\nSource: ${String(feedHealth.source || "unknown")}\nMarkets: ${discovered}\nValid: ${valid}\nAge: ${feedAge === null ? "n/a" : `${feedAge}s`}\nTop cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}` : "\n\n⚠️ KV market feed has no healthy cache yet.";
   const d1Line = d1Degraded ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV discovery + intelligence remain active." : "";
-
   await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${recoveryLine}${guardLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`);
 }
 
@@ -187,12 +184,8 @@ async function maybeRunEstablishedModel(env: Env): Promise<void> {
   const last = Number(await env.CIEL_STATE.get(MODEL_TRIGGER_KEY) || "0");
   if (last > 0 && Date.now() - last < MODEL_TRIGGER_INTERVAL_MS) return;
   await env.CIEL_STATE.put(MODEL_TRIGGER_KEY, String(Date.now()), { expirationTtl: 86400 });
-  try {
-    await triggerEstablishedModelAnalysis(env);
-  } catch (error) {
-    await markD1Degraded(env, error);
-    console.error(`Established model trigger failed: ${String(error).slice(0, 1000)}`);
-  }
+  try { await triggerEstablishedModelAnalysis(env); }
+  catch (error) { await markD1Degraded(env, error); console.error(`Established model trigger failed: ${String(error).slice(0, 1000)}`); }
 }
 
 const worker = {
@@ -226,9 +219,7 @@ const worker = {
       ctx.waitUntil((async () => {
         try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery failed: ${String(error).slice(0, 500)}`); }
         try { await runKvIntelligenceCycle(env); } catch (error) { console.error(`KV intelligence cycle failed: ${String(error).slice(0, 1000)}`); }
-
         if (await isD1Degraded(env)) return;
-
         try { await flushPendingKvSignals(env); } catch (error) { console.error(`KV pending recovery failed: ${String(error).slice(0, 1000)}`); }
         if (await isD1Degraded(env)) return;
         try { await maybeSendDecisionAlert(env); } catch (error) { console.error(`Decision Telegram alert failed: ${String(error).slice(0, 800)}`); }
@@ -247,6 +238,7 @@ const worker = {
         }
         if (!(await isD1Degraded(env))) {
           try { await flushEmergencyExitQueue(env); } catch (error) { console.error(`Emergency exit reconciliation failed: ${String(error).slice(0, 800)}`); }
+          try { await syncLivePositionMirror(env); } catch (error) { console.error(`Live position mirror sync failed: ${String(error).slice(0, 800)}`); }
         }
         try { await maybeSendHeartbeat(env); } catch (error) { console.error(`Heartbeat failed: ${String(error).slice(0, 500)}`); }
       })());
