@@ -36,23 +36,24 @@ export const TRADING_CONFIG: Record<TradingMode, TradingConfig> = {
    * - test strategies
    * - allow Ciel to make more decisions
    *
-   * This is NOT real-money protection.
+   * Paper mode intentionally has no strategy-level execution limits.
+   * Real-money protection belongs to live mode.
    */
   paper: {
 
-    maxPositions: 50,
+    maxPositions: Number.MAX_SAFE_INTEGER,
 
-    minimumConfidence: 0.50,
+    minimumConfidence: 0,
 
     maxPortfolioExposurePct: 100,
 
-    maxPositionPct: 25,
+    maxPositionPct: 100,
 
     allowAccumulationEntries: true,
 
     circuitBreakerEnabled: false,
 
-    maxFailuresBeforePause: 20
+    maxFailuresBeforePause: Number.MAX_SAFE_INTEGER
   },
 
 
