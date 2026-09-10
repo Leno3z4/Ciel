@@ -11,7 +11,7 @@ export default {
       return handleTelegramWebhook(request, env);
     }
 
-    return worker.fetch(request, env, ctx);
+    return worker.fetch(request, env);
   },
 
   async scheduled(
