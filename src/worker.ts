@@ -3,6 +3,7 @@ import { primeMarketDiscovery } from "./market_discovery";
 import { triggerEstablishedModelAnalysis } from "./model_trigger";
 import { notifyTelegram } from "./telegram";
 import { runLiveSignalCycle } from "./live_execution";
+import { runOptimizedHoldingCheck } from "./holding_monitor";
 
 export { TradingEngine };
 
@@ -48,7 +49,10 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastGeminiFallbacks",
       "lastModelDecisionCandidate",
       "lastModelDecisionAction",
-      "lastModelDecisionConfidence"
+      "lastModelDecisionConfidence",
+      "lastHoldingPaperPositions",
+      "lastHoldingLivePositions",
+      "lastHoldingCheckError"
     ];
     for (const key of diagnostics) if (runtime[key] !== undefined) payload[key] = runtime[key];
     payload.lastIndexerSnapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
@@ -96,10 +100,14 @@ const worker = {
     return statusWithDiagnostics(request, env);
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (controller.cron === "*/2 * * * *") {
+      ctx.waitUntil(runOptimizedHoldingCheck(env));
+      return;
+    }
     if (controller.cron === "*/3 * * * *") {
       ctx.waitUntil((async () => {
         await base.scheduled(controller, env, ctx);
-    
+
         try {
           await triggerEstablishedModelAnalysis(env);
         } catch (error) {
@@ -107,7 +115,7 @@ const worker = {
             `Established model trigger failed: ${String(error).slice(0, 1000)}`
           );
         }
-    
+
         try {
           await runLiveSignalCycle(env);
         } catch (error) {
@@ -116,7 +124,7 @@ const worker = {
           );
         }
       })());
-    
+
       return;
     }
     if (controller.cron === "*/10 * * * *") {
