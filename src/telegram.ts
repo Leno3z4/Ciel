@@ -1,5 +1,4 @@
 import type { Env } from "./index";
-import { reportAfterNotification } from "./reporting";
 
 type TelegramApiResponse = {
   ok?: boolean;
@@ -9,101 +8,506 @@ type TelegramApiResponse = {
 };
 
 const TELEGRAM_RUNTIME_KEY = "ciel_telegram_runtime";
-type TelegramRuntime = { lastAttemptAt?: number; lastSuccessAt?: number; lastFailureAt?: number; lastError?: string; lastTestAt?: number; lastTestSuccess?: boolean };
+const RUNTIME_KEY = "ciel_runtime_state";
+const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
+
+type TelegramRuntime = {
+  lastAttemptAt?: number;
+  lastSuccessAt?: number;
+  lastFailureAt?: number;
+  lastError?: string;
+  lastTestAt?: number;
+  lastTestSuccess?: boolean;
+};
+
+type FeedToken = {
+  token_info?: Record<string, unknown>;
+  market_info?: Record<string, unknown>;
+  [key: string]: unknown;
+};
 
 async function recordTelegramRuntime(env: Env, patch: TelegramRuntime): Promise<void> {
   try {
     const raw = await env.CIEL_STATE.get(TELEGRAM_RUNTIME_KEY);
     let current: TelegramRuntime = {};
-    try { if (raw) current = JSON.parse(raw) as TelegramRuntime; } catch {}
-    await env.CIEL_STATE.put(TELEGRAM_RUNTIME_KEY, JSON.stringify({ ...current, ...patch }));
-  } catch (error) { console.error(`Telegram telemetry write failed: ${String(error).slice(0, 300)}`); }
+    try {
+      if (raw) current = JSON.parse(raw) as TelegramRuntime;
+    } catch {}
+
+    await env.CIEL_STATE.put(
+      TELEGRAM_RUNTIME_KEY,
+      JSON.stringify({ ...current, ...patch })
+    );
+  } catch (error) {
+    console.error(
+      `Telegram telemetry write failed: ${String(error).slice(0, 300)}`
+    );
+  }
 }
 
-function telegramUrl(env: Env, method: string): string { return `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN!.trim()}/${method}`; }
+function telegramUrl(env: Env, method: string): string {
+  return `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN!.trim()}/${method}`;
+}
 
-async function telegramRequest(env: Env, method: string, body?: Record<string, unknown>): Promise<TelegramApiResponse> {
-  if (!env.TELEGRAM_BOT_TOKEN?.trim()) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
-  const response = await fetch(telegramUrl(env, method), { method: body ? "POST" : "GET", headers: body ? { "content-type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined });
+async function telegramRequest(
+  env: Env,
+  method: string,
+  body?: Record<string, unknown>
+): Promise<TelegramApiResponse> {
+  if (!env.TELEGRAM_BOT_TOKEN?.trim()) {
+    throw new Error("TELEGRAM_BOT_TOKEN is not configured");
+  }
+
+  const response = await fetch(
+    telegramUrl(env, method),
+    {
+      method: body ? "POST" : "GET",
+      headers: body
+        ? { "content-type": "application/json" }
+        : undefined,
+      body: body ? JSON.stringify(body) : undefined
+    }
+  );
+
   const raw = await response.text().catch(() => "");
   let payload: TelegramApiResponse = {};
-  try { payload = raw ? JSON.parse(raw) as TelegramApiResponse : {}; } catch {}
-  if (!response.ok || payload.ok !== true) throw new Error(`Telegram ${method} failed: HTTP ${response.status}; code=${payload.error_code ?? "unknown"}; ${payload.description ?? raw.slice(0, 500)}`);
+
+  try {
+    payload = raw
+      ? JSON.parse(raw) as TelegramApiResponse
+      : {};
+  } catch {}
+
+  if (!response.ok || payload.ok !== true) {
+    throw new Error(
+      `Telegram ${method} failed: HTTP ${response.status}; code=${payload.error_code ?? "unknown"}; ${payload.description ?? raw.slice(0, 500)}`
+    );
+  }
+
   return payload;
 }
 
 async function sendTelegram(env: Env, text: string): Promise<void> {
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = env.TELEGRAM_CHAT_ID?.trim();
-  if (!token || !chatId) throw new Error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured");
-  if (!text.trim()) throw new Error("Telegram message text is empty");
-  if (text.length > 4096) throw new Error(`Telegram message is too long: ${text.length} characters`);
-  await telegramRequest(env, "sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
+
+  if (!token || !chatId) {
+    throw new Error(
+      "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"
+    );
+  }
+
+  if (!text.trim()) {
+    throw new Error("Telegram message text is empty");
+  }
+
+  if (text.length > 4096) {
+    throw new Error(
+      `Telegram message is too long: ${text.length} characters`
+    );
+  }
+
+  await telegramRequest(
+    env,
+    "sendMessage",
+    {
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true
+    }
+  );
 }
 
-function fmtUsd(value: number): string {
+function num(value: unknown): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  if (typeof value !== "string") return 0;
+
+  const text = value.trim().replace(/[$,\s]/g, "");
+  if (!text) return 0;
+
+  const match = text.match(
+    /^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(K|M|B|T)?$/i
+  );
+
+  if (!match) {
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return 0;
+
+  const multipliers: Record<string, number> = {
+    K: 1e3,
+    M: 1e6,
+    B: 1e9,
+    T: 1e12
+  };
+
+  return base * (
+    match[2]
+      ? multipliers[match[2].toUpperCase()]
+      : 1
+  );
+}
+
+function objectValue(
+  source: unknown,
+  keys: string[]
+): unknown {
+  if (!source || typeof source !== "object") return null;
+
+  const obj = source as Record<string, unknown>;
+
+  for (const key of keys) {
+    if (
+      obj[key] !== undefined &&
+      obj[key] !== null &&
+      obj[key] !== ""
+    ) {
+      return obj[key];
+    }
+  }
+
+  return null;
+}
+
+function nestedNumber(
+  item: FeedToken,
+  tokenKeys: string[],
+  marketKeys: string[]
+): number {
+  return num(
+    objectValue(item.market_info, marketKeys)
+  ) || num(
+    objectValue(item.token_info, tokenKeys)
+  );
+}
+
+function tokenAddress(item: FeedToken): string | null {
+  const value =
+    objectValue(item.token_info, [
+      "token_id",
+      "token_address",
+      "tokenAddress"
+    ]) ||
+    objectValue(item.market_info, [
+      "token_id",
+      "token_address",
+      "tokenAddress"
+    ]);
+
+  const text = typeof value === "string"
+    ? value
+    : "";
+
+  return /^0x[a-fA-F0-9]{40}$/.test(text)
+    ? text.toLowerCase()
+    : null;
+}
+
+function extractTokens(
+  value: unknown,
+  depth = 0
+): FeedToken[] {
+  if (depth > 6 || value == null) return [];
+
+  if (Array.isArray(value)) {
+    return value.filter(
+      item => item && typeof item === "object"
+    ) as FeedToken[];
+  }
+
+  if (typeof value !== "object") return [];
+
+  const object = value as Record<string, unknown>;
+
+  for (const key of [
+    "tokens",
+    "data",
+    "result",
+    "items",
+    "markets"
+  ]) {
+    const found = extractTokens(
+      object[key],
+      depth + 1
+    );
+
+    if (found.length) return found;
+  }
+
+  return [];
+}
+
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "n/a";
   if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
   if (value >= 1_000) return `$${(value / 1_000).toFixed(1)}K`;
   return `$${Math.round(value)}`;
 }
 
-function fmtPct(value: number | null): string {
-  return Number.isFinite(Number(value)) ? `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(1)}%` : "n/a";
+function feedMarketCap(item: FeedToken): number {
+  return nestedNumber(
+    item,
+    [
+      "market_cap_usd",
+      "marketCapUsd",
+      "market_cap",
+      "marketCap",
+      "fdv"
+    ],
+    [
+      "market_cap_usd",
+      "marketCapUsd",
+      "market_cap",
+      "marketCap",
+      "fdv"
+    ]
+  );
 }
 
-async function transformIndexerNotification(env: Env, text: string): Promise<string> {
-  if (!text.startsWith("📡 Ciel indexer")) return text;
+function feedLiquidity(item: FeedToken): number {
+  return nestedNumber(
+    item,
+    ["liquidity_usd", "liquidityUsd"],
+    ["liquidity_usd", "liquidityUsd"]
+  );
+}
+
+function feedSymbol(item: FeedToken): string {
+  const symbol = objectValue(
+    item.token_info,
+    ["symbol"]
+  );
+
+  return typeof symbol === "string" && symbol.trim()
+    ? symbol.trim()
+    : tokenAddress(item)?.slice(0, 10) || "unknown";
+}
+
+async function readRuntime(
+  env: Env
+): Promise<Record<string, unknown>> {
+  const raw = await env.CIEL_STATE.get(RUNTIME_KEY);
+  if (!raw) return {};
+
   try {
-    const eligible = await env.DB.prepare(`SELECT COUNT(*) as count FROM (SELECT token_address FROM market_snapshots WHERE price_usd>0 AND market_cap_usd>=90000 GROUP BY token_address)`).first<{ count: number }>();
-    const established = await env.DB.prepare(`SELECT COUNT(*) as count FROM (SELECT token_address FROM market_snapshots WHERE price_usd>0 GROUP BY token_address HAVING COUNT(*)>=12 AND (MAX(ts_ms)-MIN(ts_ms))>=1800000 AND AVG(volume_5m_usd)>=5000 AND AVG(liquidity_usd)>=10000 AND AVG(market_cap_usd)>=90000)`).first<{ count: number }>();
-    const rows = await env.DB.prepare(`SELECT s.token_address as token, t.symbol as symbol, s.market_cap_usd as cap,
-      ((s.market_cap_usd - COALESCE((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-1800000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),s.market_cap_usd)) / NULLIF((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-1800000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),0))*100 as ret30,
-      ((s.market_cap_usd - COALESCE((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-7200000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),s.market_cap_usd)) / NULLIF((SELECT h.market_cap_usd FROM market_snapshots h WHERE h.token_address=s.token_address AND h.ts_ms<=s.ts_ms-7200000 AND h.market_cap_usd>0 ORDER BY h.ts_ms DESC LIMIT 1),0))*100 as ret2h
-      FROM market_snapshots s LEFT JOIN tokens t ON lower(t.address)=lower(s.token_address)
-      WHERE s.ts_ms=(SELECT MAX(x.ts_ms) FROM market_snapshots x WHERE x.token_address=s.token_address) AND s.market_cap_usd>=90000
-      ORDER BY s.market_cap_usd DESC LIMIT 5`).all<{ token: string; symbol: string | null; cap: number; ret30: number | null; ret2h: number | null }>();
-    if (!(rows.results?.length)) return `📊 Ciel market monitor\nMarkets ≥$90,000: ${Number(eligible?.count || 0)}\nEstablished markets: ${Number(established?.count || 0)}\n\nNo current ≥$90K market-cap snapshots. Ciel is still building history.`;
-    const top = (rows.results || []).map((row, i) => `${i + 1}. ${row.symbol?.trim() || row.token.slice(0, 10)} — ${fmtUsd(Number(row.cap))} | ${fmtPct(row.ret30)} 30m | ${fmtPct(row.ret2h)} 2h`);
-    return `📊 Ciel market monitor\nMarkets ≥$90,000: ${Number(eligible?.count || 0)}\nEstablished markets: ${Number(established?.count || 0)}\n\nTop ≥$90K markets\n${top.join("\n")}\n\nEstablished requires 12+ snapshots spanning 30m, avg 5m volume ≥$5K, avg liquidity ≥$10K, and avg market cap ≥$90K.`.slice(0, 3900);
-  } catch (error) {
-    console.error(`Market monitor Telegram formatting failed: ${String(error).slice(0, 500)}`);
-    return "📊 Ciel market monitor\nMarket-cap floor: ≥$90,000\n\nMarket snapshot data is not available yet; Ciel is still building its history.";
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {};
   }
 }
 
-export async function testTelegram(env: Env): Promise<{ ok: boolean; bot?: string; chat?: string; error?: string }> {
+async function readCachedMarkets(
+  env: Env
+): Promise<FeedToken[]> {
+  const raw = await env.CIEL_STATE.get(
+    RANKING_CACHE_KEY
+  );
+
+  if (!raw) return [];
+
+  try {
+    return extractTokens(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+async function transformIndexerNotification(
+  env: Env,
+  text: string
+): Promise<string> {
+  if (!text.startsWith("📡 Ciel indexer")) {
+    return text;
+  }
+
+  try {
+    const runtime = await readRuntime(env);
+    const markets = await readCachedMarkets(env);
+
+    const ranked = markets
+      .map(item => ({
+        item,
+        marketCap: feedMarketCap(item),
+        liquidity: feedLiquidity(item)
+      }))
+      .filter(row => row.marketCap > 0)
+      .sort((a, b) => b.marketCap - a.marketCap)
+      .slice(0, 5);
+
+    const discoveryCount = Number(
+      runtime.lastIndexerDiscoveryCount || 0
+    );
+    const candidateCount = Number(
+      runtime.lastIndexerCandidateCount || 0
+    );
+    const directEligible = Number(
+      runtime.lastIndexerDirectEligible || 0
+    );
+    const capEligible = Number(
+      runtime.lastIndexerCapEligible || 0
+    );
+
+    const marketLines = ranked.map(
+      (row, index) =>
+        `${index + 1}. ${feedSymbol(row.item)} — MC ${formatUsd(row.marketCap)} | LQ ${formatUsd(row.liquidity)}`
+    );
+
+    const marketSection = marketLines.length
+      ? `\n\nTOP CURRENT MARKETS\n${marketLines.join("\n")}`
+      : "";
+
+    return [
+      "📡 CIEL INDEXER UPDATE",
+      text.replace("📡 Ciel indexer", "").trim(),
+      `Discovery: ${discoveryCount} | Candidates: ${candidateCount} | ≥$90K: ${capEligible} | Direct eligible: ${directEligible}`,
+      marketSection
+    ].filter(Boolean).join("\n").slice(0, 3900);
+  } catch (error) {
+    console.error(
+      `Market monitor Telegram formatting failed: ${String(error).slice(0, 500)}`
+    );
+
+    return text;
+  }
+}
+
+export async function testTelegram(
+  env: Env
+): Promise<{
+  ok: boolean;
+  bot?: string;
+  chat?: string;
+  error?: string;
+}> {
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = env.TELEGRAM_CHAT_ID?.trim();
   const testedAt = Date.now();
+
   if (!token || !chatId) {
-    await recordTelegramRuntime(env, { lastTestAt: testedAt, lastTestSuccess: false, lastError: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" });
-    return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured" };
+    await recordTelegramRuntime(
+      env,
+      {
+        lastTestAt: testedAt,
+        lastTestSuccess: false,
+        lastError:
+          "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"
+      }
+    );
+
+    return {
+      ok: false,
+      error:
+        "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"
+    };
   }
+
   try {
     const me = await telegramRequest(env, "getMe");
-    const username = (me.result as { username?: string } | undefined)?.username;
-    const chat = await telegramRequest(env, "getChat", { chat_id: chatId });
-    const chatInfo = chat.result as { title?: string; username?: string; first_name?: string; type?: string } | undefined;
-    await sendTelegram(env, "🔌 Ciel Telegram test\nBot authentication, chat access, and message delivery are working.");
-    await recordTelegramRuntime(env, { lastTestAt: testedAt, lastTestSuccess: true, lastSuccessAt: Date.now(), lastError: undefined });
-    return { ok: true, bot: username ? `@${username}` : undefined, chat: chatInfo?.title || chatInfo?.username || chatInfo?.first_name || chatInfo?.type || chatId };
+    const username = (
+      me.result as { username?: string } | undefined
+    )?.username;
+
+    const chat = await telegramRequest(
+      env,
+      "getChat",
+      { chat_id: chatId }
+    );
+
+    const chatInfo = chat.result as {
+      title?: string;
+      username?: string;
+      first_name?: string;
+      type?: string;
+    } | undefined;
+
+    await sendTelegram(
+      env,
+      "🔌 Ciel Telegram test\nBot authentication, chat access, and message delivery are working."
+    );
+
+    await recordTelegramRuntime(
+      env,
+      {
+        lastTestAt: testedAt,
+        lastTestSuccess: true,
+        lastSuccessAt: Date.now(),
+        lastError: undefined
+      }
+    );
+
+    return {
+      ok: true,
+      bot: username ? `@${username}` : undefined,
+      chat:
+        chatInfo?.title ||
+        chatInfo?.username ||
+        chatInfo?.first_name ||
+        chatInfo?.type ||
+        chatId
+    };
   } catch (error) {
     const message = String(error).slice(0, 800);
-    await recordTelegramRuntime(env, { lastTestAt: testedAt, lastTestSuccess: false, lastFailureAt: Date.now(), lastError: message });
-    return { ok: false, error: message };
+
+    await recordTelegramRuntime(
+      env,
+      {
+        lastTestAt: testedAt,
+        lastTestSuccess: false,
+        lastFailureAt: Date.now(),
+        lastError: message
+      }
+    );
+
+    return {
+      ok: false,
+      error: message
+    };
   }
 }
 
-export async function notifyTelegram(env: Env, text: string): Promise<void> {
-  await recordTelegramRuntime(env, { lastAttemptAt: Date.now() });
+export async function notifyTelegram(
+  env: Env,
+  text: string
+): Promise<void> {
+  await recordTelegramRuntime(
+    env,
+    { lastAttemptAt: Date.now() }
+  );
+
   try {
-    const outgoing = await transformIndexerNotification(env, text);
+    const outgoing = await transformIndexerNotification(
+      env,
+      text
+    );
+
     await sendTelegram(env, outgoing);
-    await recordTelegramRuntime(env, { lastSuccessAt: Date.now(), lastError: undefined });
-    await reportAfterNotification(env, outgoing, sendTelegram);
+
+    await recordTelegramRuntime(
+      env,
+      {
+        lastSuccessAt: Date.now(),
+        lastError: undefined
+      }
+    );
   } catch (error) {
     const message = String(error).slice(0, 800);
-    await recordTelegramRuntime(env, { lastFailureAt: Date.now(), lastError: message });
-    console.error(`Telegram notification failed: ${message}`);
+
+    await recordTelegramRuntime(
+      env,
+      {
+        lastFailureAt: Date.now(),
+        lastError: message
+      }
+    );
+
+    console.error(
+      `Telegram notification failed: ${message}`
+    );
   }
 }
