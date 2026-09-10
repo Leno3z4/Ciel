@@ -12,6 +12,7 @@ const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
 const SNAPSHOT_INDEX_KEY = "ciel_snapshot_query_index_v1";
 const D1_DEGRADED_KEY = "ciel_d1_degraded_utc_date";
 const D1_ERROR_KEY = "ciel_d1_degraded_error";
+const TELEGRAM_DECISION_ALERT_KEY = "ciel_telegram_last_decision_alert_ms";
 
 function utcDateKey(now = Date.now()): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -27,11 +28,13 @@ async function isD1Degraded(env: Env): Promise<boolean> {
 
 async function markD1Degraded(env: Env, error: unknown): Promise<void> {
   if (!isD1QuotaError(error)) return;
+
   await env.CIEL_STATE.put(
     D1_DEGRADED_KEY,
     utcDateKey(),
     { expirationTtl: 172800 }
   );
+
   await env.CIEL_STATE.put(
     D1_ERROR_KEY,
     String(error).slice(0, 1000),
@@ -91,11 +94,13 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
   const response = await base.fetch(request, env);
   const url = new URL(request.url);
   if (url.pathname !== "/status" || url.searchParams.get("telegramTest") === "1" || !response.ok) return response;
+
   try {
     const payload = await response.json() as Record<string, unknown>;
     const raw = await env.CIEL_STATE.get("ciel_runtime_state");
     let runtime: Record<string, unknown> = {};
     try { runtime = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
+
     const diagnostics = [
       "lastIndexerDiscoveryCount",
       "lastIndexerValidAddressCount",
@@ -119,28 +124,110 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastHoldingLivePositions",
       "lastHoldingCheckError"
     ];
-    for (const key of diagnostics) if (runtime[key] !== undefined) payload[key] = runtime[key];
-    payload.lastIndexerSnapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
+
+    for (const key of diagnostics) {
+      if (runtime[key] !== undefined) payload[key] = runtime[key];
+    }
+
+    payload.lastIndexerSnapshotsThisCycle = Number(
+      runtime.lastIndexerSnapshots || 0
+    );
+
     payload.d1Degraded = await isD1Degraded(env);
+
     if (payload.d1Degraded) {
       payload.d1DegradedError = await env.CIEL_STATE.get(D1_ERROR_KEY);
     }
+
     const snapshots = await snapshotDiagnostics(env);
     payload.marketSnapshotTotalCount = snapshots.total;
     payload.marketSnapshotHistory = snapshots.markets;
-    return new Response(JSON.stringify(payload), { status: response.status, headers: { "content-type": "application/json" } });
+
+    return new Response(
+      JSON.stringify(payload),
+      {
+        status: response.status,
+        headers: { "content-type": "application/json" }
+      }
+    );
   } catch {
     return response;
   }
 }
 
+async function maybeSendDecisionAlert(env: Env): Promise<void> {
+  const raw = await env.CIEL_STATE.get("ciel_runtime_state");
+
+  if (!raw) return;
+
+  let runtime: Record<string, unknown>;
+
+  try {
+    runtime = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+
+  const action = String(
+    runtime.lastModelDecisionAction || ""
+  ).toUpperCase();
+
+  if (action !== "BUY" && action !== "SELL") return;
+
+  const decisionAt = Number(
+    runtime.lastGeminiSuccess ||
+    runtime.lastModelAnalyzed ||
+    0
+  );
+
+  if (!(decisionAt > 0)) return;
+
+  const lastAlert = Number(
+    await env.CIEL_STATE.get(
+      TELEGRAM_DECISION_ALERT_KEY
+    ) || "0"
+  );
+
+  if (decisionAt <= lastAlert) return;
+
+  const candidate = typeof runtime.lastModelDecisionCandidate === "string"
+    ? runtime.lastModelDecisionCandidate
+    : "unknown";
+
+  const confidence = Number(
+    runtime.lastModelDecisionConfidence || 0
+  );
+
+  const mode = env.TRADING_ENABLED === "true"
+    ? "LIVE"
+    : "PAPER";
+
+  await notifyTelegram(
+    env,
+    `${action === "BUY" ? "🟢" : "🔴"} CIEL ${action} DECISION\nToken: ${candidate}\nConfidence: ${(confidence * 100).toFixed(0)}%\nMode: ${mode}\nGemini analysis: ${new Date(decisionAt).toISOString()}`
+  );
+
+  await env.CIEL_STATE.put(
+    TELEGRAM_DECISION_ALERT_KEY,
+    String(decisionAt),
+    { expirationTtl: 172800 }
+  );
+}
+
 async function maybeSendHeartbeat(env: Env): Promise<void> {
   const last = Number(await env.CIEL_STATE.get(HEARTBEAT_KEY) || "0");
   if (last > 0 && Date.now() - last < HEARTBEAT_INTERVAL_MS) return;
-  await env.CIEL_STATE.put(HEARTBEAT_KEY, String(Date.now()), { expirationTtl: 3600 });
+
+  await env.CIEL_STATE.put(
+    HEARTBEAT_KEY,
+    String(Date.now()),
+    { expirationTtl: 3600 }
+  );
+
   const raw = await env.CIEL_STATE.get("ciel_runtime_state");
   let runtime: Record<string, unknown> = {};
   try { runtime = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
+
   const discovered = Number(runtime.lastIndexerDiscoveryCount || 0);
   const valid = Number(runtime.lastIndexerValidAddressCount || 0);
   const candidates = Number(runtime.lastIndexerCandidateCount || 0);
@@ -167,65 +254,131 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const d1Line = d1Degraded
     ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV market discovery/health remains active."
     : "";
-  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`);
+
+  await notifyTelegram(
+    env,
+    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`
+  );
 }
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
     return statusWithDiagnostics(request, env);
   },
-  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext
+  ) {
     if (controller.cron === "*/2 * * * *") {
       if (await isD1Degraded(env)) return;
 
       const startedAt = Date.now();
+
       ctx.waitUntil((async () => {
         await runOptimizedHoldingCheck(env);
-        const runtimeRaw = await env.CIEL_STATE.get("ciel_runtime_state");
+
+        const runtimeRaw = await env.CIEL_STATE.get(
+          "ciel_runtime_state"
+        );
+
         try {
-          const runtime = runtimeRaw ? JSON.parse(runtimeRaw) as Record<string, unknown> : {};
-          const lastCheck = Number(runtime.lastHoldingCheck || 0);
+          const runtime = runtimeRaw
+            ? JSON.parse(runtimeRaw) as Record<string, unknown>
+            : {};
+          const lastCheck = Number(
+            runtime.lastHoldingCheck || 0
+          );
           const error = runtime.lastHoldingCheckError;
-          if (lastCheck >= startedAt && isD1QuotaError(error)) {
+
+          if (
+            lastCheck >= startedAt &&
+            isD1QuotaError(error)
+          ) {
             await markD1Degraded(env, error);
           }
         } catch {}
       })());
+
       return;
     }
 
     if (controller.cron === "*/3 * * * *") {
       ctx.waitUntil((async () => {
         if (await isD1Degraded(env)) {
-          try { await primeMarketDiscovery(env); } catch (error) { console.error(`KV market discovery refresh failed: ${String(error).slice(0, 500)}`); }
+          try {
+            await primeMarketDiscovery(env);
+          } catch (error) {
+            console.error(
+              `KV market discovery refresh failed: ${String(error).slice(0, 500)}`
+            );
+          }
+
           return;
         }
 
         const startedAt = Date.now();
         const indexReady = await ensureSnapshotQueryIndex(env);
-        if (!indexReady || await isD1Degraded(env)) {
-          try { await primeMarketDiscovery(env); } catch (error) { console.error(`KV market discovery refresh failed: ${String(error).slice(0, 500)}`); }
+
+        if (
+          !indexReady ||
+          await isD1Degraded(env)
+        ) {
+          try {
+            await primeMarketDiscovery(env);
+          } catch (error) {
+            console.error(
+              `KV market discovery refresh failed: ${String(error).slice(0, 500)}`
+            );
+          }
+
           return;
         }
 
         try {
-          await base.scheduled(controller, env, ctx);
+          await base.scheduled(
+            controller,
+            env,
+            ctx
+          );
         } catch (error) {
           await markD1Degraded(env, error);
         }
 
-        const runtimeRaw = await env.CIEL_STATE.get("ciel_runtime_state");
+        const runtimeRaw = await env.CIEL_STATE.get(
+          "ciel_runtime_state"
+        );
+
         try {
-          const runtime = runtimeRaw ? JSON.parse(runtimeRaw) as Record<string, unknown> : {};
-          const lastCycle = Number(runtime.lastMarketCycle || 0);
+          const runtime = runtimeRaw
+            ? JSON.parse(runtimeRaw) as Record<string, unknown>
+            : {};
+          const lastCycle = Number(
+            runtime.lastMarketCycle || 0
+          );
           const cycleError = runtime.lastMarketCycleError;
-          if (lastCycle >= startedAt && isD1QuotaError(cycleError)) {
-            await markD1Degraded(env, cycleError);
+
+          if (
+            lastCycle >= startedAt &&
+            isD1QuotaError(cycleError)
+          ) {
+            await markD1Degraded(
+              env,
+              cycleError
+            );
           }
         } catch {}
 
         if (await isD1Degraded(env)) {
-          try { await primeMarketDiscovery(env); } catch (error) { console.error(`KV market discovery refresh failed: ${String(error).slice(0, 500)}`); }
+          try {
+            await primeMarketDiscovery(env);
+          } catch (error) {
+            console.error(
+              `KV market discovery refresh failed: ${String(error).slice(0, 500)}`
+            );
+          }
+
           return;
         }
 
@@ -239,6 +392,14 @@ const worker = {
         }
 
         if (await isD1Degraded(env)) return;
+
+        try {
+          await maybeSendDecisionAlert(env);
+        } catch (error) {
+          console.error(
+            `Decision Telegram alert failed: ${String(error).slice(0, 800)}`
+          );
+        }
 
         try {
           await runLiveSignalCycle(env);
@@ -258,18 +419,44 @@ const worker = {
         if (!(await isD1Degraded(env))) {
           await ensureSnapshotQueryIndex(env);
         }
-        try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery prime failed: ${String(error).slice(0, 500)}`); }
-        try { if (!(await isD1Degraded(env))) await base.scheduled(controller, env, ctx); } finally { await maybeSendHeartbeat(env); }
+
+        try {
+          await primeMarketDiscovery(env);
+        } catch (error) {
+          console.error(
+            `Market discovery prime failed: ${String(error).slice(0, 500)}`
+          );
+        }
+
+        try {
+          if (!(await isD1Degraded(env))) {
+            await base.scheduled(
+              controller,
+              env,
+              ctx
+            );
+          }
+        } finally {
+          await maybeSendHeartbeat(env);
+        }
       })());
+
       return;
     }
 
     if (controller.cron === "0 * * * *") {
-      if (!(await isD1Degraded(env))) await ensureSnapshotQueryIndex(env);
+      if (!(await isD1Degraded(env))) {
+        await ensureSnapshotQueryIndex(env);
+      }
+
       return;
     }
 
-    await base.scheduled(controller, env, ctx);
+    await base.scheduled(
+      controller,
+      env,
+      ctx
+    );
   }
 };
 
