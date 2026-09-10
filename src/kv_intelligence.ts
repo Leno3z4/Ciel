@@ -94,11 +94,7 @@ async function writeRuntime(env: Env, patch: Record<string, unknown>): Promise<v
 async function readFeed(env: Env): Promise<Array<Record<string, unknown>>> {
   const raw = await env.CIEL_STATE.get(RANKING_CACHE_KEY);
   if (!raw) return [];
-  try {
-    return extractTokens(JSON.parse(raw));
-  } catch {
-    return [];
-  }
+  try { return extractTokens(JSON.parse(raw)); } catch { return []; }
 }
 
 async function appendHistory(env: Env, snapshot: Snapshot): Promise<Snapshot[]> {
@@ -113,13 +109,7 @@ async function appendHistory(env: Env, snapshot: Snapshot): Promise<Snapshot[]> 
   return history;
 }
 
-async function loadHistory(env: Env, token: string): Promise<Snapshot[]> {
-  const raw = await env.CIEL_STATE.get(`${HISTORY_PREFIX}${token.toLowerCase()}`);
-  if (!raw) return [];
-  try { return JSON.parse(raw) as Snapshot[]; } catch { return []; }
-}
-
-async function runKvDecision(env: Env, token: string, item: Record<string, unknown>, history: Snapshot[], monUsd: number): Promise<void> {
+async function runKvDecision(env: Env, token: string, item: Record<string, unknown>, history: Snapshot[]): Promise<void> {
   if (history.length < 4) return;
   const current = history[0];
   const baseline = buildBaseline(history);
@@ -215,7 +205,7 @@ export async function runKvIntelligenceCycle(env: Env): Promise<void> {
       holders: num(objectValue(row.item.token_info, ["holder_count", "holderCount", "holders"]))
     };
     const history = await appendHistory(env, snapshot);
-    await runKvDecision(env, row.token, row.item, history, monUsd);
+    await runKvDecision(env, row.token, row.item, history);
     analyzed++;
   }
 
