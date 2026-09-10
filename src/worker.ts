@@ -13,6 +13,7 @@ const SNAPSHOT_INDEX_KEY = "ciel_snapshot_query_index_v1";
 const D1_DEGRADED_KEY = "ciel_d1_degraded_utc_date";
 const D1_ERROR_KEY = "ciel_d1_degraded_error";
 const TELEGRAM_DECISION_ALERT_KEY = "ciel_telegram_last_decision_alert_ms";
+const FEED_HEALTH_KEY = "ciel_market_feed_health";
 
 function utcDateKey(now = Date.now()): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -90,6 +91,16 @@ async function snapshotDiagnostics(env: Env): Promise<{ total: number; markets: 
   }
 }
 
+async function readFeedHealth(env: Env): Promise<Record<string, unknown>> {
+  const raw = await env.CIEL_STATE.get(FEED_HEALTH_KEY);
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 async function statusWithDiagnostics(request: Request, env: Env): Promise<Response> {
   const response = await base.fetch(request, env);
   const url = new URL(request.url);
@@ -139,6 +150,29 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       payload.d1DegradedError = await env.CIEL_STATE.get(D1_ERROR_KEY);
     }
 
+    const feedHealth = await readFeedHealth(env);
+    payload.kvMarketFeed = {
+      ok: feedHealth.ok === true,
+      source: feedHealth.source || null,
+      fetchedAt: Number(feedHealth.fetchedAt || 0),
+      ageSeconds: feedHealth.fetchedAt
+        ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000))
+        : null,
+      count: Number(feedHealth.count || 0),
+      validCount: Number(feedHealth.validCount || 0),
+      topMarketCapUsd: Number(feedHealth.topMarketCapUsd || 0),
+      topSymbol: feedHealth.topSymbol || null,
+      monUsd: Number(feedHealth.monUsd || 0) || null
+    };
+
+    if (payload.d1Degraded) {
+      payload.lastIndexerDiscoveryCount = Number(feedHealth.count || 0);
+      payload.lastIndexerValidAddressCount = Number(feedHealth.validCount || 0);
+      payload.lastIndexerTopMarketCapUsd = Number(feedHealth.topMarketCapUsd || 0);
+      payload.lastIndexerTopMarketCapSymbol = feedHealth.topSymbol || null;
+      payload.lastIndexerSkipReason = "d1-degraded-kv-discovery-active";
+    }
+
     const snapshots = await snapshotDiagnostics(env);
     payload.marketSnapshotTotalCount = snapshots.total;
     payload.marketSnapshotHistory = snapshots.markets;
@@ -157,7 +191,6 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
 
 async function maybeSendDecisionAlert(env: Env): Promise<void> {
   const raw = await env.CIEL_STATE.get("ciel_runtime_state");
-
   if (!raw) return;
 
   let runtime: Record<string, unknown>;
@@ -228,13 +261,18 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   let runtime: Record<string, unknown> = {};
   try { runtime = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
 
-  const discovered = Number(runtime.lastIndexerDiscoveryCount || 0);
-  const valid = Number(runtime.lastIndexerValidAddressCount || 0);
+  const feedHealth = await readFeedHealth(env);
+  const discovered = Number(feedHealth.count || runtime.lastIndexerDiscoveryCount || 0);
+  const valid = Number(feedHealth.validCount || runtime.lastIndexerValidAddressCount || 0);
   const candidates = Number(runtime.lastIndexerCandidateCount || 0);
   const capEligible = Number(runtime.lastIndexerCapEligible || 0);
   const snapshotsThisCycle = Number(runtime.lastIndexerSnapshots || 0);
-  const topCap = Number(runtime.lastIndexerTopMarketCapUsd || 0);
-  const topSymbol = typeof runtime.lastIndexerTopMarketCapSymbol === "string" ? runtime.lastIndexerTopMarketCapSymbol : "";
+  const topCap = Number(feedHealth.topMarketCapUsd || runtime.lastIndexerTopMarketCapUsd || 0);
+  const topSymbol = typeof feedHealth.topSymbol === "string"
+    ? feedHealth.topSymbol
+    : typeof runtime.lastIndexerTopMarketCapSymbol === "string"
+      ? runtime.lastIndexerTopMarketCapSymbol
+      : "";
   const eligibility = runtime.lastModelEligibilityDiagnostics as Record<string, unknown> | undefined;
   const eligibilityLine = eligibility
     ? `\n\nModel eligibility (latest 12 snapshots)\nMarkets: ${Number(eligibility.markets || 0)}\nHistory ≥12: ${Number(eligibility.historyEligible || 0)}\nSpan ≥30m: ${Number(eligibility.spanEligible || 0)}\nAvg volume ≥$5K: ${Number(eligibility.volumeEligible || 0)}\nAvg liquidity ≥$10K: ${Number(eligibility.liquidityEligible || 0)}\nEstablished: ${Number(eligibility.establishedEligible || 0)}`
@@ -251,13 +289,19 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
     const label = row.symbol && row.symbol.trim() ? row.symbol.trim() : row.token.slice(0, 10);
     return `${i + 1}. ${label} — ${row.samples} snapshots / ${row.ageMinutes.toFixed(1)}m`;
   }).join("\n");
+  const feedAge = feedHealth.fetchedAt
+    ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000))
+    : null;
+  const kvLine = feedHealth.ok === true
+    ? `\n\nKV market feed\nSource: ${String(feedHealth.source || "unknown")}\nMarkets: ${discovered}\nValid: ${valid}\nAge: ${feedAge === null ? "n/a" : `${feedAge}s`}\nTop cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}`
+    : "\n\n⚠️ KV market feed has no healthy cache yet.";
   const d1Line = d1Degraded
     ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV market discovery/health remains active."
     : "";
 
   await notifyTelegram(
     env,
-    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}\nTop market cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`
+    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`
   );
 }
 
