@@ -16,12 +16,19 @@
       "head_sampling_rate": 1
     }
   },
-  "triggers": { "crons": ["*/2 * * * *", "*/3 * * * *", "*/10 * * * *", "0 * * * *"] },
+  "triggers": { "crons": ["* * * * *", "*/2 * * * *", "*/3 * * * *", "*/10 * * * *", "*/30 * * * *"] },
   "vars": {
     "TRADING_ENABLED": "true",
     "PAPER_TRADING": "false",
     "HOLDING_CHECK_MINUTES": "2",
-    "GEMINI_MODEL": "gemini-3.8-flash"
+    "GEMINI_MODEL": "gemini-3.8-flash",
+    "LIVE_HARD_STOP_PCT": "-20",
+    "LIVE_RAPID_CRASH_PCT": "-10",
+    "LIVE_TAKE_PROFIT_PCT": "20",
+    "LIVE_TRAILING_ACTIVATION_PCT": "15",
+    "LIVE_TRAILING_DRAWDOWN_PCT": "7",
+    "LIVE_HIGH_ZONE_PROFIT_PCT": "10",
+    "LIVE_EMERGENCY_SLIPPAGE_BPS": "1000"
   },
   "secrets": {
     "required": [
@@ -40,5 +47,5 @@
   "kv_namespaces": [{ "binding": "CIEL_STATE", "id": "8b5c4b6078ce43a8aec4d9343855a70f" }],
   "d1_databases": [{ "binding": "DB", "database_name": "ciel", "database_id": "fb55e85b-af9b-45b3-ba43-6c7f7996dfa8" }],
   "durable_objects": { "bindings": [{ "name": "TRADING_ENGINE", "class_name": "TradingEngine" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TradingEngine"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TradingEngine"] }
 }
