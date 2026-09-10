@@ -229,6 +229,17 @@ export async function flushPendingKvSignals(env: Env): Promise<void> {
   const pendingList = await env.CIEL_STATE.list({ prefix: PENDING_PREFIX, limit: MAX_PENDING_SIGNALS_PER_FLUSH });
   if (!pendingList.keys.length) return;
 
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS live_positions (
+      token_address TEXT PRIMARY KEY,
+      quantity TEXT NOT NULL,
+      entry_price_usd REAL,
+      entry_ts_ms INTEGER,
+      last_price_usd REAL,
+      updated_ts_ms INTEGER NOT NULL
+    )
+  `).run();
+
   const feed = await readFeed(env);
   const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
   const feedByToken = new Map<string, Record<string, unknown>>();
@@ -287,26 +298,15 @@ export async function flushPendingKvSignals(env: Env): Promise<void> {
       continue;
     }
 
-    if (action === "BUY") {
-      const existingPosition = await env.DB
-        .prepare("SELECT quantity FROM positions WHERE token_address=? AND quantity<>'0'")
-        .bind(token)
-        .first<{ quantity: string }>();
-      if (existingPosition) {
-        await env.CIEL_STATE.delete(key.name);
-        discarded++;
-        continue;
-      }
-    } else {
-      const existingPosition = await env.DB
-        .prepare("SELECT quantity FROM positions WHERE token_address=? AND quantity<>'0'")
-        .bind(token)
-        .first<{ quantity: string }>();
-      if (!existingPosition) {
-        await env.CIEL_STATE.delete(key.name);
-        discarded++;
-        continue;
-      }
+    const position = await env.DB
+      .prepare("SELECT quantity FROM live_positions WHERE token_address=? AND quantity<>'0'")
+      .bind(token)
+      .first<{ quantity: string }>();
+
+    if ((action === "BUY" && position) || (action === "SELL" && !position)) {
+      await env.CIEL_STATE.delete(key.name);
+      discarded++;
+      continue;
     }
 
     const recentDuplicate = await env.DB
