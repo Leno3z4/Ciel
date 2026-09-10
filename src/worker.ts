@@ -1,6 +1,5 @@
 import base, { type Env, TradingEngine } from "./index";
 import { primeMarketDiscovery } from "./market_discovery";
-import { triggerEstablishedModelAnalysis } from "./model_trigger";
 import { notifyTelegram } from "./telegram";
 import { runLiveSignalCycle } from "./live_execution";
 import { runOptimizedHoldingCheck } from "./holding_monitor";
@@ -16,8 +15,6 @@ const D1_DEGRADED_KEY = "ciel_d1_degraded_utc_date";
 const D1_ERROR_KEY = "ciel_d1_degraded_error";
 const TELEGRAM_DECISION_ALERT_KEY = "ciel_telegram_last_decision_alert_ms";
 const FEED_HEALTH_KEY = "ciel_market_feed_health";
-const MODEL_TRIGGER_KEY = "ciel_established_model_last_run_ms";
-const MODEL_TRIGGER_INTERVAL_MS = 30 * 60 * 1000;
 
 function utcDateKey(now = Date.now()): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -178,15 +175,6 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${recoveryLine}${guardLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`);
 }
 
-async function maybeRunEstablishedModel(env: Env): Promise<void> {
-  if (await isD1Degraded(env)) return;
-  const last = Number(await env.CIEL_STATE.get(MODEL_TRIGGER_KEY) || "0");
-  if (last > 0 && Date.now() - last < MODEL_TRIGGER_INTERVAL_MS) return;
-  await env.CIEL_STATE.put(MODEL_TRIGGER_KEY, String(Date.now()), { expirationTtl: 86400 });
-  try { await triggerEstablishedModelAnalysis(env); }
-  catch (error) { await markD1Degraded(env, error); console.error(`Established model trigger failed: ${String(error).slice(0, 1000)}`); }
-}
-
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
     return statusWithDiagnostics(request, env);
@@ -232,10 +220,6 @@ const worker = {
         if (!(await isD1Degraded(env))) await ensureSnapshotQueryIndex(env);
         try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery prime failed: ${String(error).slice(0, 500)}`); }
         if (!(await isD1Degraded(env))) {
-          try { await base.scheduled(controller, env, ctx); }
-          catch (error) { await markD1Degraded(env, error); }
-        }
-        if (!(await isD1Degraded(env))) {
           try { await flushEmergencyExitQueue(env); } catch (error) { console.error(`Emergency exit reconciliation failed: ${String(error).slice(0, 800)}`); }
         }
         try { await maybeSendHeartbeat(env); } catch (error) { console.error(`Heartbeat failed: ${String(error).slice(0, 500)}`); }
@@ -245,7 +229,6 @@ const worker = {
 
     if (controller.cron === "*/30 * * * *") {
       ctx.waitUntil((async () => {
-        await maybeRunEstablishedModel(env);
         if (!(await isD1Degraded(env))) {
           try { await flushEmergencyExitQueue(env); } catch (error) { console.error(`Emergency exit reconciliation failed: ${String(error).slice(0, 800)}`); }
         }
