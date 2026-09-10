@@ -18,6 +18,7 @@ const GEMINI_KEY_COOLDOWN_MS = 30 * 60 * 1000;
 const RUNTIME_WRITE_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_PENDING_AGE_MS = 30 * 60 * 1000;
 const MAX_PENDING_SIGNALS_PER_FLUSH = 20;
+const TRADING_GEMINI_KEY_COUNT = 6;
 
 interface HotMarketState {
   symbol: string;
@@ -36,14 +37,7 @@ interface HotState {
 }
 
 function emptyHotState(): HotState {
-  return {
-    version: 1,
-    updatedTsMs: 0,
-    markets: {},
-    geminiCursor: 0,
-    geminiKeyCooldowns: {},
-    lastGeminiDecisionAt: 0
-  };
+  return { version: 1, updatedTsMs: 0, markets: {}, geminiCursor: 0, geminiKeyCooldowns: {}, lastGeminiDecisionAt: 0 };
 }
 
 function num(value: unknown): number {
@@ -171,8 +165,7 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
 
   const keys = [
     env.GEMINI_API_KEY_1, env.GEMINI_API_KEY_2, env.GEMINI_API_KEY_3,
-    env.GEMINI_API_KEY_4, env.GEMINI_API_KEY_5, env.GEMINI_API_KEY_6,
-    env.GEMINI_API_KEY_7
+    env.GEMINI_API_KEY_4, env.GEMINI_API_KEY_5, env.GEMINI_API_KEY_6
   ].map(value => (value || "").trim()).filter(Boolean);
   if (!keys.length) return false;
 
@@ -227,7 +220,8 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastModelDecisionAction: decision.action === "HOLD" || decision.action === "IGNORE" ? "WAIT" : decision.action,
     lastModelDecisionConfidence: decision.confidence,
     lastModelError: undefined,
-    kvModelActive: true
+    kvModelActive: true,
+    lastModelDecisionKeyPool: TRADING_GEMINI_KEY_COUNT
   }, true);
 
   if (decision.action !== "BUY" && decision.action !== "SELL") return true;
@@ -292,7 +286,8 @@ export async function runKvIntelligenceCycle(env: Env): Promise<void> {
     lastKvIntelligenceRun: now,
     lastKvIntelligenceAnalyzed: analyzed,
     lastKvIntelligenceCandidates: candidates.length,
-    kvModelActive: analyzed > 0
+    kvModelActive: analyzed > 0,
+    lastModelDecisionKeyPool: TRADING_GEMINI_KEY_COUNT
   });
 }
 
