@@ -14,8 +14,6 @@ const MIN_HISTORY_SAMPLES = 8;
 const MIN_MARKET_CAP_USD = 50_000;
 const MIN_LIQUIDITY_USD = 5_000;
 const KV_DECISION_COOLDOWN_MS = 30 * 60 * 1000;
-const ANALYST_POOL_COOLDOWN_MS = 10 * 60 * 1000;
-const DECISION_POOL_COOLDOWN_MS = 3 * 60 * 1000;
 const GEMINI_KEY_COOLDOWN_MS = 5 * 60 * 1000;
 const RUNTIME_WRITE_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_PENDING_AGE_MS = 30 * 60 * 1000;
@@ -202,12 +200,6 @@ function setCursorForPool(state: GeminiPoolState, pool: GeminiPool, cursor: numb
   else state.fallbackCursor = cursor;
 }
 
-function cooldownForPool(pool: GeminiPool): number {
-  if (pool === "ANALYST") return ANALYST_POOL_COOLDOWN_MS;
-  if (pool === "DECISION") return DECISION_POOL_COOLDOWN_MS;
-  return 0;
-}
-
 function isFallbackWorthy(error: unknown): boolean {
   return /429|RESOURCE_EXHAUSTED|quota|rate.?limit|401|403|api.?key|permission|timeout|temporar/i.test(String(error));
 }
@@ -225,12 +217,6 @@ async function callGeminiPool(
   if (!slots.length) throw new Error(`No Gemini keys configured for ${GEMINI_POOL_LABELS[pool]}`);
 
   const now = Date.now();
-  const lastPoolCall = num(poolState.lastPoolCallAt[pool] || 0);
-  const poolCooldown = cooldownForPool(pool);
-  if (poolCooldown > 0 && lastPoolCall > 0 && now - lastPoolCall < poolCooldown) {
-    throw new Error(`${pool.toLowerCase()}_pool_cooldown`);
-  }
-
   let cursor = cursorForPool(poolState, pool);
   let lastError: unknown = new Error(`No usable Gemini key in ${GEMINI_POOL_LABELS[pool]}`);
   let attempts = 0;
@@ -277,16 +263,18 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
   const poolState = await readPoolState(env);
 
   let analyst: { decision: GeminiDecision; keyIndex: number; fallbacks: number };
+  let analystSourcePool: GeminiPool = "ANALYST";
   try {
     analyst = await callGeminiPool(env, poolState, "ANALYST", history[0], baseline, score, pattern);
   } catch (error) {
-    if (/analyst_pool_cooldown/.test(String(error))) return false;
     try {
       analyst = await callGeminiPool(env, poolState, "FALLBACK", history[0], baseline, score, pattern);
+      analystSourcePool = "FALLBACK";
     } catch (fallbackError) {
       await writeRuntimeThrottled(env, {
         lastGeminiError: `Analyst stage failed: ${String(fallbackError).slice(0, 700)}`,
-        lastGeminiPoolFailure: "ANALYST/FALLBACK"
+        lastGeminiPoolFailure: "ANALYST/FALLBACK",
+        lastGeminiEmergencyFallbackUsed: false
       }, true);
       return false;
     }
@@ -301,22 +289,26 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastGeminiAnalystAction: analystAction,
     lastGeminiAnalystConfidence: analystDecision.confidence,
     lastGeminiAnalystFallbacks: analyst.fallbacks,
-    lastGeminiPool: "ANALYST"
+    lastGeminiAnalystPool: analystSourcePool,
+    lastGeminiPool: analystSourcePool,
+    lastGeminiEmergencyFallbackUsed: analystSourcePool === "FALLBACK"
   }, true);
 
   if (!analystPass) return true;
 
   let finalResult: { decision: GeminiDecision; keyIndex: number; fallbacks: number };
+  let decisionSourcePool: GeminiPool = "DECISION";
   try {
     finalResult = await callGeminiPool(env, poolState, "DECISION", history[0], baseline, score, pattern);
   } catch (error) {
-    if (/decision_pool_cooldown/.test(String(error))) return true;
     try {
       finalResult = await callGeminiPool(env, poolState, "FALLBACK", history[0], baseline, score, pattern);
+      decisionSourcePool = "FALLBACK";
     } catch (fallbackError) {
       await writeRuntimeThrottled(env, {
         lastGeminiError: `Decision stage failed: ${String(fallbackError).slice(0, 700)}`,
-        lastGeminiPoolFailure: "DECISION/FALLBACK"
+        lastGeminiPoolFailure: "DECISION/FALLBACK",
+        lastGeminiEmergencyFallbackUsed: analystSourcePool === "FALLBACK"
       }, true);
       return false;
     }
@@ -333,11 +325,18 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastDecisionAt: decisionAt
   };
 
+  const totalFallbackAttempts = analyst.fallbacks + finalResult.fallbacks;
+  const emergencyFallbackUsed = analystSourcePool === "FALLBACK" || decisionSourcePool === "FALLBACK";
   await writeHotState(env, state);
   await writeRuntimeThrottled(env, {
     lastGeminiSuccess: decisionAt,
     lastGeminiKeyUsed: finalResult.keyIndex,
-    lastGeminiFallbacks: finalResult.fallbacks,
+    lastGeminiFallbacks: totalFallbackAttempts,
+    lastGeminiAnalystFallbacks: analyst.fallbacks,
+    lastGeminiDecisionFallbacks: finalResult.fallbacks,
+    lastGeminiEmergencyFallbackUsed: emergencyFallbackUsed,
+    lastGeminiAnalystPool: analystSourcePool,
+    lastGeminiDecisionSourcePool: decisionSourcePool,
     lastModelAnalyzed: decisionAt,
     lastModelDecisionCandidate: token,
     lastModelDecisionAction: decision.action === "HOLD" || decision.action === "IGNORE" ? "WAIT" : decision.action,
@@ -345,7 +344,7 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastModelError: undefined,
     kvModelActive: true,
     lastModelDecisionKeyPool: TRADING_GEMINI_KEY_COUNT,
-    lastGeminiDecisionPool: "DECISION",
+    lastGeminiDecisionPool: decisionSourcePool,
     lastGeminiFallbackKeyReserved: 7
   }, true);
 
@@ -366,7 +365,12 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     status: "PENDING_D1"
   };
   await env.CIEL_STATE.put(`${PENDING_PREFIX}${key}`, JSON.stringify(pending), { expirationTtl: 86400 });
-  await notifyTelegram(env, `${decision.action === "BUY" ? "🟢" : "🔴"} CIEL KV ${decision.action} SIGNAL\n${tokenSymbol(item)} (${token.slice(0, 10)}…)\nConfidence: ${(decision.confidence * 100).toFixed(0)}%\nRegime: ${decision.regime}\nStatus: queued for D1 execution ledger\nReason: ${decision.rationale}`);
+  await notifyTelegram(env, `${decision.action === "BUY" ? "🟢" : "🔴"} CIEL KV ${decision.action} SIGNAL\
+${tokenSymbol(item)} (${token.slice(0, 10)}…)\
+Confidence: ${(decision.confidence * 100).toFixed(0)}%\
+Regime: ${decision.regime}\
+Status: queued for D1 execution ledger\
+Reason: ${decision.rationale}`);
   return true;
 }
 
@@ -487,5 +491,8 @@ export async function flushPendingKvSignals(env: Env): Promise<void> {
   }
 
   await writeRuntimeThrottled(env, { lastKvPendingFlush: Date.now(), lastKvPendingQueued: queued, lastKvPendingDiscarded: discarded }, true);
-  if (queued > 0 || discarded > 0) await notifyTelegram(env, `🔄 CIEL KV SIGNAL RECOVERY\nQueued for live ledger: ${queued}\nDiscarded stale/invalid: ${discarded}\nD1 execution path is active again.`);
+  if (queued > 0 || discarded > 0) await notifyTelegram(env, `🔄 CIEL KV SIGNAL RECOVERY\
+Queued for live ledger: ${queued}\
+Discarded stale/invalid: ${discarded}\
+D1 execution path is active again.`);
 }
