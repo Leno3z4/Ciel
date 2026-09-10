@@ -9,6 +9,27 @@ export { TradingEngine };
 
 const HEARTBEAT_KEY = "ciel_telegram_heartbeat_ms";
 const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
+const SNAPSHOT_INDEX_KEY = "ciel_snapshot_query_index_v1";
+
+async function ensureSnapshotQueryIndex(env: Env): Promise<void> {
+  if (await env.CIEL_STATE.get(SNAPSHOT_INDEX_KEY) === "1") return;
+
+  try {
+    await env.DB.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts_token ON market_snapshots(ts_ms, token_address, market_cap_usd)"
+    ).run();
+
+    await env.CIEL_STATE.put(
+      SNAPSHOT_INDEX_KEY,
+      "1",
+      { expirationTtl: 31536000 }
+    );
+  } catch (error) {
+    console.error(
+      `Snapshot query index setup failed: ${String(error).slice(0, 500)}`
+    );
+  }
+}
 
 async function snapshotDiagnostics(env: Env): Promise<{ total: number; markets: Array<{ token: string; symbol: string | null; samples: number; ageMinutes: number }> }> {
   try {
@@ -104,8 +125,10 @@ const worker = {
       ctx.waitUntil(runOptimizedHoldingCheck(env));
       return;
     }
+
     if (controller.cron === "*/3 * * * *") {
       ctx.waitUntil((async () => {
+        await ensureSnapshotQueryIndex(env);
         await base.scheduled(controller, env, ctx);
 
         try {
@@ -127,13 +150,27 @@ const worker = {
 
       return;
     }
+
     if (controller.cron === "*/10 * * * *") {
       ctx.waitUntil((async () => {
+        await ensureSnapshotQueryIndex(env);
         try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery prime failed: ${String(error).slice(0, 500)}`); }
         try { await base.scheduled(controller, env, ctx); } finally { await maybeSendHeartbeat(env); }
       })());
       return;
     }
+
+    /*
+     * The old hourly base.scheduled() path only ran the legacy model
+     * maintenance query. The dedicated model_trigger pipeline already runs
+     * every 3 minutes, so running the legacy hourly query was duplicate D1
+     * work and could push the free-tier row-read budget unnecessarily.
+     */
+    if (controller.cron === "0 * * * *") {
+      await ensureSnapshotQueryIndex(env);
+      return;
+    }
+
     await base.scheduled(controller, env, ctx);
   }
 };
