@@ -1,24 +1,27 @@
-import { buildBaseline, buildPatternProfile, deviationScore, askGemini, type Snapshot } from "./model";
+import { buildBaseline, buildPatternProfile, deviationScore, askGemini, type Snapshot, type GeminiDecision } from "./model";
 import type { Env } from "./index";
 import { notifyTelegram } from "./telegram";
 import { getMarketState } from "./market_discovery";
+import { getGeminiPool, nextPoolSlot, type GeminiPool, GEMINI_POOL_LABELS } from "./gemini_router";
 
 const HOT_STATE_KEY = "ciel_hot_intelligence_state";
 const PENDING_PREFIX = "ciel_kv_pending_signal:";
 const RUNTIME_KEY = "ciel_runtime_state";
-const GEMINI_GLOBAL_CALL_KEY = "ciel_gemini_last_global_call_ms";
+const GEMINI_POOL_STATE_KEY = "ciel_gemini_pool_state";
 const MAX_HISTORY = 480;
 const MAX_MARKETS = 5;
 const MIN_HISTORY_SAMPLES = 8;
 const MIN_MARKET_CAP_USD = 50_000;
 const MIN_LIQUIDITY_USD = 5_000;
 const KV_DECISION_COOLDOWN_MS = 30 * 60 * 1000;
-const GEMINI_GLOBAL_MIN_INTERVAL_MS = 15 * 60 * 1000;
-const GEMINI_KEY_COOLDOWN_MS = 30 * 60 * 1000;
+const ANALYST_POOL_COOLDOWN_MS = 10 * 60 * 1000;
+const DECISION_POOL_COOLDOWN_MS = 3 * 60 * 1000;
+const GEMINI_KEY_COOLDOWN_MS = 5 * 60 * 1000;
 const RUNTIME_WRITE_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_PENDING_AGE_MS = 30 * 60 * 1000;
 const MAX_PENDING_SIGNALS_PER_FLUSH = 20;
-const TRADING_GEMINI_KEY_COUNT = 6;
+const ANALYST_MIN_CONFIDENCE = 0.60;
+const TRADING_GEMINI_KEY_COUNT = 7;
 
 interface HotMarketState {
   symbol: string;
@@ -36,8 +39,20 @@ interface HotState {
   lastGeminiDecisionAt: number;
 }
 
+interface GeminiPoolState {
+  analystCursor: number;
+  decisionCursor: number;
+  fallbackCursor: number;
+  lastPoolCallAt: Partial<Record<GeminiPool, number>>;
+  lastUsedKeyByPool: Partial<Record<GeminiPool, number>>;
+}
+
 function emptyHotState(): HotState {
   return { version: 1, updatedTsMs: 0, markets: {}, geminiCursor: 0, geminiKeyCooldowns: {}, lastGeminiDecisionAt: 0 };
+}
+
+function emptyGeminiPoolState(): GeminiPoolState {
+  return { analystCursor: 0, decisionCursor: 0, fallbackCursor: 0, lastPoolCallAt: {}, lastUsedKeyByPool: {} };
 }
 
 function num(value: unknown): number {
@@ -67,6 +82,27 @@ async function readHotState(env: Env): Promise<HotState> {
 async function writeHotState(env: Env, state: HotState): Promise<void> {
   state.updatedTsMs = Date.now();
   await env.CIEL_STATE.put(HOT_STATE_KEY, JSON.stringify(state), { expirationTtl: 172800 });
+}
+
+async function readPoolState(env: Env): Promise<GeminiPoolState> {
+  const raw = await env.CIEL_STATE.get(GEMINI_POOL_STATE_KEY);
+  if (!raw) return emptyGeminiPoolState();
+  try {
+    const parsed = JSON.parse(raw) as Partial<GeminiPoolState>;
+    return {
+      analystCursor: Math.max(0, Math.floor(num(parsed.analystCursor))),
+      decisionCursor: Math.max(0, Math.floor(num(parsed.decisionCursor))),
+      fallbackCursor: Math.max(0, Math.floor(num(parsed.fallbackCursor))),
+      lastPoolCallAt: parsed.lastPoolCallAt || {},
+      lastUsedKeyByPool: parsed.lastUsedKeyByPool || {}
+    };
+  } catch {
+    return emptyGeminiPoolState();
+  }
+}
+
+async function writePoolState(env: Env, state: GeminiPoolState): Promise<void> {
+  await env.CIEL_STATE.put(GEMINI_POOL_STATE_KEY, JSON.stringify(state), { expirationTtl: 172800 });
 }
 
 async function readRuntime(env: Env): Promise<Record<string, unknown>> {
@@ -154,54 +190,145 @@ function meaningfulTrigger(history: Snapshot[]): boolean {
   return (enteringLow && improving) || strongTrend;
 }
 
+function cursorForPool(state: GeminiPoolState, pool: GeminiPool): number {
+  if (pool === "ANALYST") return state.analystCursor;
+  if (pool === "DECISION") return state.decisionCursor;
+  return state.fallbackCursor;
+}
+
+function setCursorForPool(state: GeminiPoolState, pool: GeminiPool, cursor: number): void {
+  if (pool === "ANALYST") state.analystCursor = cursor;
+  else if (pool === "DECISION") state.decisionCursor = cursor;
+  else state.fallbackCursor = cursor;
+}
+
+function cooldownForPool(pool: GeminiPool): number {
+  if (pool === "ANALYST") return ANALYST_POOL_COOLDOWN_MS;
+  if (pool === "DECISION") return DECISION_POOL_COOLDOWN_MS;
+  return 0;
+}
+
+function isFallbackWorthy(error: unknown): boolean {
+  return /429|RESOURCE_EXHAUSTED|quota|rate.?limit|401|403|api.?key|permission|timeout|temporar/i.test(String(error));
+}
+
+async function callGeminiPool(
+  env: Env,
+  poolState: GeminiPoolState,
+  pool: GeminiPool,
+  snapshot: Snapshot,
+  baseline: ReturnType<typeof buildBaseline>,
+  score: number,
+  pattern: ReturnType<typeof buildPatternProfile>
+): Promise<{ decision: GeminiDecision; keyIndex: number; fallbacks: number }> {
+  const slots = getGeminiPool(env, pool);
+  if (!slots.length) throw new Error(`No Gemini keys configured for ${GEMINI_POOL_LABELS[pool]}`);
+
+  const now = Date.now();
+  const lastPoolCall = num(poolState.lastPoolCallAt[pool] || 0);
+  const poolCooldown = cooldownForPool(pool);
+  if (poolCooldown > 0 && lastPoolCall > 0 && now - lastPoolCall < poolCooldown) {
+    throw new Error(`${pool.toLowerCase()}_pool_cooldown`);
+  }
+
+  let cursor = cursorForPool(poolState, pool);
+  let lastError: unknown = new Error(`No usable Gemini key in ${GEMINI_POOL_LABELS[pool]}`);
+  let attempts = 0;
+  for (let offset = 0; offset < slots.length; offset++) {
+    const candidate = nextPoolSlot(pool, slots, cursor);
+    if (!candidate) break;
+    cursor = candidate.nextCursor;
+    const slot = candidate.slot;
+    const cooldownUntil = num((poolState as unknown as Record<string, unknown>)[`keyCooldown_${slot.index}`] || 0);
+    const stateKey = String(slot.index);
+    const persistedCooldowns = await env.CIEL_STATE.get(`${"ciel_gemini_key_cooldown:"}${stateKey}`);
+    const effectiveCooldown = Math.max(cooldownUntil, num(persistedCooldowns));
+    if (effectiveCooldown > now) continue;
+
+    attempts++;
+    try {
+      const role = pool === "DECISION" ? "regime" : "market";
+      const decision = await askGemini(slot.key, env.GEMINI_MODEL, role, snapshot, baseline, score, pattern);
+      if (!decision) throw new Error("Gemini returned no decision");
+      const nextCursor = slots.length ? (slots.findIndex(entry => entry.index === slot.index) + 1) % slots.length : 0;
+      setCursorForPool(poolState, pool, nextCursor);
+      poolState.lastPoolCallAt[pool] = now;
+      poolState.lastUsedKeyByPool[pool] = slot.index;
+      await env.CIEL_STATE.delete(`${"ciel_gemini_key_cooldown:"}${stateKey}`);
+      await writePoolState(env, poolState);
+      return { decision, keyIndex: slot.index, fallbacks: Math.max(0, attempts - 1) };
+    } catch (error) {
+      lastError = error;
+      if (!isFallbackWorthy(error)) throw error;
+      await env.CIEL_STATE.put(`${"ciel_gemini_key_cooldown:"}${stateKey}`, String(now + GEMINI_KEY_COOLDOWN_MS), { expirationTtl: 3600 });
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 async function runKvDecision(env: Env, state: HotState, token: string, item: Record<string, unknown>, history: Snapshot[]): Promise<boolean> {
   if (!meaningfulTrigger(history)) return false;
   const key = token.toLowerCase();
   const market = state.markets[key];
-  if (market && market.decisionCooldownUntil > Date.now()) return false;
-  const sharedLast = num(await env.CIEL_STATE.get(GEMINI_GLOBAL_CALL_KEY) || "0");
-  if (sharedLast > 0 && Date.now() - sharedLast < GEMINI_GLOBAL_MIN_INTERVAL_MS) return false;
-  if (state.lastGeminiDecisionAt > 0 && Date.now() - state.lastGeminiDecisionAt < GEMINI_GLOBAL_MIN_INTERVAL_MS) return false;
-
-  const keys = [
-    env.GEMINI_API_KEY_1, env.GEMINI_API_KEY_2, env.GEMINI_API_KEY_3,
-    env.GEMINI_API_KEY_4, env.GEMINI_API_KEY_5, env.GEMINI_API_KEY_6
-  ].map(value => (value || "").trim()).filter(Boolean);
-  if (!keys.length) return false;
+  const now = Date.now();
+  if (market && market.decisionCooldownUntil > now) return false;
 
   const baseline = buildBaseline(history);
   const pattern = buildPatternProfile(history);
   const score = deviationScore(history[0], baseline);
-  const cursor = state.geminiCursor % keys.length;
-  let decision = null;
-  let lastError: unknown = null;
-  let usedSlot = -1;
+  const poolState = await readPoolState(env);
 
-  for (let offset = 0; offset < keys.length; offset++) {
-    const index = (cursor + offset) % keys.length;
-    const cooldownUntil = num(state.geminiKeyCooldowns[String(index + 1)] || 0);
-    if (cooldownUntil > Date.now()) continue;
+  let analyst: { decision: GeminiDecision; keyIndex: number; fallbacks: number };
+  try {
+    analyst = await callGeminiPool(env, poolState, "ANALYST", history[0], baseline, score, pattern);
+  } catch (error) {
+    if (/analyst_pool_cooldown/.test(String(error))) return false;
     try {
-      decision = await askGemini(keys[index], env.GEMINI_MODEL, "market", history[0], baseline, score, pattern);
-      usedSlot = index + 1;
-      break;
-    } catch (error) {
-      lastError = error;
-      if (/429|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(String(error))) {
-        state.geminiKeyCooldowns[String(index + 1)] = Date.now() + GEMINI_KEY_COOLDOWN_MS;
-        continue;
-      }
-      break;
+      analyst = await callGeminiPool(env, poolState, "FALLBACK", history[0], baseline, score, pattern);
+    } catch (fallbackError) {
+      await writeRuntimeThrottled(env, {
+        lastGeminiError: `Analyst stage failed: ${String(fallbackError).slice(0, 700)}`,
+        lastGeminiPoolFailure: "ANALYST/FALLBACK"
+      }, true);
+      return false;
     }
   }
 
-  if (!decision || usedSlot < 0) {
-    if (lastError) await writeRuntimeThrottled(env, { lastGeminiError: `KV decision failed: ${String(lastError).slice(0, 700)}` }, true);
-    return false;
+  const analystDecision = analyst.decision;
+  const analystAction = analystDecision.action === "HOLD" || analystDecision.action === "IGNORE" ? "WAIT" : analystDecision.action;
+  const analystPass = (analystAction === "BUY" || analystAction === "SELL") && analystDecision.confidence >= ANALYST_MIN_CONFIDENCE;
+
+  await writeRuntimeThrottled(env, {
+    lastGeminiAnalystKey: analyst.keyIndex,
+    lastGeminiAnalystAction: analystAction,
+    lastGeminiAnalystConfidence: analystDecision.confidence,
+    lastGeminiAnalystFallbacks: analyst.fallbacks,
+    lastGeminiPool: "ANALYST"
+  }, true);
+
+  if (!analystPass) {
+    return true;
   }
 
+  let finalResult: { decision: GeminiDecision; keyIndex: number; fallbacks: number };
+  try {
+    finalResult = await callGeminiPool(env, poolState, "DECISION", history[0], baseline, score, pattern);
+  } catch (error) {
+    try {
+      finalResult = await callGeminiPool(env, poolState, "FALLBACK", history[0], baseline, score, pattern);
+    } catch (fallbackError) {
+      await writeRuntimeThrottled(env, {
+        lastGeminiError: `Decision stage failed: ${String(fallbackError).slice(0, 700)}`,
+        lastGeminiPoolFailure: "DECISION/FALLBACK"
+      }, true);
+      return false;
+    }
+  }
+
+  const decision = finalResult.decision;
   const decisionAt = Date.now();
-  state.geminiCursor = usedSlot % keys.length;
+  state.geminiCursor = Math.max(0, finalResult.keyIndex - 1);
   state.lastGeminiDecisionAt = decisionAt;
   state.markets[key] = {
     symbol: tokenSymbol(item),
@@ -210,18 +337,20 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastDecisionAt: decisionAt
   };
 
-  await env.CIEL_STATE.put(GEMINI_GLOBAL_CALL_KEY, String(decisionAt), { expirationTtl: 172800 });
+  await writeHotState(env, state);
   await writeRuntimeThrottled(env, {
     lastGeminiSuccess: decisionAt,
-    lastGeminiKeyUsed: usedSlot,
-    lastGeminiFallbacks: Math.max(0, usedSlot - cursor - 1),
+    lastGeminiKeyUsed: finalResult.keyIndex,
+    lastGeminiFallbacks: finalResult.fallbacks,
     lastModelAnalyzed: decisionAt,
     lastModelDecisionCandidate: token,
     lastModelDecisionAction: decision.action === "HOLD" || decision.action === "IGNORE" ? "WAIT" : decision.action,
     lastModelDecisionConfidence: decision.confidence,
     lastModelError: undefined,
     kvModelActive: true,
-    lastModelDecisionKeyPool: TRADING_GEMINI_KEY_COUNT
+    lastModelDecisionKeyPool: TRADING_GEMINI_KEY_COUNT,
+    lastGeminiDecisionPool: "DECISION",
+    lastGeminiFallbackKeyReserved: 7
   }, true);
 
   if (decision.action !== "BUY" && decision.action !== "SELL") return true;
