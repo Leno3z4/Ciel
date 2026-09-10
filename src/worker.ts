@@ -6,7 +6,6 @@ import { runLiveSignalCycle } from "./live_execution";
 import { runOptimizedHoldingCheck } from "./holding_monitor";
 import { runKvIntelligenceCycle, flushPendingKvSignals } from "./kv_intelligence";
 import { runLivePositionGuard, flushEmergencyExitQueue } from "./live_position_guard";
-import { syncLivePositionMirror } from "./live_position_sync";
 
 export { TradingEngine };
 
@@ -238,7 +237,6 @@ const worker = {
         }
         if (!(await isD1Degraded(env))) {
           try { await flushEmergencyExitQueue(env); } catch (error) { console.error(`Emergency exit reconciliation failed: ${String(error).slice(0, 800)}`); }
-          try { await syncLivePositionMirror(env); } catch (error) { console.error(`Live position mirror sync failed: ${String(error).slice(0, 800)}`); }
         }
         try { await maybeSendHeartbeat(env); } catch (error) { console.error(`Heartbeat failed: ${String(error).slice(0, 500)}`); }
       })());
