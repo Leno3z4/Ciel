@@ -4,6 +4,7 @@ import { triggerEstablishedModelAnalysis } from "./model_trigger";
 import { notifyTelegram } from "./telegram";
 import { runLiveSignalCycle } from "./live_execution";
 import { runOptimizedHoldingCheck } from "./holding_monitor";
+import { runKvIntelligenceCycle } from "./kv_intelligence";
 
 export { TradingEngine };
 
@@ -133,7 +134,11 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastModelDecisionConfidence",
       "lastHoldingPaperPositions",
       "lastHoldingLivePositions",
-      "lastHoldingCheckError"
+      "lastHoldingCheckError",
+      "lastKvIntelligenceRun",
+      "lastKvIntelligenceAnalyzed",
+      "lastKvIntelligenceCandidates",
+      "kvModelActive"
     ];
 
     for (const key of diagnostics) {
@@ -162,7 +167,8 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       validCount: Number(feedHealth.validCount || 0),
       topMarketCapUsd: Number(feedHealth.topMarketCapUsd || 0),
       topSymbol: feedHealth.topSymbol || null,
-      monUsd: Number(feedHealth.monUsd || 0) || null
+      monUsd: Number(feedHealth.monUsd || 0) || null,
+      diagnostics: feedHealth.diagnostics || null
     };
 
     if (payload.d1Degraded) {
@@ -275,10 +281,13 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
       : "";
   const eligibility = runtime.lastModelEligibilityDiagnostics as Record<string, unknown> | undefined;
   const eligibilityLine = eligibility
-    ? `\n\nModel eligibility (latest 12 snapshots)\nMarkets: ${Number(eligibility.markets || 0)}\nHistory ≥12: ${Number(eligibility.historyEligible || 0)}\nSpan ≥30m: ${Number(eligibility.spanEligible || 0)}\nAvg volume ≥$5K: ${Number(eligibility.volumeEligible || 0)}\nAvg liquidity ≥$10K: ${Number(eligibility.liquidityEligible || 0)}\nEstablished: ${Number(eligibility.establishedEligible || 0)}`
+    ? `\n\nModel eligibility\nMarkets: ${Number(eligibility.markets || 0)}\nHistory ≥8: ${Number(eligibility.historyEligible || 0)}\nSpan ≥15m: ${Number(eligibility.spanEligible || 0)}\nAvg volume ≥$1K: ${Number(eligibility.volumeEligible || 0)}\nAvg liquidity ≥$5K: ${Number(eligibility.liquidityEligible || 0)}\nEstablished: ${Number(eligibility.establishedEligible || 0)}`
     : "";
   const decisionLine = runtime.lastGeminiKeyUsed !== undefined || runtime.lastModelDecisionCandidate
     ? `\n\nDecision engine\nBudget/cycle: ${Number(runtime.lastModelDecisionBudgetPerCycle || 0)}\nCandidate: ${typeof runtime.lastModelDecisionCandidate === "string" ? runtime.lastModelDecisionCandidate.slice(0, 10) : "n/a"}\nGemini key slot: ${Number(runtime.lastGeminiKeyUsed || 0) || "n/a"}\nFallbacks used: ${Number(runtime.lastGeminiFallbacks || 0)}`
+    : "";
+  const kvModelLine = runtime.kvModelActive
+    ? `\n\nKV intelligence\nCandidates: ${Number(runtime.lastKvIntelligenceCandidates || 0)}\nAnalyzed: ${Number(runtime.lastKvIntelligenceAnalyzed || 0)}\nActive: yes`
     : "";
   const capText = topCap > 0 ? `$${topCap >= 1_000_000 ? (topCap / 1_000_000).toFixed(2) + "M" : (topCap / 1_000).toFixed(1) + "K"}` : "n/a";
   const d1Degraded = await isD1Degraded(env);
@@ -296,12 +305,12 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
     ? `\n\nKV market feed\nSource: ${String(feedHealth.source || "unknown")}\nMarkets: ${discovered}\nValid: ${valid}\nAge: ${feedAge === null ? "n/a" : `${feedAge}s`}\nTop cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}`
     : "\n\n⚠️ KV market feed has no healthy cache yet.";
   const d1Line = d1Degraded
-    ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV market discovery/health remains active."
+    ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV discovery + intelligence remain active."
     : "";
 
   await notifyTelegram(
     env,
-    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$90K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring established NadFun markets; market cap is the primary signal.`
+    `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`
   );
 }
 
@@ -353,9 +362,10 @@ const worker = {
         if (await isD1Degraded(env)) {
           try {
             await primeMarketDiscovery(env);
+            await runKvIntelligenceCycle(env);
           } catch (error) {
             console.error(
-              `KV market discovery refresh failed: ${String(error).slice(0, 500)}`
+              `KV market intelligence cycle failed: ${String(error).slice(0, 1000)}`
             );
           }
 
@@ -371,9 +381,10 @@ const worker = {
         ) {
           try {
             await primeMarketDiscovery(env);
+            await runKvIntelligenceCycle(env);
           } catch (error) {
             console.error(
-              `KV market discovery refresh failed: ${String(error).slice(0, 500)}`
+              `KV market intelligence cycle failed: ${String(error).slice(0, 1000)}`
             );
           }
 
@@ -417,9 +428,10 @@ const worker = {
         if (await isD1Degraded(env)) {
           try {
             await primeMarketDiscovery(env);
+            await runKvIntelligenceCycle(env);
           } catch (error) {
             console.error(
-              `KV market discovery refresh failed: ${String(error).slice(0, 500)}`
+              `KV market intelligence cycle failed: ${String(error).slice(0, 1000)}`
             );
           }
 
@@ -435,7 +447,17 @@ const worker = {
           );
         }
 
-        if (await isD1Degraded(env)) return;
+        if (await isD1Degraded(env)) {
+          try {
+            await primeMarketDiscovery(env);
+            await runKvIntelligenceCycle(env);
+          } catch (error) {
+            console.error(
+              `KV market intelligence cycle failed: ${String(error).slice(0, 1000)}`
+            );
+          }
+          return;
+        }
 
         try {
           await maybeSendDecisionAlert(env);
