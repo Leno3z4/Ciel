@@ -81,7 +81,11 @@ function objectValue(source: unknown, keys: string[]): unknown {
 }
 
 function nestedNumber(item: TokenRecord, tokenKeys: string[], marketKeys: string[]): number {
-  return num(objectValue(item.market_info, marketKeys)) || num(objectValue(item.token_info, tokenKeys));
+  return (
+    num(objectValue(item.market_info, marketKeys)) ||
+    num(objectValue(item.token_info, tokenKeys)) ||
+    num(objectValue(item, [...marketKeys, ...tokenKeys]))
+  );
 }
 
 function extractTokens(value: unknown, depth = 0): TokenRecord[] {
@@ -136,8 +140,8 @@ function priceUsd(item: TokenRecord, monUsd = 0): number {
 function marketCap(item: TokenRecord, monUsd = 0): number {
   const direct = nestedNumber(
     item,
-    ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"],
-    ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"]
+    ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"],
+    ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"]
   );
   if (direct > 0) return direct;
 
@@ -156,7 +160,7 @@ function liquidity(item: TokenRecord, monUsd: number): number {
 
   const reserveNative = num(
     objectValue(item.market_info, ["reserve_native"])
-  ) || num(objectValue(item.token_info, ["reserve_native"]));
+  ) || num(objectValue(item.token_info, ["reserve_native"])) || num(objectValue(item, ["reserve_native"]));
 
   if (reserveNative <= 0 || monUsd <= 0) return 0;
   return reserveNative >= 1e12
@@ -221,6 +225,55 @@ function estimateMonUsd(tokens: TokenRecord[]): number {
   return estimates[Math.floor(estimates.length / 2)] || 0;
 }
 
+function feedDiagnostics(tokens: TokenRecord[], monUsd: number) {
+  let addressCount = 0;
+  let directMarketCapCount = 0;
+  let priceUsdCount = 0;
+  let tokenPriceMonCount = 0;
+  let derivedMarketCapCount = 0;
+  const samples: Array<Record<string, unknown>> = [];
+
+  for (const item of tokens.slice(0, 5)) {
+    const token = firstAddress(item);
+    const directCap = nestedNumber(
+      item,
+      ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"],
+      ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"]
+    );
+    const usd = priceUsd(item, monUsd);
+    const mon = tokenPriceMon(item);
+    const cap = marketCap(item, monUsd);
+
+    if (token) addressCount++;
+    if (directCap > 0) directMarketCapCount++;
+    if (usd > 0) priceUsdCount++;
+    if (mon > 0) tokenPriceMonCount++;
+    if (cap > 0 && directCap <= 0) derivedMarketCapCount++;
+
+    if (samples.length < 2) {
+      samples.push({
+        topLevelKeys: Object.keys(item).slice(0, 20),
+        tokenInfoKeys: item.token_info ? Object.keys(item.token_info).slice(0, 30) : [],
+        marketInfoKeys: item.market_info ? Object.keys(item.market_info).slice(0, 30) : [],
+        address: token,
+        priceUsd: usd || 0,
+        tokenPriceMon: mon || 0,
+        marketCapUsd: cap || 0
+      });
+    }
+  }
+
+  return {
+    rawCount: tokens.length,
+    addressCount,
+    directMarketCapCount,
+    priceUsdCount,
+    tokenPriceMonCount,
+    derivedMarketCapCount,
+    samples
+  };
+}
+
 function normalizeToken(item: TokenRecord, monUsd: number): TokenRecord | null {
   const token = firstAddress(item);
   if (!token) return null;
@@ -266,7 +319,10 @@ function rankTokens(tokens: TokenRecord[], monUsd: number) {
 async function save(env: Env, tokens: TokenRecord[], source: string): Promise<number> {
   if (!tokens.length) return 0;
 
-  const monUsd = estimateMonUsd(tokens);
+  let monUsd = estimateMonUsd(tokens);
+  const storedMonUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
+  if (!(monUsd > 0) && storedMonUsd > 0) monUsd = storedMonUsd;
+
   if (monUsd > 0) {
     await env.CIEL_STATE.put(
       MON_USD_KEY,
@@ -275,14 +331,34 @@ async function save(env: Env, tokens: TokenRecord[], source: string): Promise<nu
     );
   }
 
+  const diagnostics = feedDiagnostics(tokens, monUsd);
   const normalized = tokens
     .map(item => normalizeToken(item, monUsd))
     .filter((item): item is TokenRecord => item !== null)
     .slice(0, MARKET_LIMIT);
 
+  const ranked = rankTokens(normalized.length ? normalized : tokens, monUsd);
+  const fetchedAt = Date.now();
+  const top = ranked[0];
+
+  await env.CIEL_STATE.put(
+    FEED_HEALTH_KEY,
+    JSON.stringify({
+      ok: true,
+      source,
+      fetchedAt,
+      count: tokens.length,
+      validCount: normalized.length,
+      topMarketCapUsd: top?.marketCapUsd || 0,
+      topSymbol: top?.symbol || null,
+      monUsd: monUsd || null,
+      diagnostics
+    }),
+    { expirationTtl: 3600 }
+  );
+
   if (!normalized.length) return 0;
 
-  const fetchedAt = Date.now();
   await env.CIEL_STATE.put(
     CACHE_KEY,
     JSON.stringify(normalized),
@@ -291,23 +367,6 @@ async function save(env: Env, tokens: TokenRecord[], source: string): Promise<nu
   await env.CIEL_STATE.put(
     FETCH_TS_KEY,
     String(fetchedAt),
-    { expirationTtl: 3600 }
-  );
-
-  const ranked = rankTokens(normalized, monUsd);
-  const top = ranked[0];
-  await env.CIEL_STATE.put(
-    FEED_HEALTH_KEY,
-    JSON.stringify({
-      ok: true,
-      source,
-      fetchedAt,
-      count: normalized.length,
-      validCount: ranked.length,
-      topMarketCapUsd: top?.marketCapUsd || 0,
-      topSymbol: top?.symbol || null,
-      monUsd: monUsd || null
-    }),
     { expirationTtl: 3600 }
   );
 
@@ -469,7 +528,7 @@ async function maybeSendMarketPulse(
 
   await notifyTelegram(
     env,
-    `📡 CIEL MARKET INTELLIGENCE\n${status}\nSource: ${sourceLabel}\nMarkets cached: ${Number(health.count || ranked.length)}${monUsd > 0 ? `\nMON/USD: $${monUsd.toFixed(4)}` : ""}\n\nTOP NAD.FUN MARKETS\n${lines.join("\n")}\n\nKV discovery is active; D1 availability does not stop this scanner.`
+    `📡 CIEL MARKET INTELLIGENCE\n${status}\nSource: ${sourceLabel}\nMarkets received: ${Number(health.count || ranked.length)}${monUsd > 0 ? `\nMON/USD: $${monUsd.toFixed(4)}` : ""}\n\nTOP NAD.FUN MARKETS\n${lines.join("\n")}\n\nKV discovery is active; D1 availability does not stop this scanner.`
   );
 
   await env.CIEL_STATE.put(
