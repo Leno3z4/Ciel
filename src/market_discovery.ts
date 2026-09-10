@@ -11,6 +11,7 @@ const DISCOVERY_REFRESH_MS = 10 * 60 * 1000;
 const TELEGRAM_PULSE_INTERVAL_MS = 10 * 60 * 1000;
 const MARKET_LIMIT = 50;
 const FALLBACK_TOKEN_LIMIT = 8;
+const NADFUN_TOTAL_SUPPLY = 1_000_000_000;
 
 type TokenRecord = {
   token_info?: Record<string, unknown>;
@@ -97,28 +98,82 @@ function extractTokens(value: unknown, depth = 0): TokenRecord[] {
   return [];
 }
 
-function marketCap(item: TokenRecord): number {
+function totalSupply(item: TokenRecord): number {
+  const raw = objectValue(item.token_info, [
+    "total_supply",
+    "totalSupply",
+    "supply",
+    "circulating_supply",
+    "circulatingSupply"
+  ]);
+  const decimals = Math.max(
+    0,
+    Math.floor(
+      num(objectValue(item.token_info, ["decimals", "token_decimals", "tokenDecimals"])) || 18
+    )
+  );
+  const value = num(raw);
+  if (value > 0) return value >= 1e15 ? value / 10 ** decimals : value;
+  return NADFUN_TOTAL_SUPPLY;
+}
+
+function priceUsd(item: TokenRecord): number {
   return nestedNumber(
+    item,
+    ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"],
+    ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]
+  );
+}
+
+function marketCap(item: TokenRecord): number {
+  const direct = nestedNumber(
     item,
     ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"],
     ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"]
   );
+  if (direct > 0) return direct;
+
+  const usdPrice = priceUsd(item);
+  const supply = totalSupply(item);
+  return usdPrice > 0 && supply > 0 ? usdPrice * supply : 0;
 }
 
-function liquidity(item: TokenRecord): number {
-  return nestedNumber(
+function liquidity(item: TokenRecord, monUsd: number): number {
+  const direct = nestedNumber(
     item,
     ["liquidity_usd", "liquidityUsd"],
     ["liquidity_usd", "liquidityUsd"]
   );
+  if (direct > 0) return direct;
+
+  const reserveNative = num(
+    objectValue(item.market_info, ["reserve_native"])
+  ) || num(objectValue(item.token_info, ["reserve_native"]));
+
+  if (reserveNative <= 0 || monUsd <= 0) return 0;
+  return reserveNative >= 1e12
+    ? reserveNative / 1e18 * monUsd
+    : reserveNative * monUsd;
 }
 
-function volume5m(item: TokenRecord): number {
-  return nestedNumber(
+function volume5m(item: TokenRecord, monUsd: number): number {
+  const direct = nestedNumber(
     item,
     ["volume_5m_usd", "volume5mUsd", "volume_usd_5m"],
     ["volume_5m_usd", "volume5mUsd", "volume_usd_5m"]
   );
+  if (direct > 0) return direct;
+
+  const rawVolume = nestedNumber(
+    item,
+    [],
+    ["volume_5m", "volume5m", "volume"]
+  );
+  if (rawVolume <= 0 || monUsd <= 0) return 0;
+
+  return rawVolume >= 1e15
+    ? rawVolume / 1e18 * monUsd
+    : rawVolume * monUsd;
 }
 
 function symbol(item: TokenRecord): string {
@@ -139,7 +194,7 @@ function estimateMonUsd(tokens: TokenRecord[]): number {
   const estimates: number[] = [];
   for (const item of tokens) {
     const tokenInMon = nestedNumber(item, [], ["price", "token_price"]);
-    const tokenUsd = nestedNumber(item, ["price_usd", "priceUsd"], ["price_usd", "priceUsd"]);
+    const tokenUsd = priceUsd(item);
     if (tokenInMon > 0 && tokenUsd > 0) {
       const ratio = tokenUsd / tokenInMon;
       if (ratio > 0.01 && ratio < 1_000) estimates.push(ratio);
@@ -158,10 +213,63 @@ function estimateMonUsd(tokens: TokenRecord[]): number {
   return estimates[Math.floor(estimates.length / 2)] || 0;
 }
 
+function normalizeToken(item: TokenRecord, monUsd: number): TokenRecord | null {
+  const token = firstAddress(item);
+  if (!token) return null;
+
+  const cap = marketCap(item);
+  if (!(cap > 0)) return null;
+
+  const tokenInfo = { ...(item.token_info || {}) };
+  const marketInfo = { ...(item.market_info || {}) };
+  const currentSymbol = symbol(item);
+  const usdPrice = priceUsd(item);
+  const liq = liquidity(item, monUsd);
+  const vol = volume5m(item, monUsd);
+
+  tokenInfo.token_id = token;
+  if (!tokenInfo.symbol && currentSymbol !== "unknown") tokenInfo.symbol = currentSymbol;
+  if (usdPrice > 0 && num(marketInfo.price_usd) <= 0) marketInfo.price_usd = usdPrice;
+  if (num(marketInfo.market_cap_usd) <= 0) marketInfo.market_cap_usd = cap;
+  if (liq > 0 && num(marketInfo.liquidity_usd) <= 0) marketInfo.liquidity_usd = liq;
+  if (vol > 0 && num(marketInfo.volume_5m_usd) <= 0) marketInfo.volume_5m_usd = vol;
+
+  return {
+    ...item,
+    token_info: tokenInfo,
+    market_info: marketInfo
+  };
+}
+
+function rankTokens(tokens: TokenRecord[], monUsd: number) {
+  return tokens
+    .map(item => ({
+      symbol: symbol(item),
+      token: firstAddress(item),
+      marketCapUsd: marketCap(item),
+      liquidityUsd: liquidity(item, monUsd),
+      volume5mUsd: volume5m(item, monUsd),
+      percent: num(item.percent)
+    }))
+    .filter(item => item.token && item.marketCapUsd > 0)
+    .sort((a, b) => b.marketCapUsd - a.marketCapUsd);
+}
+
 async function save(env: Env, tokens: TokenRecord[], source: string): Promise<number> {
   if (!tokens.length) return 0;
+
+  const monUsd = estimateMonUsd(tokens);
+  if (monUsd > 0) {
+    await env.CIEL_STATE.put(
+      MON_USD_KEY,
+      String(monUsd),
+      { expirationTtl: 3600 }
+    );
+  }
+
   const normalized = tokens
-    .filter(item => firstAddress(item))
+    .map(item => normalizeToken(item, monUsd))
+    .filter((item): item is TokenRecord => item !== null)
     .slice(0, MARKET_LIMIT);
 
   if (!normalized.length) return 0;
@@ -178,27 +286,7 @@ async function save(env: Env, tokens: TokenRecord[], source: string): Promise<nu
     { expirationTtl: 3600 }
   );
 
-  const monUsd = estimateMonUsd(normalized);
-  if (monUsd > 0) {
-    await env.CIEL_STATE.put(
-      MON_USD_KEY,
-      String(monUsd),
-      { expirationTtl: 3600 }
-    );
-  }
-
-  const ranked = normalized
-    .map(item => ({
-      symbol: symbol(item),
-      token: firstAddress(item),
-      marketCapUsd: marketCap(item),
-      liquidityUsd: liquidity(item),
-      volume5mUsd: volume5m(item),
-      percent: num(item.percent)
-    }))
-    .filter(item => item.token && item.marketCapUsd > 0)
-    .sort((a, b) => b.marketCapUsd - a.marketCapUsd);
-
+  const ranked = rankTokens(normalized, monUsd);
   const top = ranked[0];
   await env.CIEL_STATE.put(
     FEED_HEALTH_KEY,
@@ -389,17 +477,8 @@ async function sendCachedPulse(env: Env): Promise<void> {
 
   try {
     const tokens = extractTokens(JSON.parse(cached));
-    const ranked = tokens
-      .map(item => ({
-        symbol: symbol(item),
-        token: firstAddress(item),
-        marketCapUsd: marketCap(item),
-        liquidityUsd: liquidity(item),
-        volume5mUsd: volume5m(item),
-        percent: num(item.percent)
-      }))
-      .filter(item => item.token && item.marketCapUsd > 0)
-      .sort((a, b) => b.marketCapUsd - a.marketCapUsd);
+    const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
+    const ranked = rankTokens(tokens, monUsd);
 
     await maybeSendMarketPulse(
       env,
@@ -423,14 +502,14 @@ export async function primeMarketDiscovery(env: Env): Promise<void> {
 
   const ranked = await fetchMarketCapFeed();
   if (ranked.length) {
-    await save(env, ranked, "market-cap");
-    return;
+    const saved = await save(env, ranked, "market-cap");
+    if (saved > 0) return;
   }
 
   const creation = await fetchCreationFeed();
   if (creation.length) {
-    await save(env, creation, "creation-time");
-    return;
+    const saved = await save(env, creation, "creation-time");
+    if (saved > 0) return;
   }
 
   const recentTokens = await fetchRecentEventTokens();
@@ -441,8 +520,8 @@ export async function primeMarketDiscovery(env: Env): Promise<void> {
       if (market) fallback.push(market);
     }
     if (fallback.length) {
-      await save(env, fallback, "recent-events");
-      return;
+      const saved = await save(env, fallback, "recent-events");
+      if (saved > 0) return;
     }
   }
 
