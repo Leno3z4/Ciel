@@ -12,11 +12,20 @@ const MAX_MARKETS = 5;
 const KV_COOLDOWN_MS = 10 * 60 * 1000;
 const MIN_MARKET_CAP_USD = 50_000;
 const MIN_LIQUIDITY_USD = 5_000;
+const MAX_PENDING_AGE_MS = 30 * 60 * 1000;
+const MAX_PENDING_SIGNALS_PER_FLUSH = 20;
 
 function num(value: unknown): number {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
   if (typeof value !== "string") return 0;
   const text = value.trim().replace(/[$,\s]/g, "");
+  const match = text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(K|M|B|T)?$/i);
+  if (match) {
+    const base = Number(match[1]);
+    const multipliers: Record<string, number> = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
+    const valueWithSuffix = base * (match[2] ? multipliers[match[2].toUpperCase()] : 1);
+    return Number.isFinite(valueWithSuffix) ? valueWithSuffix : 0;
+  }
   const parsed = Number(text);
   return Number.isFinite(parsed) ? parsed : 0;
 }
@@ -214,4 +223,149 @@ export async function runKvIntelligenceCycle(env: Env): Promise<void> {
     lastKvIntelligenceAnalyzed: analyzed,
     lastKvIntelligenceCandidates: candidates.length
   });
+}
+
+export async function flushPendingKvSignals(env: Env): Promise<void> {
+  const pendingList = await env.CIEL_STATE.list({ prefix: PENDING_PREFIX, limit: MAX_PENDING_SIGNALS_PER_FLUSH });
+  if (!pendingList.keys.length) return;
+
+  const feed = await readFeed(env);
+  const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
+  const feedByToken = new Map<string, Record<string, unknown>>();
+
+  for (const item of feed) {
+    const token = tokenAddress(item);
+    if (token) feedByToken.set(token.toLowerCase(), item);
+  }
+
+  let queued = 0;
+  let discarded = 0;
+
+  for (const key of pendingList.keys) {
+    const token = key.name.slice(PENDING_PREFIX.length).toLowerCase();
+    const raw = await env.CIEL_STATE.get(key.name);
+    if (!raw) continue;
+
+    let pending: Record<string, unknown>;
+    try {
+      pending = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      await env.CIEL_STATE.delete(key.name);
+      discarded++;
+      continue;
+    }
+
+    const createdTsMs = Number(pending.createdTsMs || 0);
+    const action = String(pending.action || "").toUpperCase();
+    const confidence = Number(pending.confidence || 0);
+    const item = feedByToken.get(token);
+
+    if (
+      !createdTsMs ||
+      Date.now() - createdTsMs > MAX_PENDING_AGE_MS ||
+      !item ||
+      !["BUY", "SELL"].includes(action) ||
+      !Number.isFinite(confidence) ||
+      confidence < 0.48
+    ) {
+      await env.CIEL_STATE.delete(key.name);
+      discarded++;
+      continue;
+    }
+
+    const currentMarketCap = marketCap(item);
+    const currentLiquidity = liquidityUsd(item, monUsd);
+    const currentPrice = priceUsd(item);
+
+    if (
+      currentMarketCap < MIN_MARKET_CAP_USD ||
+      currentLiquidity < MIN_LIQUIDITY_USD ||
+      currentPrice <= 0
+    ) {
+      await env.CIEL_STATE.delete(key.name);
+      discarded++;
+      continue;
+    }
+
+    if (action === "BUY") {
+      const existingPosition = await env.DB
+        .prepare("SELECT quantity FROM positions WHERE token_address=? AND quantity<>'0'")
+        .bind(token)
+        .first<{ quantity: string }>();
+      if (existingPosition) {
+        await env.CIEL_STATE.delete(key.name);
+        discarded++;
+        continue;
+      }
+    } else {
+      const existingPosition = await env.DB
+        .prepare("SELECT quantity FROM positions WHERE token_address=? AND quantity<>'0'")
+        .bind(token)
+        .first<{ quantity: string }>();
+      if (!existingPosition) {
+        await env.CIEL_STATE.delete(key.name);
+        discarded++;
+        continue;
+      }
+    }
+
+    const recentDuplicate = await env.DB
+      .prepare(`
+        SELECT id
+        FROM signals
+        WHERE token_address=?
+          AND action=?
+          AND ts_ms>=?
+        ORDER BY ts_ms DESC
+        LIMIT 1
+      `)
+      .bind(token, action, Date.now() - 30 * 60 * 1000)
+      .first<{ id: number }>();
+
+    if (recentDuplicate) {
+      await env.CIEL_STATE.delete(key.name);
+      discarded++;
+      continue;
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO signals(
+        token_address,
+        ts_ms,
+        action,
+        confidence,
+        expected_low,
+        expected_high,
+        anomaly_score,
+        model,
+        rationale
+      ) VALUES(?,?,?,?,?,?,?,?,?)
+    `).bind(
+      token,
+      Date.now(),
+      action,
+      confidence,
+      Number(pending.expectedLowUsd || 0),
+      Number(pending.expectedHighUsd || 0),
+      Number(pending.anomalyScore || 0),
+      "gemini-kv-recovery",
+      `${String(pending.regime || "UNKNOWN")}: ${String(pending.rationale || "KV signal recovered after D1 degradation")}`
+    ).run();
+
+    await env.CIEL_STATE.delete(key.name);
+    queued++;
+  }
+
+  await writeRuntime(env, {
+    lastKvPendingFlush: Date.now(),
+    lastKvPendingQueued: queued,
+    lastKvPendingDiscarded: discarded
+  });
+
+  if (queued > 0 || discarded > 0) {
+    await notifyTelegram(
+      env,
+      `🔄 CIEL KV SIGNAL RECOVERY\nQueued for live ledger: ${queued}\nDiscarded stale/invalid: ${discarded}\nD1 execution path is active again.`
+    );
+  }
 }
