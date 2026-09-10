@@ -37,6 +37,10 @@ export async function executePaperOrder(env: Env, order: PaperOrder): Promise<vo
   await env.DB.prepare("INSERT INTO trades(token_address,ts_ms,side,quantity,price_usd,tx_hash,mode,status,error) VALUES(?,?,?,?,?,?,?,?,?)").bind(order.token, now, order.side, order.quantity, order.priceUsd, null, "paper", "filled", null).run();
 }
 
-export function paperOrderAllowed(env: Env): boolean {
-  return env.PAPER_TRADING === "true" && env.TRADING_ENABLED !== "true";
+export function paperOrderAllowed(
+  env: Env
+): boolean {
+
+  return env.PAPER_TRADING === "true";
+
 }
