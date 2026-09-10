@@ -2,6 +2,7 @@ import base, { type Env, TradingEngine } from "./index";
 import { primeMarketDiscovery } from "./market_discovery";
 import { triggerEstablishedModelAnalysis } from "./model_trigger";
 import { notifyTelegram } from "./telegram";
+import { runLiveSignalCycle } from "./live_execution";
 
 export { TradingEngine };
 
@@ -98,8 +99,24 @@ const worker = {
     if (controller.cron === "*/3 * * * *") {
       ctx.waitUntil((async () => {
         await base.scheduled(controller, env, ctx);
-        try { await triggerEstablishedModelAnalysis(env); } catch (error) { console.error(`Established model trigger failed: ${String(error).slice(0, 1000)}`); }
+    
+        try {
+          await triggerEstablishedModelAnalysis(env);
+        } catch (error) {
+          console.error(
+            `Established model trigger failed: ${String(error).slice(0, 1000)}`
+          );
+        }
+    
+        try {
+          await runLiveSignalCycle(env);
+        } catch (error) {
+          console.error(
+            `Live execution cycle failed: ${String(error).slice(0, 1000)}`
+          );
+        }
       })());
+    
       return;
     }
     if (controller.cron === "*/10 * * * *") {
