@@ -60,21 +60,21 @@ export const TRADING_CONFIG: Record<TradingMode, TradingConfig> = {
   /*
    * Live mode.
    *
-   * Still flexible, but protects capital.
-   *
-   * These are intentionally not ultra-conservative.
+   * Entry standards are intentionally relaxed enough to let Ciel
+   * trade normal early/mid-stage opportunities while preserving
+   * liquidity, exposure, position-size, and circuit-breaker guards.
    */
   live: {
 
     maxPositions: 10,
 
-    minimumConfidence: 0.60,
+    minimumConfidence: 0.48,
 
-    maxPortfolioExposurePct: 50,
+    maxPortfolioExposurePct: 60,
 
-    maxPositionPct: 10,
+    maxPositionPct: 15,
 
-    allowAccumulationEntries: false,
+    allowAccumulationEntries: true,
 
     circuitBreakerEnabled: true,
 
