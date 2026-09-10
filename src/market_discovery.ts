@@ -117,15 +117,23 @@ function totalSupply(item: TokenRecord): number {
   return NADFUN_TOTAL_SUPPLY;
 }
 
-function priceUsd(item: TokenRecord): number {
-  return nestedNumber(
+function tokenPriceMon(item: TokenRecord): number {
+  return nestedNumber(item, [], ["price", "token_price"]);
+}
+
+function priceUsd(item: TokenRecord, monUsd = 0): number {
+  const direct = nestedNumber(
     item,
     ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"],
     ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]
   );
+  if (direct > 0) return direct;
+
+  const monPrice = tokenPriceMon(item);
+  return monPrice > 0 && monUsd > 0 ? monPrice * monUsd : 0;
 }
 
-function marketCap(item: TokenRecord): number {
+function marketCap(item: TokenRecord, monUsd = 0): number {
   const direct = nestedNumber(
     item,
     ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv"],
@@ -133,7 +141,7 @@ function marketCap(item: TokenRecord): number {
   );
   if (direct > 0) return direct;
 
-  const usdPrice = priceUsd(item);
+  const usdPrice = priceUsd(item, monUsd);
   const supply = totalSupply(item);
   return usdPrice > 0 && supply > 0 ? usdPrice * supply : 0;
 }
@@ -193,7 +201,7 @@ function formatUsd(value: number): string {
 function estimateMonUsd(tokens: TokenRecord[]): number {
   const estimates: number[] = [];
   for (const item of tokens) {
-    const tokenInMon = nestedNumber(item, [], ["price", "token_price"]);
+    const tokenInMon = tokenPriceMon(item);
     const tokenUsd = priceUsd(item);
     if (tokenInMon > 0 && tokenUsd > 0) {
       const ratio = tokenUsd / tokenInMon;
@@ -217,13 +225,13 @@ function normalizeToken(item: TokenRecord, monUsd: number): TokenRecord | null {
   const token = firstAddress(item);
   if (!token) return null;
 
-  const cap = marketCap(item);
+  const cap = marketCap(item, monUsd);
   if (!(cap > 0)) return null;
 
   const tokenInfo = { ...(item.token_info || {}) };
   const marketInfo = { ...(item.market_info || {}) };
   const currentSymbol = symbol(item);
-  const usdPrice = priceUsd(item);
+  const usdPrice = priceUsd(item, monUsd);
   const liq = liquidity(item, monUsd);
   const vol = volume5m(item, monUsd);
 
@@ -246,7 +254,7 @@ function rankTokens(tokens: TokenRecord[], monUsd: number) {
     .map(item => ({
       symbol: symbol(item),
       token: firstAddress(item),
-      marketCapUsd: marketCap(item),
+      marketCapUsd: marketCap(item, monUsd),
       liquidityUsd: liquidity(item, monUsd),
       volume5mUsd: volume5m(item, monUsd),
       percent: num(item.percent)
