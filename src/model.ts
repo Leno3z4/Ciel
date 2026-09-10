@@ -27,6 +27,26 @@ export interface Baseline {
   marketCapP90: number;
 }
 
+export interface PriceBehaviorProfile {
+  observations24h: number;
+  observations12h: number;
+  avgLowPrice12h: number;
+  avgHighPrice12h: number;
+  avgLowPrice24h: number;
+  avgHighPrice24h: number;
+  lowestPrice24h: number;
+  highestPrice24h: number;
+  currentVsAvgLow24hPct: number;
+  currentVsAvgHigh24hPct: number;
+  currentRangePositionPct: number;
+  avgMinutesNearLow12h: number;
+  avgMinutesNearHigh12h: number;
+  avgMinutesNearLow24h: number;
+  avgMinutesNearHigh24h: number;
+  currentMinutesInZone: number;
+  currentZone: "LOW" | "MIDDLE" | "HIGH" | "UNKNOWN";
+}
+
 export interface PatternProfile {
   historySamples: number;
   ageHours: number;
@@ -45,6 +65,7 @@ export interface PatternProfile {
   buyPressure: number;
   priceVsMedian: number;
   drawdownFromMarketCapPeakPct: number;
+  priceBehavior: PriceBehaviorProfile;
   regimeHint: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";
 }
 
@@ -76,13 +97,143 @@ function historyValueBefore(rows: Snapshot[], msAgo: number, key: keyof Pick<Sna
 
 function meanFinite(values: number[]): number { return mean(values.filter(v => Number.isFinite(v) && v > 0)); }
 
+function emptyPriceBehavior(): PriceBehaviorProfile {
+  return {
+    observations24h: 0,
+    observations12h: 0,
+    avgLowPrice12h: 0,
+    avgHighPrice12h: 0,
+    avgLowPrice24h: 0,
+    avgHighPrice24h: 0,
+    lowestPrice24h: 0,
+    highestPrice24h: 0,
+    currentVsAvgLow24hPct: 0,
+    currentVsAvgHigh24hPct: 0,
+    currentRangePositionPct: 0,
+    avgMinutesNearLow12h: 0,
+    avgMinutesNearHigh12h: 0,
+    avgMinutesNearLow24h: 0,
+    avgMinutesNearHigh24h: 0,
+    currentMinutesInZone: 0,
+    currentZone: "UNKNOWN"
+  };
+}
+
+function buildPriceBehavior(rows: Snapshot[]): PriceBehaviorProfile {
+  if (!rows.length) return emptyPriceBehavior();
+
+  const newestTs = Math.max(...rows.map(row => row.tsMs));
+  const cutoff24h = newestTs - 24 * 60 * 60 * 1000;
+  const cutoff12h = newestTs - 12 * 60 * 60 * 1000;
+  const valid = rows
+    .filter(row => row.tsMs >= cutoff24h && Number.isFinite(row.priceUsd) && row.priceUsd > 0)
+    .sort((a, b) => a.tsMs - b.tsMs);
+  if (!valid.length) return emptyPriceBehavior();
+
+  const last12h = valid.filter(row => row.tsMs >= cutoff12h);
+  const prices24h = valid.map(row => row.priceUsd);
+  const prices12h = last12h.length ? last12h.map(row => row.priceUsd) : prices24h;
+  const low24h = Math.min(...prices24h);
+  const high24h = Math.max(...prices24h);
+  const low12h = Math.min(...prices12h);
+  const high12h = Math.max(...prices12h);
+  const range24h = high24h - low24h;
+  const range12h = high12h - low12h;
+  const nearLow24h = low24h + range24h * 0.20;
+  const nearHigh24h = high24h - range24h * 0.20;
+  const nearLow12h = low12h + range12h * 0.20;
+  const nearHigh12h = high12h - range12h * 0.20;
+
+  function durationNear(windowRows: Snapshot[], lowThreshold: number, highThreshold: number): { lowMinutes: number; highMinutes: number } {
+    let lowMs = 0;
+    let highMs = 0;
+    for (let i = 1; i < windowRows.length; i++) {
+      const previous = windowRows[i - 1];
+      const current = windowRows[i];
+      const gapMs = current.tsMs - previous.tsMs;
+      if (gapMs <= 0 || gapMs > 10 * 60 * 1000) continue;
+      if (previous.priceUsd <= lowThreshold) lowMs += gapMs;
+      if (previous.priceUsd >= highThreshold) highMs += gapMs;
+    }
+    return { lowMinutes: lowMs / 60000, highMinutes: highMs / 60000 };
+  }
+
+  function blockStats(windowRows: Snapshot[]): { low: number; high: number; lowMinutes: number; highMinutes: number } {
+    if (!windowRows.length) return { low: 0, high: 0, lowMinutes: 0, highMinutes: 0 };
+    const prices = windowRows.map(row => row.priceUsd).filter(price => Number.isFinite(price) && price > 0);
+    if (!prices.length) return { low: 0, high: 0, lowMinutes: 0, highMinutes: 0 };
+    const low = Math.min(...prices);
+    const high = Math.max(...prices);
+    const range = high - low;
+    const timing = durationNear(windowRows, low + range * 0.20, high - range * 0.20);
+    return { low, high, lowMinutes: timing.lowMinutes, highMinutes: timing.highMinutes };
+  }
+
+  const twelveHourBlocks: Snapshot[][] = [];
+  const firstBlockEnd = cutoff12h;
+  const olderBlock = valid.filter(row => row.tsMs < firstBlockEnd);
+  if (olderBlock.length) twelveHourBlocks.push(olderBlock);
+  if (last12h.length) twelveHourBlocks.push(last12h);
+  if (!twelveHourBlocks.length) twelveHourBlocks.push(valid);
+
+  const blocks = twelveHourBlocks.map(blockStats);
+  const avgLow24h = mean(blocks.map(block => block.low).filter(price => price > 0));
+  const avgHigh24h = mean(blocks.map(block => block.high).filter(price => price > 0));
+  const avgLowMinutes24h = mean(blocks.map(block => block.lowMinutes));
+  const avgHighMinutes24h = mean(blocks.map(block => block.highMinutes));
+  const twelveHourTiming = durationNear(last12h.length ? last12h : valid, nearLow12h, nearHigh12h);
+
+  const current = valid[valid.length - 1].priceUsd;
+  const currentRangePositionPct = range24h > 0 ? Math.max(0, Math.min(100, ((current - low24h) / range24h) * 100)) : 50;
+  const currentIsLow = current <= nearLow24h;
+  const currentIsHigh = current >= nearHigh24h;
+  let currentZone: PriceBehaviorProfile["currentZone"] = "MIDDLE";
+  if (currentIsLow) currentZone = "LOW";
+  else if (currentIsHigh) currentZone = "HIGH";
+
+  let currentZoneStart = valid[valid.length - 1].tsMs;
+  if (currentZone !== "MIDDLE") {
+    for (let i = valid.length - 2; i >= 0; i--) {
+      const previous = valid[i];
+      const next = valid[i + 1];
+      const gapMs = next.tsMs - previous.tsMs;
+      if (gapMs <= 0 || gapMs > 10 * 60 * 1000) break;
+      const sameZone = (currentZone === "LOW" && previous.priceUsd <= nearLow24h) ||
+        (currentZone === "HIGH" && previous.priceUsd >= nearHigh24h);
+      if (!sameZone) break;
+      currentZoneStart = previous.tsMs;
+    }
+  }
+
+  const currentMinutesInZone = currentZone === "MIDDLE" ? 0 : Math.max(0, (newestTs - currentZoneStart) / 60000);
+  return {
+    observations24h: valid.length,
+    observations12h: last12h.length,
+    avgLowPrice12h: low12h,
+    avgHighPrice12h: high12h,
+    avgLowPrice24h: avgLow24h || low24h,
+    avgHighPrice24h: avgHigh24h || high24h,
+    lowestPrice24h: low24h,
+    highestPrice24h: high24h,
+    currentVsAvgLow24hPct: avgLow24h > 0 ? pctChange(current, avgLow24h) : 0,
+    currentVsAvgHigh24hPct: avgHigh24h > 0 ? pctChange(current, avgHigh24h) : 0,
+    currentRangePositionPct,
+    avgMinutesNearLow12h: twelveHourTiming.lowMinutes,
+    avgMinutesNearHigh12h: twelveHourTiming.highMinutes,
+    avgMinutesNearLow24h: avgLowMinutes24h,
+    avgMinutesNearHigh24h: avgHighMinutes24h,
+    currentMinutesInZone,
+    currentZone
+  };
+}
+
 export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
   if (!rows.length) return {
     historySamples: 0, ageHours: 0, hourOfDayUtc: 0, sameHourSamples: 0, currentMarketCapUsd: 0,
     currentMarketCapReturn5mPct: 0, currentMarketCapReturn30mPct: 0, currentMarketCapReturn2hPct: 0,
     marketCapVsMedian: 0, marketCapVsMean: 0, sameHourMarketCapVsBaseline: 0, marketCapPositionPct: 0,
     volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0.5, priceVsMedian: 0,
-    drawdownFromMarketCapPeakPct: 0, regimeHint: "UNKNOWN"
+    drawdownFromMarketCapPeakPct: 0, priceBehavior: emptyPriceBehavior(), regimeHint: "UNKNOWN"
   };
   const current = rows[0];
   const oldest = rows[rows.length - 1];
@@ -129,6 +280,7 @@ export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
     buyPressure,
     priceVsMedian: priceMedian > 0 ? current.priceUsd / priceMedian : 0,
     drawdownFromMarketCapPeakPct: drawdown,
+    priceBehavior: buildPriceBehavior(rows),
     regimeHint
   };
 }
@@ -206,6 +358,25 @@ function compactDecisionPacket(snapshot: Snapshot, baseline: Baseline, pattern: 
       priceVsMedian: Number(pattern.priceVsMedian.toFixed(3)),
       sameHourSamples: pattern.sameHourSamples
     },
+    priceBehavior: {
+      observations12h: pattern.priceBehavior.observations12h,
+      observations24h: pattern.priceBehavior.observations24h,
+      avgLowPrice12h: pattern.priceBehavior.avgLowPrice12h,
+      avgHighPrice12h: pattern.priceBehavior.avgHighPrice12h,
+      avgLowPrice24h: pattern.priceBehavior.avgLowPrice24h,
+      avgHighPrice24h: pattern.priceBehavior.avgHighPrice24h,
+      lowestPrice24h: pattern.priceBehavior.lowestPrice24h,
+      highestPrice24h: pattern.priceBehavior.highestPrice24h,
+      currentVsAvgLow24hPct: Number(pattern.priceBehavior.currentVsAvgLow24hPct.toFixed(2)),
+      currentVsAvgHigh24hPct: Number(pattern.priceBehavior.currentVsAvgHigh24hPct.toFixed(2)),
+      currentRangePositionPct: Number(pattern.priceBehavior.currentRangePositionPct.toFixed(1)),
+      avgMinutesNearLow12h: Number(pattern.priceBehavior.avgMinutesNearLow12h.toFixed(1)),
+      avgMinutesNearHigh12h: Number(pattern.priceBehavior.avgMinutesNearHigh12h.toFixed(1)),
+      avgMinutesNearLow24h: Number(pattern.priceBehavior.avgMinutesNearLow24h.toFixed(1)),
+      avgMinutesNearHigh24h: Number(pattern.priceBehavior.avgMinutesNearHigh24h.toFixed(1)),
+      currentMinutesInZone: Number(pattern.priceBehavior.currentMinutesInZone.toFixed(1)),
+      currentZone: pattern.priceBehavior.currentZone
+    },
     baseline: {
       samples: baseline.samples,
       medianMarketCapUsd: Math.round(baseline.medianMarketCap),
@@ -231,7 +402,7 @@ export async function askGemini(apiKey: string | undefined, model: string, role:
   const packet = compactDecisionPacket(snapshot, baseline, effectivePattern, score);
   const ai = new GoogleGenAI({ apiKey });
   const prompt = `${role === "market" ? "You are Ciel's established-meme market decision engine." : "You are Ciel's established-meme regime/deviation decision engine."}
-Decide from a compact feature packet derived from Ciel's full local history. The full raw history is intentionally not sent to you. MARKET CAP is the primary signal: use its multi-horizon movement, position in the token's own range, drawdown, same-hour behavior, and regime. Liquidity and 5m volume are risk/quality confirmation. Buy/sell flow and price are secondary confirmation only. These are already-created established markets; do not chase novelty or new launches. BUY only for a repeatable favorable entry regime with adequate liquidity and sensible risk/reward. HOLD/IGNORE when evidence is weak. SELL for distribution, panic, or deterioration of a held position. Never invent missing data or claim certainty/profitability. Return only the requested JSON.
+Decide from a compact feature packet derived from Ciel's full local history. The full raw history is intentionally not sent to you. MARKET CAP is the primary signal: use its multi-horizon movement, position in the token's own range, drawdown, same-hour behavior, regime, and the token-specific price-behavior timing profile. The price-behavior profile contains 12h and 24h low/high levels, rolling average lows/highs, the token's current position in its own historical range, typical time spent near low/high zones, and current time spent in its current low/high zone. Use this as a timing confirmation layer, not a guarantee that history repeats. Prefer BUY only when the broader market evidence supports an entry and the price is attractively positioned relative to the token's own historical low/accumulation behavior. Prefer SELL for a held position when price is near the token's historical high zone and distribution, weakening momentum, or other deterioration confirms the exit. Do not chase a price merely because it is below an average, and do not assume a high will be revisited. Liquidity and 5m volume remain risk/quality confirmation. These are already-created established markets; do not chase novelty or new launches. Never invent missing data or claim certainty/profitability. Return only the requested JSON.
 Decision packet: ${JSON.stringify(packet)}`;
   try {
     const response = await ai.models.generateContent({
