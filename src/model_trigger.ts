@@ -1,5 +1,6 @@
 import { buildBaseline, deviationScore, buildPatternProfile, askGemini, type Snapshot } from "./model";
 import { runDecisionPipeline } from "./decision_orchestrator";
+
 type ModelEnv = {
   CIEL_STATE: KVNamespace;
   DB: D1Database;
@@ -29,6 +30,7 @@ const MIN_HISTORY_SPAN_MS = 30 * 60 * 1000;
 const MIN_AVG_VOLUME_5M_USD = 5_000;
 const MIN_AVG_LIQUIDITY_USD = 10_000;
 const MAX_CANDIDATE_POOL = 20;
+const MAX_CANDIDATE_HISTORY_ROWS = 24;
 const MAX_CANDIDATES = 3;
 const MAX_DECISIONS_PER_CYCLE = 3;
 const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
@@ -69,21 +71,6 @@ function feedTokenAddress(item: FeedToken): string | null {
   const value = objectValue(item.token_info, ["token_id", "token_address", "tokenAddress"]) || objectValue(item.market_info, ["token_id", "token_address", "tokenAddress"]);
   const text = typeof value === "string" ? value : "";
   return /^0x[a-fA-F0-9]{40}$/.test(text) ? text.toLowerCase() : null;
-}
-
-function decodeApiBody(body: string): unknown | null {
-  const raw = body.trim();
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== "string") return parsed;
-    return JSON.parse(parsed);
-  } catch {}
-  try {
-    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    const bytes = atob(padded);
-    return JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes, c => c.charCodeAt(0))));
-  } catch { return null; }
 }
 
 function extractTokens(value: unknown, depth = 0): FeedToken[] {
@@ -147,42 +134,53 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
   if (!feed.size) return [];
 
   const pool = Array.from(feed.entries())
-    .map(([token, item]) => ({
-      token,
-      marketCap: feedMarketCapUsd(item)
-    }))
+    .map(([token, item]) => ({ token, marketCap: feedMarketCapUsd(item) }))
     .filter(item => item.marketCap >= MIN_MARKET_CAP_USD)
     .sort((a, b) => b.marketCap - a.marketCap)
     .slice(0, MAX_CANDIDATE_POOL);
 
-  if (!pool.length) return [];
+  const candidates: Candidate[] = [];
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
 
-  const placeholders = pool.map(() => "?").join(",");
-  const rows = await env.DB.prepare(`
-    SELECT token_address as token,
-      COUNT(*) as samples,
-      MIN(ts_ms) as firstTs,
-      MAX(ts_ms) as lastTs,
-      AVG(market_cap_usd) as avgMarketCap
-    FROM market_snapshots ms
-    WHERE ms.price_usd>0
-      AND ms.ts_ms >= ?
-      AND ms.token_address IN (${placeholders})
-    GROUP BY ms.token_address
-    HAVING COUNT(*)>=?
-      AND (MAX(ms.ts_ms)-MIN(ms.ts_ms))>=?
-      AND AVG(ms.market_cap_usd)>=?
-    ORDER BY AVG(ms.market_cap_usd) DESC
-    LIMIT ?`).bind(
-    Date.now() - 2 * 60 * 60 * 1000,
-    ...pool.map(item => item.token),
-    MIN_HISTORY_SAMPLES,
-    MIN_HISTORY_SPAN_MS,
-    MIN_MARKET_CAP_USD,
-    MAX_CANDIDATES
-  ).all<Candidate>();
+  for (const item of pool) {
+    const rows = await env.DB.prepare(`
+      SELECT token_address as token,
+        ts_ms as tsMs,
+        market_cap_usd as marketCapUsd
+      FROM market_snapshots
+      WHERE token_address=?
+        AND price_usd>0
+        AND ts_ms>=?
+      ORDER BY ts_ms DESC
+      LIMIT ?`).bind(item.token, cutoff, MAX_CANDIDATE_HISTORY_ROWS).all<{
+        token: string;
+        tsMs: number;
+        marketCapUsd: number;
+      }>();
 
-  return rows.results || [];
+    const history = rows.results || [];
+    if (history.length < MIN_HISTORY_SAMPLES) continue;
+
+    const first = history[history.length - 1];
+    const last = history[0];
+    const avgMarketCap = history.reduce((sum, row) => sum + Number(row.marketCapUsd || 0), 0) / history.length;
+
+    if ((Number(last.tsMs) - Number(first.tsMs)) < MIN_HISTORY_SPAN_MS) continue;
+    if (!(avgMarketCap >= MIN_MARKET_CAP_USD)) continue;
+
+    candidates.push({
+      token: item.token,
+      samples: history.length,
+      firstTs: Number(first.tsMs),
+      lastTs: Number(last.tsMs),
+      avgMarketCap
+    });
+
+    if (candidates.length >= MAX_CANDIDATES) break;
+  }
+
+  candidates.sort((a, b) => b.avgMarketCap - a.avgMarketCap);
+  return candidates;
 }
 
 async function writeEligibilityDiagnostics(env: ModelEnv, candidates: Candidate[]): Promise<void> {
@@ -359,9 +357,7 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
 
           const decision = response.decision;
 
-          if (!decision) {
-            throw new Error("Gemini returned no decision");
-          }
+          if (!decision) throw new Error("Gemini returned no decision");
 
           const normalizedAction =
             decision.action === "HOLD" || decision.action === "IGNORE"
