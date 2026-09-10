@@ -6,6 +6,7 @@ import { getMarketState } from "./market_discovery";
 const HOT_STATE_KEY = "ciel_hot_intelligence_state";
 const PENDING_PREFIX = "ciel_kv_pending_signal:";
 const RUNTIME_KEY = "ciel_runtime_state";
+const GEMINI_GLOBAL_CALL_KEY = "ciel_gemini_last_global_call_ms";
 const MAX_HISTORY = 480;
 const MAX_MARKETS = 5;
 const MIN_HISTORY_SAMPLES = 8;
@@ -164,6 +165,8 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
   const key = token.toLowerCase();
   const market = state.markets[key];
   if (market && market.decisionCooldownUntil > Date.now()) return false;
+  const sharedLast = num(await env.CIEL_STATE.get(GEMINI_GLOBAL_CALL_KEY) || "0");
+  if (sharedLast > 0 && Date.now() - sharedLast < GEMINI_GLOBAL_MIN_INTERVAL_MS) return false;
   if (state.lastGeminiDecisionAt > 0 && Date.now() - state.lastGeminiDecisionAt < GEMINI_GLOBAL_MIN_INTERVAL_MS) return false;
 
   const keys = [
@@ -214,7 +217,7 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastDecisionAt: decisionAt
   };
 
-  await env.CIEL_STATE.put("ciel_gemini_last_global_call_ms", String(decisionAt), { expirationTtl: 172800 });
+  await env.CIEL_STATE.put(GEMINI_GLOBAL_CALL_KEY, String(decisionAt), { expirationTtl: 172800 });
   await writeRuntimeThrottled(env, {
     lastGeminiSuccess: decisionAt,
     lastGeminiKeyUsed: usedSlot,
@@ -275,7 +278,6 @@ export async function runKvIntelligenceCycle(env: Env): Promise<void> {
       lastDecisionAt: state.markets[key]?.lastDecisionAt || 0
     };
     analyzed++;
-
     if (!geminiTriggered) geminiTriggered = await runKvDecision(env, state, row.token, row.item, history);
   }
 
