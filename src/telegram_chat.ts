@@ -1,13 +1,14 @@
 import { GoogleGenAI } from "@google/genai";
 import type { Env } from "./index";
 import { notifyTelegram } from "./telegram";
+import { getMarketState } from "./market_discovery";
 
 const CHAT_HISTORY_PREFIX = "ciel_telegram_chat_history:";
 const CHAT_HISTORY_TTL_SECONDS = 24 * 60 * 60;
 const MAX_HISTORY_MESSAGES = 10;
-const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
 const RUNTIME_KEY = "ciel_runtime_state";
-const FEED_HEALTH_KEY = "ciel_market_feed_health";
+const HOT_STATE_KEY = "ciel_hot_intelligence_state";
+const CHAT_KEY_INDEX = 7;
 
 type GeminiEnv = Env & Record<string, unknown>;
 
@@ -16,88 +17,43 @@ function trimText(value: unknown, max = 1200): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-function extractTokens(value: unknown, depth = 0): Array<Record<string, unknown>> {
-  if (depth > 6 || value == null) return [];
-  if (Array.isArray(value)) return value.filter(item => item && typeof item === "object") as Array<Record<string, unknown>>;
-  if (typeof value !== "object") return [];
-  const object = value as Record<string, unknown>;
-  for (const key of ["tokens", "data", "result", "items", "markets"]) {
-    const found = extractTokens(object[key], depth + 1);
-    if (found.length) return found;
-  }
-  return [];
-}
-
 function num(value: unknown): number {
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  if (typeof value !== "string") return 0;
-  const text = value.trim().replace(/[$,\s]/g, "");
-  if (!text) return 0;
-  const match = text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(K|M|B|T)?$/i);
-  if (!match) {
-    const parsed = Number(text);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  const base = Number(match[1]);
-  const multipliers: Record<string, number> = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
-  return base * (match[2] ? multipliers[match[2].toUpperCase()] : 1);
-}
-
-function objectValue(source: unknown, keys: string[]): unknown {
-  if (!source || typeof source !== "object") return null;
-  const object = source as Record<string, unknown>;
-  for (const key of keys) {
-    if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
-  }
-  return null;
-}
-
-function tokenSymbol(item: Record<string, unknown>): string {
-  const symbol = objectValue(item.token_info, ["symbol"]);
-  return typeof symbol === "string" && symbol.trim() ? symbol.trim() : "unknown";
-}
-
-function tokenAddress(item: Record<string, unknown>): string | null {
-  const value = objectValue(item.token_info, ["token_id", "token_address", "tokenAddress"]) || objectValue(item.market_info, ["token_id", "token_address", "tokenAddress"]);
-  const text = typeof value === "string" ? value.trim() : "";
-  return /^0x[a-fA-F0-9]{40}$/.test(text) ? text : null;
-}
-
-function marketCap(item: Record<string, unknown>): number {
-  return num(objectValue(item.market_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"])) || num(objectValue(item.token_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"]));
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 async function contextForChat(env: GeminiEnv): Promise<string> {
   const parts: string[] = [];
-  const feedRaw = await env.CIEL_STATE.get(RANKING_CACHE_KEY);
-  const healthRaw = await env.CIEL_STATE.get(FEED_HEALTH_KEY);
+  const marketState = await getMarketState(env);
   const runtimeRaw = await env.CIEL_STATE.get(RUNTIME_KEY);
+  const hotRaw = await env.CIEL_STATE.get(HOT_STATE_KEY);
 
-  if (healthRaw) {
-    try {
-      const health = JSON.parse(healthRaw) as Record<string, unknown>;
-      parts.push(`Feed health: ${JSON.stringify({
-        source: health.source || null,
-        fetchedAt: health.fetchedAt || 0,
-        count: health.count || 0,
-        validCount: health.validCount || 0,
-        topMarketCapUsd: health.topMarketCapUsd || 0,
-        topSymbol: health.topSymbol || null,
-        monUsd: health.monUsd || 0,
-        diagnostics: health.diagnostics || null
-      })}`);
-    } catch {}
+  if (marketState) {
+    parts.push(`Market feed: ${JSON.stringify({
+      source: marketState.source || null,
+      fetchedAt: marketState.fetchedAt || 0,
+      count: marketState.tokens?.length || 0,
+      monUsd: marketState.monUsd || 0,
+      topMarkets: (marketState.ranked || []).slice(0, 12)
+    })}`);
   }
 
-  if (feedRaw) {
+  if (hotRaw) {
     try {
-      const tokens = extractTokens(JSON.parse(feedRaw));
-      const markets = tokens
-        .map(item => ({ symbol: tokenSymbol(item), token: tokenAddress(item), marketCapUsd: marketCap(item) }))
-        .filter(item => item.token && item.marketCapUsd > 0)
-        .sort((a, b) => b.marketCapUsd - a.marketCapUsd)
-        .slice(0, 12);
-      parts.push(`Top cached markets: ${JSON.stringify(markets)}`);
+      const hot = JSON.parse(hotRaw) as Record<string, unknown>;
+      const markets = hot.markets && typeof hot.markets === "object" ? hot.markets as Record<string, unknown> : {};
+      const hotSummary = Object.entries(markets).slice(0, 5).map(([token, value]) => {
+        const market = value && typeof value === "object" ? value as Record<string, unknown> : {};
+        const snapshots = Array.isArray(market.snapshots) ? market.snapshots as Array<Record<string, unknown>> : [];
+        const latest = snapshots[0] || {};
+        return {
+          token,
+          samples: snapshots.length,
+          currentPriceUsd: num(latest.priceUsd),
+          currentMarketCapUsd: num(latest.marketCapUsd)
+        };
+      });
+      parts.push(`Hot intelligence summary: ${JSON.stringify(hotSummary)}`);
     } catch {}
   }
 
@@ -112,8 +68,12 @@ async function contextForChat(env: GeminiEnv): Promise<string> {
         lastModelDecisionCandidate: runtime.lastModelDecisionCandidate || null,
         lastModelDecisionAction: runtime.lastModelDecisionAction || null,
         lastModelDecisionConfidence: runtime.lastModelDecisionConfidence || 0,
-        lastIndexerDiscoveryCount: runtime.lastIndexerDiscoveryCount || 0,
-        lastIndexerValidAddressCount: runtime.lastIndexerValidAddressCount || 0
+        lastKvIntelligenceRun: runtime.lastKvIntelligenceRun || 0,
+        lastKvIntelligenceAnalyzed: runtime.lastKvIntelligenceAnalyzed || 0,
+        lastLivePositionGuard: runtime.lastLivePositionGuard || 0,
+        lastLivePositionGuardChecked: runtime.lastLivePositionGuardChecked || 0,
+        lastLivePositionGuardExited: runtime.lastLivePositionGuardExited || 0,
+        lastLivePositionGuardWarning: runtime.lastLivePositionGuardWarning || null
       })}`);
     } catch {}
   }
@@ -126,52 +86,48 @@ async function loadHistory(env: GeminiEnv, chatId: string): Promise<Array<{ role
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw) as Array<{ role?: string; text?: unknown }>;
-    return parsed.filter(item => (item.role === "user" || item.role === "model") && typeof item.text === "string").map(item => ({ role: item.role as "user" | "model", text: trimText(item.text, 2000) })).slice(-MAX_HISTORY_MESSAGES);
+    return parsed
+      .filter(item => (item.role === "user" || item.role === "model") && typeof item.text === "string")
+      .map(item => ({ role: item.role as "user" | "model", text: trimText(item.text, 2000) }))
+      .slice(-MAX_HISTORY_MESSAGES);
   } catch {
     return [];
   }
 }
 
 async function saveHistory(env: GeminiEnv, chatId: string, history: Array<{ role: "user" | "model"; text: string }>): Promise<void> {
-  await env.CIEL_STATE.put(`${CHAT_HISTORY_PREFIX}${chatId}`, JSON.stringify(history.slice(-MAX_HISTORY_MESSAGES)), { expirationTtl: CHAT_HISTORY_TTL_SECONDS });
+  await env.CIEL_STATE.put(
+    `${CHAT_HISTORY_PREFIX}${chatId}`,
+    JSON.stringify(history.slice(-MAX_HISTORY_MESSAGES)),
+    { expirationTtl: CHAT_HISTORY_TTL_SECONDS }
+  );
 }
 
-function keySlots(env: GeminiEnv): string[] {
-  return [1, 2, 3, 4, 5, 6, 7]
-    .map(index => String(env[`GEMINI_API_KEY_${index}`] || "").trim())
-    .filter(Boolean);
-}
-
-async function answerWithGemini(env: GeminiEnv, history: Array<{ role: "user" | "model"; text: string }>, userText: string): Promise<string> {
-  const keys = keySlots(env);
-  if (!keys.length) throw new Error("No Gemini API key is configured");
+async function answerWithGemini(
+  env: GeminiEnv,
+  history: Array<{ role: "user" | "model"; text: string }>,
+  userText: string
+): Promise<string> {
+  const key = String(env[`GEMINI_API_KEY_${CHAT_KEY_INDEX}`] || "").trim();
+  if (!key) throw new Error(`GEMINI_API_KEY_${CHAT_KEY_INDEX} is not configured for Telegram chat`);
 
   const context = await contextForChat(env);
   const prompt = [
     "You are Ciel, a crypto market intelligence assistant running on Nad.fun.",
     "Answer the user's Telegram question directly and naturally.",
     "Use the supplied live Ciel context when it is relevant. Never invent live prices, trades, balances, transactions, or decisions.",
-    "You may explain Ciel's current state, market observations, model decisions, risk settings, or recent telemetry.",
+    "You may explain Ciel's current state, market observations, model decisions, risk settings, positions, exits, or recent telemetry.",
     "Make clear when data is unavailable or stale. Keep responses under 3500 characters.",
     `LIVE CIEL CONTEXT:\n${context}`,
     `RECENT CHAT:\n${history.map(item => `${item.role === "user" ? "User" : "Ciel"}: ${item.text}`).join("\n") || "(none)"}`,
     `CURRENT USER MESSAGE:\n${userText}`
   ].join("\n\n");
 
-  let lastError: unknown = null;
-  for (const key of keys) {
-    try {
-      const ai = new GoogleGenAI({ apiKey: key });
-      const response = await ai.models.generateContent({ model: env.GEMINI_MODEL, contents: prompt });
-      const text = trimText(response.text, 3500);
-      if (!text) throw new Error("Gemini returned an empty response");
-      return text;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error(String(lastError || "Gemini request failed"));
+  const ai = new GoogleGenAI({ apiKey: key });
+  const response = await ai.models.generateContent({ model: env.GEMINI_MODEL, contents: prompt });
+  const text = trimText(response.text, 3500);
+  if (!text) throw new Error("Gemini returned an empty response");
+  return text;
 }
 
 export async function handleTelegramWebhook(request: Request, env: GeminiEnv): Promise<Response> {
@@ -191,7 +147,7 @@ export async function handleTelegramWebhook(request: Request, env: GeminiEnv): P
   if (!text) return new Response("No text", { status: 200 });
 
   if (text === "/start" || text === "/help") {
-    await notifyTelegram(env, "🤖 Ciel Gemini chat is online. Ask me about the market feed, Ciel's decisions, trading state, positions, or what the bot has seen recently.");
+    await notifyTelegram(env, "🤖 Ciel Gemini chat is online. Ask me about the market feed, Ciel's decisions, trading state, positions, exits, or what the bot has seen recently.");
     return new Response("ok", { status: 200 });
   }
 
@@ -204,7 +160,11 @@ export async function handleTelegramWebhook(request: Request, env: GeminiEnv): P
   try {
     const history = await loadHistory(env, String(chatId));
     const reply = await answerWithGemini(env, history, text);
-    await saveHistory(env, String(chatId), [...history, { role: "user", text: trimText(text, 2000) }, { role: "model", text: reply }]);
+    await saveHistory(env, String(chatId), [
+      ...history,
+      { role: "user", text: trimText(text, 2000) },
+      { role: "model", text: reply }
+    ]);
     await notifyTelegram(env, reply);
   } catch (error) {
     await notifyTelegram(env, `⚠️ Gemini chat error: ${trimText(String(error), 900)}`);
