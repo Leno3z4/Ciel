@@ -1,92 +1,77 @@
 import { buildBaseline, buildPatternProfile, deviationScore, askGemini, type Snapshot } from "./model";
 import type { Env } from "./index";
 import { notifyTelegram } from "./telegram";
+import { getMarketState } from "./market_discovery";
 
-const RANKING_CACHE_KEY = "nadfun_market_ranking_cache";
-const MON_USD_KEY = "mon_usd";
-const HISTORY_PREFIX = "ciel_kv_history:";
+const HOT_STATE_KEY = "ciel_hot_intelligence_state";
 const PENDING_PREFIX = "ciel_kv_pending_signal:";
 const RUNTIME_KEY = "ciel_runtime_state";
 const MAX_HISTORY = 480;
 const MAX_MARKETS = 5;
-const KV_COOLDOWN_MS = 10 * 60 * 1000;
+const MIN_HISTORY_SAMPLES = 8;
 const MIN_MARKET_CAP_USD = 50_000;
 const MIN_LIQUIDITY_USD = 5_000;
+const KV_DECISION_COOLDOWN_MS = 30 * 60 * 1000;
+const GEMINI_GLOBAL_MIN_INTERVAL_MS = 15 * 60 * 1000;
+const GEMINI_KEY_COOLDOWN_MS = 30 * 60 * 1000;
+const RUNTIME_WRITE_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_PENDING_AGE_MS = 30 * 60 * 1000;
 const MAX_PENDING_SIGNALS_PER_FLUSH = 20;
 
+interface HotMarketState {
+  symbol: string;
+  snapshots: Snapshot[];
+  decisionCooldownUntil: number;
+  lastDecisionAt: number;
+}
+
+interface HotState {
+  version: 1;
+  updatedTsMs: number;
+  markets: Record<string, HotMarketState>;
+  geminiCursor: number;
+  geminiKeyCooldowns: Record<string, number>;
+  lastGeminiDecisionAt: number;
+}
+
+function emptyHotState(): HotState {
+  return {
+    version: 1,
+    updatedTsMs: 0,
+    markets: {},
+    geminiCursor: 0,
+    geminiKeyCooldowns: {},
+    lastGeminiDecisionAt: 0
+  };
+}
+
 function num(value: unknown): number {
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  if (typeof value !== "string") return 0;
-  const text = value.trim().replace(/[$,\s]/g, "");
-  const match = text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(K|M|B|T)?$/i);
-  if (match) {
-    const base = Number(match[1]);
-    const multipliers: Record<string, number> = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
-    const valueWithSuffix = base * (match[2] ? multipliers[match[2].toUpperCase()] : 1);
-    return Number.isFinite(valueWithSuffix) ? valueWithSuffix : 0;
-  }
-  const parsed = Number(text);
+  const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function objectValue(source: unknown, keys: string[]): unknown {
-  if (!source || typeof source !== "object") return null;
-  const object = source as Record<string, unknown>;
-  for (const key of keys) {
-    if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+async function readHotState(env: Env): Promise<HotState> {
+  const raw = await env.CIEL_STATE.get(HOT_STATE_KEY);
+  if (!raw) return emptyHotState();
+  try {
+    const parsed = JSON.parse(raw) as Partial<HotState>;
+    if (!parsed || typeof parsed !== "object" || !parsed.markets || typeof parsed.markets !== "object") return emptyHotState();
+    return {
+      version: 1,
+      updatedTsMs: num(parsed.updatedTsMs),
+      markets: parsed.markets as Record<string, HotMarketState>,
+      geminiCursor: Math.max(0, Math.floor(num(parsed.geminiCursor))),
+      geminiKeyCooldowns: parsed.geminiKeyCooldowns || {},
+      lastGeminiDecisionAt: num(parsed.lastGeminiDecisionAt)
+    };
+  } catch {
+    return emptyHotState();
   }
-  return null;
 }
 
-function extractTokens(value: unknown, depth = 0): Array<Record<string, unknown>> {
-  if (depth > 6 || value == null) return [];
-  if (Array.isArray(value)) return value.filter(x => x && typeof x === "object") as Array<Record<string, unknown>>;
-  if (typeof value !== "object") return [];
-  const object = value as Record<string, unknown>;
-  for (const key of ["tokens", "data", "result", "items", "markets"]) {
-    const found = extractTokens(object[key], depth + 1);
-    if (found.length) return found;
-  }
-  return [];
-}
-
-function tokenAddress(item: Record<string, unknown>): string | null {
-  const value = objectValue(item.token_info, ["token_id", "token_address", "tokenAddress"]) ||
-    objectValue(item.market_info, ["token_id", "token_address", "tokenAddress"]);
-  const text = typeof value === "string" ? value.trim() : "";
-  return /^0x[a-fA-F0-9]{40}$/.test(text) ? text : null;
-}
-
-function tokenSymbol(item: Record<string, unknown>): string {
-  const value = objectValue(item.token_info, ["symbol"]);
-  return typeof value === "string" && value.trim() ? value.trim() : (tokenAddress(item)?.slice(0, 10) || "unknown");
-}
-
-function marketCap(item: Record<string, unknown>): number {
-  return num(objectValue(item.market_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"])) ||
-    num(objectValue(item.token_info, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"]));
-}
-
-function priceUsd(item: Record<string, unknown>): number {
-  return num(objectValue(item.market_info, ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"])) ||
-    num(objectValue(item.token_info, ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]));
-}
-
-function liquidityUsd(item: Record<string, unknown>, monUsd: number): number {
-  const direct = num(objectValue(item.market_info, ["liquidity_usd", "liquidityUsd"])) ||
-    num(objectValue(item.token_info, ["liquidity_usd", "liquidityUsd"]));
-  if (direct > 0) return direct;
-  const reserve = num(objectValue(item.market_info, ["reserve_native"])) || num(objectValue(item.token_info, ["reserve_native"]));
-  return reserve > 0 && monUsd > 0 ? reserve / 1e18 * monUsd : 0;
-}
-
-function volume5mUsd(item: Record<string, unknown>, monUsd: number): number {
-  const direct = num(objectValue(item.market_info, ["volume_5m_usd", "volume5mUsd", "volume_usd_5m"])) ||
-    num(objectValue(item.token_info, ["volume_5m_usd", "volume5mUsd", "volume_usd_5m"]));
-  if (direct > 0) return direct;
-  const raw = num(objectValue(item.market_info, ["volume_5m", "volume5m", "volume"]));
-  return raw > 0 && monUsd > 0 ? (raw >= 1e15 ? raw / 1e18 * monUsd : raw * monUsd) : 0;
+async function writeHotState(env: Env, state: HotState): Promise<void> {
+  state.updatedTsMs = Date.now();
+  await env.CIEL_STATE.put(HOT_STATE_KEY, JSON.stringify(state), { expirationTtl: 172800 });
 }
 
 async function readRuntime(env: Env): Promise<Record<string, unknown>> {
@@ -95,73 +80,154 @@ async function readRuntime(env: Env): Promise<Record<string, unknown>> {
   try { return JSON.parse(raw) as Record<string, unknown>; } catch { return {}; }
 }
 
-async function writeRuntime(env: Env, patch: Record<string, unknown>): Promise<void> {
+async function writeRuntimeThrottled(env: Env, patch: Record<string, unknown>, force = false): Promise<void> {
   const current = await readRuntime(env);
-  await env.CIEL_STATE.put(RUNTIME_KEY, JSON.stringify({ ...current, ...patch }));
+  const last = num(current.lastKvRuntimeWrite || 0);
+  if (!force && last > 0 && Date.now() - last < RUNTIME_WRITE_INTERVAL_MS) return;
+  await env.CIEL_STATE.put(RUNTIME_KEY, JSON.stringify({ ...current, ...patch, lastKvRuntimeWrite: Date.now() }), { expirationTtl: 172800 });
 }
 
-async function readFeed(env: Env): Promise<Array<Record<string, unknown>>> {
-  const raw = await env.CIEL_STATE.get(RANKING_CACHE_KEY);
-  if (!raw) return [];
-  try { return extractTokens(JSON.parse(raw)); } catch { return []; }
+function tokenAddress(item: Record<string, unknown>): string | null {
+  const tokenInfo = item.token_info;
+  const marketInfo = item.market_info;
+  const values = [
+    tokenInfo && typeof tokenInfo === "object" ? (tokenInfo as Record<string, unknown>).token_id : null,
+    marketInfo && typeof marketInfo === "object" ? (marketInfo as Record<string, unknown>).token_id : null
+  ];
+  for (const value of values) {
+    if (typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value.trim())) return value.trim();
+  }
+  return null;
 }
 
-async function appendHistory(env: Env, snapshot: Snapshot): Promise<Snapshot[]> {
-  const key = `${HISTORY_PREFIX}${snapshot.token.toLowerCase()}`;
-  const raw = await env.CIEL_STATE.get(key);
-  let history: Snapshot[] = [];
-  try { history = raw ? JSON.parse(raw) as Snapshot[] : []; } catch {}
-  history = history.filter(row => Number(row.tsMs) > 0 && Number(row.marketCapUsd) > 0);
-  history.push(snapshot);
-  history = history.sort((a, b) => Number(b.tsMs) - Number(a.tsMs)).slice(0, MAX_HISTORY);
-  await env.CIEL_STATE.put(key, JSON.stringify(history), { expirationTtl: 691200 });
-  return history;
+function tokenSymbol(item: Record<string, unknown>): string {
+  const tokenInfo = item.token_info;
+  const value = tokenInfo && typeof tokenInfo === "object" ? (tokenInfo as Record<string, unknown>).symbol : null;
+  return typeof value === "string" && value.trim() ? value.trim() : tokenAddress(item)?.slice(0, 10) || "unknown";
 }
 
-async function runKvDecision(env: Env, token: string, item: Record<string, unknown>, history: Snapshot[]): Promise<void> {
-  if (history.length < 4) return;
-  const current = history[0];
-  const baseline = buildBaseline(history);
+function numberFrom(item: Record<string, unknown>, keys: string[]): number {
+  const sources = [item.market_info, item.token_info, item];
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const object = source as Record<string, unknown>;
+    for (const key of keys) {
+      const value = num(object[key]);
+      if (value > 0) return value;
+    }
+  }
+  return 0;
+}
+
+function marketCap(item: Record<string, unknown>): number {
+  return numberFrom(item, ["market_cap_usd", "marketCapUsd", "market_cap", "marketCap", "fdv", "fully_diluted_valuation"]);
+}
+
+function priceUsd(item: Record<string, unknown>): number {
+  return numberFrom(item, ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]);
+}
+
+function liquidityUsd(item: Record<string, unknown>): number {
+  return numberFrom(item, ["liquidity_usd", "liquidityUsd"]);
+}
+
+function volume5mUsd(item: Record<string, unknown>): number {
+  return numberFrom(item, ["volume_5m_usd", "volume5mUsd", "volume_usd_5m", "volume_5m", "volume5m", "volume"]);
+}
+
+function snapshotFor(item: Record<string, unknown>, token: string, now: number): Snapshot {
+  return {
+    token,
+    tsMs: now,
+    priceUsd: priceUsd(item),
+    marketCapUsd: marketCap(item),
+    liquidityUsd: liquidityUsd(item),
+    volume5mUsd: volume5mUsd(item),
+    buys5m: 0,
+    sells5m: 0,
+    holders: numberFrom(item, ["holder_count", "holderCount", "holders"])
+  };
+}
+
+function meaningfulTrigger(history: Snapshot[]): boolean {
+  if (history.length < MIN_HISTORY_SAMPLES) return false;
   const pattern = buildPatternProfile(history);
-  const score = deviationScore(current, baseline);
+  const behavior = pattern.priceBehavior;
+  const improving = pattern.currentMarketCapReturn30mPct >= 2 && pattern.volumeVsBaseline >= 1.15;
+  const enteringLow = behavior.currentZone === "LOW" && pattern.currentMarketCapReturn30mPct >= -5;
+  const strongTrend = pattern.currentMarketCapReturn30mPct >= 8 && pattern.volumeVsBaseline >= 1.25;
+  return (enteringLow && improving) || strongTrend;
+}
+
+async function runKvDecision(env: Env, state: HotState, token: string, item: Record<string, unknown>, history: Snapshot[]): Promise<boolean> {
+  if (!meaningfulTrigger(history)) return false;
+  const key = token.toLowerCase();
+  const market = state.markets[key];
+  if (market && market.decisionCooldownUntil > Date.now()) return false;
+  if (state.lastGeminiDecisionAt > 0 && Date.now() - state.lastGeminiDecisionAt < GEMINI_GLOBAL_MIN_INTERVAL_MS) return false;
+
   const keys = [
     env.GEMINI_API_KEY_1, env.GEMINI_API_KEY_2, env.GEMINI_API_KEY_3,
     env.GEMINI_API_KEY_4, env.GEMINI_API_KEY_5, env.GEMINI_API_KEY_6,
     env.GEMINI_API_KEY_7
   ].map(value => (value || "").trim()).filter(Boolean);
-  if (!keys.length) return;
+  if (!keys.length) return false;
 
-  const cooldownKey = `ciel_kv_decision_cooldown:${token.toLowerCase()}`;
-  const last = Number(await env.CIEL_STATE.get(cooldownKey) || "0");
-  if (last > 0 && Date.now() - last < KV_COOLDOWN_MS) return;
-
+  const baseline = buildBaseline(history);
+  const pattern = buildPatternProfile(history);
+  const score = deviationScore(history[0], baseline);
+  const cursor = state.geminiCursor % keys.length;
   let decision = null;
   let lastError: unknown = null;
-  for (const key of keys) {
+  let usedSlot = -1;
+
+  for (let offset = 0; offset < keys.length; offset++) {
+    const index = (cursor + offset) % keys.length;
+    const cooldownUntil = num(state.geminiKeyCooldowns[String(index + 1)] || 0);
+    if (cooldownUntil > Date.now()) continue;
     try {
-      decision = await askGemini(key, env.GEMINI_MODEL, "market", current, baseline, score, pattern);
-      if (decision) break;
+      decision = await askGemini(keys[index], env.GEMINI_MODEL, "market", history[0], baseline, score, pattern);
+      usedSlot = index + 1;
+      break;
     } catch (error) {
       lastError = error;
+      if (/429|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(String(error))) {
+        state.geminiKeyCooldowns[String(index + 1)] = Date.now() + GEMINI_KEY_COOLDOWN_MS;
+        continue;
+      }
+      break;
     }
   }
-  if (!decision) {
-    await writeRuntime(env, { lastGeminiError: `KV decision failed: ${String(lastError || "unknown error").slice(0, 700)}` });
-    return;
+
+  if (!decision || usedSlot < 0) {
+    if (lastError) await writeRuntimeThrottled(env, { lastGeminiError: `KV decision failed: ${String(lastError).slice(0, 700)}` }, true);
+    return false;
   }
 
-  await env.CIEL_STATE.put(cooldownKey, String(Date.now()), { expirationTtl: 3600 });
-  await writeRuntime(env, {
-    lastGeminiSuccess: Date.now(),
-    lastModelAnalyzed: Date.now(),
+  const decisionAt = Date.now();
+  state.geminiCursor = usedSlot % keys.length;
+  state.lastGeminiDecisionAt = decisionAt;
+  state.markets[key] = {
+    symbol: tokenSymbol(item),
+    snapshots: history,
+    decisionCooldownUntil: decisionAt + KV_DECISION_COOLDOWN_MS,
+    lastDecisionAt: decisionAt
+  };
+
+  await env.CIEL_STATE.put("ciel_gemini_last_global_call_ms", String(decisionAt), { expirationTtl: 172800 });
+  await writeRuntimeThrottled(env, {
+    lastGeminiSuccess: decisionAt,
+    lastGeminiKeyUsed: usedSlot,
+    lastGeminiFallbacks: Math.max(0, usedSlot - cursor - 1),
+    lastModelAnalyzed: decisionAt,
     lastModelDecisionCandidate: token,
     lastModelDecisionAction: decision.action === "HOLD" || decision.action === "IGNORE" ? "WAIT" : decision.action,
     lastModelDecisionConfidence: decision.confidence,
     lastModelError: undefined,
     kvModelActive: true
-  });
+  }, true);
 
-  if (decision.action !== "BUY" && decision.action !== "SELL") return;
+  if (decision.action !== "BUY" && decision.action !== "SELL") return true;
 
   const pending = {
     token,
@@ -172,56 +238,59 @@ async function runKvDecision(env: Env, token: string, item: Record<string, unkno
     expectedHighUsd: decision.expectedHighUsd,
     anomalyScore: decision.anomalyScore,
     regime: decision.regime,
-    marketCapUsd: current.marketCapUsd,
-    liquidityUsd: current.liquidityUsd,
-    createdTsMs: Date.now(),
+    marketCapUsd: history[0].marketCapUsd,
+    liquidityUsd: history[0].liquidityUsd,
+    createdTsMs: decisionAt,
     status: "PENDING_D1"
   };
-
-  await env.CIEL_STATE.put(
-    `${PENDING_PREFIX}${token.toLowerCase()}`,
-    JSON.stringify(pending),
-    { expirationTtl: 86400 }
-  );
-
-  await notifyTelegram(
-    env,
-    `${decision.action === "BUY" ? "🟢" : "🔴"} CIEL KV ${decision.action} SIGNAL\n${tokenSymbol(item)} (${token.slice(0, 10)}…)\nConfidence: ${(decision.confidence * 100).toFixed(0)}%\nRegime: ${decision.regime}\nStatus: queued for D1 execution ledger\nReason: ${decision.rationale}`
-  );
+  await env.CIEL_STATE.put(`${PENDING_PREFIX}${key}`, JSON.stringify(pending), { expirationTtl: 86400 });
+  await notifyTelegram(env, `${decision.action === "BUY" ? "🟢" : "🔴"} CIEL KV ${decision.action} SIGNAL\n${tokenSymbol(item)} (${token.slice(0, 10)}…)\nConfidence: ${(decision.confidence * 100).toFixed(0)}%\nRegime: ${decision.regime}\nStatus: queued for D1 execution ledger\nReason: ${decision.rationale}`);
+  return true;
 }
 
 export async function runKvIntelligenceCycle(env: Env): Promise<void> {
-  const feed = await readFeed(env);
-  const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
-  const candidates = feed
-    .map(item => ({ item, token: tokenAddress(item), marketCap: marketCap(item), liquidity: liquidityUsd(item, monUsd) }))
+  const marketState = await getMarketState(env);
+  if (!marketState || !marketState.tokens.length) return;
+
+  const state = await readHotState(env);
+  const now = Date.now();
+  const candidates = marketState.tokens
+    .map(item => ({ item, token: tokenAddress(item), marketCap: marketCap(item), liquidity: liquidityUsd(item) }))
     .filter(row => row.token && row.marketCap >= MIN_MARKET_CAP_USD && row.liquidity >= MIN_LIQUIDITY_USD)
     .sort((a, b) => b.marketCap - a.marketCap)
     .slice(0, MAX_MARKETS);
 
   let analyzed = 0;
+  let geminiTriggered = false;
   for (const row of candidates) {
     if (!row.token) continue;
-    const snapshot: Snapshot = {
-      token: row.token,
-      tsMs: Date.now(),
-      priceUsd: priceUsd(row.item),
-      marketCapUsd: row.marketCap,
-      liquidityUsd: row.liquidity,
-      volume5mUsd: volume5mUsd(row.item, monUsd),
-      buys5m: 0,
-      sells5m: 0,
-      holders: num(objectValue(row.item.token_info, ["holder_count", "holderCount", "holders"]))
+    const key = row.token.toLowerCase();
+    const previous = state.markets[key]?.snapshots || [];
+    const snapshot = snapshotFor(row.item, row.token, now);
+    const history = [snapshot, ...previous].sort((a, b) => b.tsMs - a.tsMs).slice(0, MAX_HISTORY);
+    state.markets[key] = {
+      symbol: tokenSymbol(row.item),
+      snapshots: history,
+      decisionCooldownUntil: state.markets[key]?.decisionCooldownUntil || 0,
+      lastDecisionAt: state.markets[key]?.lastDecisionAt || 0
     };
-    const history = await appendHistory(env, snapshot);
-    await runKvDecision(env, row.token, row.item, history);
     analyzed++;
+
+    if (!geminiTriggered) geminiTriggered = await runKvDecision(env, state, row.token, row.item, history);
   }
 
-  await writeRuntime(env, {
-    lastKvIntelligenceRun: Date.now(),
+  const cutoff = now - 26 * 60 * 60 * 1000;
+  for (const [token, market] of Object.entries(state.markets)) {
+    const newest = Math.max(...(market.snapshots || []).map(row => row.tsMs), 0);
+    if (newest < cutoff) delete state.markets[token];
+  }
+
+  await writeHotState(env, state);
+  await writeRuntimeThrottled(env, {
+    lastKvIntelligenceRun: now,
     lastKvIntelligenceAnalyzed: analyzed,
-    lastKvIntelligenceCandidates: candidates.length
+    lastKvIntelligenceCandidates: candidates.length,
+    kvModelActive: analyzed > 0
   });
 }
 
@@ -229,125 +298,64 @@ export async function flushPendingKvSignals(env: Env): Promise<void> {
   const pendingList = await env.CIEL_STATE.list({ prefix: PENDING_PREFIX, limit: MAX_PENDING_SIGNALS_PER_FLUSH });
   if (!pendingList.keys.length) return;
 
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS live_positions (
-      token_address TEXT PRIMARY KEY,
-      quantity TEXT NOT NULL,
-      entry_price_usd REAL,
-      entry_ts_ms INTEGER,
-      last_price_usd REAL,
-      updated_ts_ms INTEGER NOT NULL
-    )
-  `).run();
-
-  const feed = await readFeed(env);
-  const monUsd = Number(await env.CIEL_STATE.get(MON_USD_KEY) || "0");
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS live_positions (token_address TEXT PRIMARY KEY, quantity TEXT NOT NULL, entry_price_usd REAL, entry_ts_ms INTEGER, last_price_usd REAL, updated_ts_ms INTEGER NOT NULL)`).run();
+  const marketState = await getMarketState(env);
   const feedByToken = new Map<string, Record<string, unknown>>();
-
-  for (const item of feed) {
+  for (const item of marketState?.tokens || []) {
     const token = tokenAddress(item);
     if (token) feedByToken.set(token.toLowerCase(), item);
   }
 
   let queued = 0;
   let discarded = 0;
-
   for (const key of pendingList.keys) {
     const token = key.name.slice(PENDING_PREFIX.length).toLowerCase();
     const raw = await env.CIEL_STATE.get(key.name);
     if (!raw) continue;
-
     let pending: Record<string, unknown>;
-    try {
-      pending = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      await env.CIEL_STATE.delete(key.name);
-      discarded++;
-      continue;
-    }
-
-    const createdTsMs = Number(pending.createdTsMs || 0);
+    try { pending = JSON.parse(raw) as Record<string, unknown>; } catch { await env.CIEL_STATE.delete(key.name); discarded++; continue; }
+    const createdTsMs = num(pending.createdTsMs);
     const action = String(pending.action || "").toUpperCase();
-    const confidence = Number(pending.confidence || 0);
+    const confidence = num(pending.confidence);
     const item = feedByToken.get(token);
 
-    if (
-      !createdTsMs ||
-      Date.now() - createdTsMs > MAX_PENDING_AGE_MS ||
-      !item ||
-      !["BUY", "SELL"].includes(action) ||
-      !Number.isFinite(confidence) ||
-      confidence < 0.48
-    ) {
+    if (!createdTsMs || Date.now() - createdTsMs > MAX_PENDING_AGE_MS || !item || !["BUY", "SELL"].includes(action) || confidence < 0.48) {
       await env.CIEL_STATE.delete(key.name);
       discarded++;
       continue;
     }
 
     const currentMarketCap = marketCap(item);
-    const currentLiquidity = liquidityUsd(item, monUsd);
+    const currentLiquidity = liquidityUsd(item);
     const currentPrice = priceUsd(item);
-
-    if (
-      currentMarketCap < MIN_MARKET_CAP_USD ||
-      currentLiquidity < MIN_LIQUIDITY_USD ||
-      currentPrice <= 0
-    ) {
+    if (currentMarketCap < MIN_MARKET_CAP_USD || currentLiquidity < MIN_LIQUIDITY_USD || currentPrice <= 0) {
       await env.CIEL_STATE.delete(key.name);
       discarded++;
       continue;
     }
 
-    const position = await env.DB
-      .prepare("SELECT quantity FROM live_positions WHERE token_address=? AND quantity<>'0'")
-      .bind(token)
-      .first<{ quantity: string }>();
-
+    const position = await env.DB.prepare("SELECT quantity FROM live_positions WHERE token_address=? AND quantity<>'0'").bind(token).first<{ quantity: string }>();
     if ((action === "BUY" && position) || (action === "SELL" && !position)) {
       await env.CIEL_STATE.delete(key.name);
       discarded++;
       continue;
     }
 
-    const recentDuplicate = await env.DB
-      .prepare(`
-        SELECT id
-        FROM signals
-        WHERE token_address=?
-          AND action=?
-          AND ts_ms>=?
-        ORDER BY ts_ms DESC
-        LIMIT 1
-      `)
-      .bind(token, action, Date.now() - 30 * 60 * 1000)
-      .first<{ id: number }>();
-
+    const recentDuplicate = await env.DB.prepare(`SELECT id FROM signals WHERE token_address=? AND action=? AND ts_ms>=? ORDER BY ts_ms DESC LIMIT 1`).bind(token, action, Date.now() - 30 * 60 * 1000).first<{ id: number }>();
     if (recentDuplicate) {
       await env.CIEL_STATE.delete(key.name);
       discarded++;
       continue;
     }
 
-    await env.DB.prepare(`
-      INSERT INTO signals(
-        token_address,
-        ts_ms,
-        action,
-        confidence,
-        expected_low,
-        expected_high,
-        anomaly_score,
-        model,
-        rationale
-      ) VALUES(?,?,?,?,?,?,?,?,?)
-    `).bind(
+    await env.DB.prepare(`INSERT INTO signals(token_address, ts_ms, action, confidence, expected_low, expected_high, anomaly_score, model, rationale) VALUES(?,?,?,?,?,?,?,?,?)`).bind(
       token,
       Date.now(),
       action,
       confidence,
-      Number(pending.expectedLowUsd || 0),
-      Number(pending.expectedHighUsd || 0),
-      Number(pending.anomalyScore || 0),
+      num(pending.expectedLowUsd),
+      num(pending.expectedHighUsd),
+      num(pending.anomalyScore),
       "gemini-kv-recovery",
       `${String(pending.regime || "UNKNOWN")}: ${String(pending.rationale || "KV signal recovered after D1 degradation")}`
     ).run();
@@ -356,16 +364,6 @@ export async function flushPendingKvSignals(env: Env): Promise<void> {
     queued++;
   }
 
-  await writeRuntime(env, {
-    lastKvPendingFlush: Date.now(),
-    lastKvPendingQueued: queued,
-    lastKvPendingDiscarded: discarded
-  });
-
-  if (queued > 0 || discarded > 0) {
-    await notifyTelegram(
-      env,
-      `🔄 CIEL KV SIGNAL RECOVERY\nQueued for live ledger: ${queued}\nDiscarded stale/invalid: ${discarded}\nD1 execution path is active again.`
-    );
-  }
+  await writeRuntimeThrottled(env, { lastKvPendingFlush: Date.now(), lastKvPendingQueued: queued, lastKvPendingDiscarded: discarded }, true);
+  if (queued > 0 || discarded > 0) await notifyTelegram(env, `🔄 CIEL KV SIGNAL RECOVERY\nQueued for live ledger: ${queued}\nDiscarded stale/invalid: ${discarded}\nD1 execution path is active again.`);
 }
