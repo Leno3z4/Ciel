@@ -28,7 +28,7 @@ const MIN_HISTORY_SAMPLES = 12;
 const MIN_HISTORY_SPAN_MS = 30 * 60 * 1000;
 const MIN_AVG_VOLUME_5M_USD = 5_000;
 const MIN_AVG_LIQUIDITY_USD = 10_000;
-const MAX_CANDIDATES = 10;
+const MAX_CANDIDATES = 3;
 const MAX_DECISIONS_PER_CYCLE = 3;
 const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
 const MODEL_KEY_COOLDOWN_MS = 60 * 1000;
@@ -142,19 +142,14 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
       AVG(market_cap_usd) as avgMarketCap
     FROM market_snapshots ms
     WHERE ms.price_usd>0
-      AND ms.ts_ms >= (
-        SELECT ts_ms
-        FROM market_snapshots
-        WHERE token_address=ms.token_address AND price_usd>0
-        ORDER BY ts_ms DESC
-        LIMIT 1 OFFSET 11
-      )
+      AND ms.ts_ms >= ?
     GROUP BY ms.token_address
     HAVING COUNT(*)>=?
       AND (MAX(ms.ts_ms)-MIN(ms.ts_ms))>=?
       AND AVG(ms.market_cap_usd)>=?
     ORDER BY AVG(ms.market_cap_usd) DESC
     LIMIT ?`).bind(
+    Date.now() - 2 * 60 * 60 * 1000,
     MIN_HISTORY_SAMPLES,
     MIN_HISTORY_SPAN_MS,
     MIN_MARKET_CAP_USD,
@@ -292,7 +287,7 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
         holders
       FROM market_snapshots
       WHERE token_address=? AND price_usd>0
-      ORDER BY ts_ms DESC LIMIT 50`).bind(candidate.token).all<Snapshot>();
+      ORDER BY ts_ms DESC LIMIT 12`).bind(candidate.token).all<Snapshot>();
     const history = historyResult.results || [];
     if (history.length < MIN_HISTORY_SAMPLES) continue;
     const current = history[0];
