@@ -8,7 +8,7 @@ const CHAT_HISTORY_TTL_SECONDS = 24 * 60 * 60;
 const MAX_HISTORY_MESSAGES = 10;
 const RUNTIME_KEY = "ciel_runtime_state";
 const HOT_STATE_KEY = "ciel_hot_intelligence_state";
-const CHAT_KEY_INDEX = 7;
+const CHAT_KEY_INDEX = 1;
 
 function trimText(value: unknown, max = 1200): string {
   const text = typeof value === "string" ? value.trim() : "";
