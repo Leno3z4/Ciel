@@ -97,6 +97,144 @@ function numberFromItem(item: Record<string, unknown>, keys: string[]): number {
   return 0;
 }
 
+function tokenAddressFromItem(item: Record<string, unknown>): string | null {
+  const sources = [item.token_info, item.market_info, item];
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const object = source as Record<string, unknown>;
+    for (const key of ["token_id", "token_address", "tokenAddress", "address", "mint", "id"]) {
+      const value = object[key];
+      if (typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value.trim())) return value.trim().toLowerCase();
+    }
+  }
+  return null;
+}
+
+async function enrichLiveStatus(
+  env: Parameters<typeof worker.fetch>[1],
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const livePortfolio: Record<string, unknown> = {
+    openPositionCount: 0,
+    positions: [],
+    lastLiveTrade: null,
+    recentTrades: [],
+    sellCanRealizeProfit: false
+  };
+
+  const lastTradeRaw = await env.CIEL_STATE.get("ciel_last_live_trade");
+  if (lastTradeRaw) {
+    try {
+      livePortfolio.lastLiveTrade = JSON.parse(lastTradeRaw);
+    } catch {}
+  }
+
+  try {
+    const feed = await getMarketState(env);
+    const prices = new Map<string, number>();
+    for (const item of feed?.tokens || []) {
+      const token = tokenAddressFromItem(item);
+      const price = numberFromItem(item, ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]);
+      if (token && price > 0) prices.set(token, price);
+    }
+
+    const positionRows = await env.DB
+      .prepare(`
+        SELECT
+          token_address,
+          quantity,
+          entry_price_usd,
+          entry_ts_ms,
+          last_price_usd,
+          updated_ts_ms
+        FROM live_positions
+        WHERE quantity <> '0'
+        ORDER BY updated_ts_ms DESC
+      `)
+      .all<{
+        token_address: string;
+        quantity: string;
+        entry_price_usd: number;
+        entry_ts_ms: number;
+        last_price_usd: number;
+        updated_ts_ms: number;
+      }>();
+
+    const positions = (positionRows.results || []).map((position) => {
+      const quantity = Number(position.quantity || 0);
+      const entryPriceUsd = Number(position.entry_price_usd || 0);
+      const currentPriceUsd =
+        prices.get(position.token_address.toLowerCase()) ||
+        Number(position.last_price_usd || 0);
+      const marketValueUsd =
+        currentPriceUsd > 0 ? quantity * currentPriceUsd : 0;
+      const costUsd =
+        entryPriceUsd > 0 ? quantity * entryPriceUsd : 0;
+      const unrealizedPnlUsd =
+        marketValueUsd > 0 && costUsd > 0
+          ? marketValueUsd - costUsd
+          : 0;
+      const unrealizedPnlPct =
+        costUsd > 0
+          ? (unrealizedPnlUsd / costUsd) * 100
+          : 0;
+
+      return {
+        token: position.token_address,
+        quantity: position.quantity,
+        entryPriceUsd,
+        currentPriceUsd,
+        costUsd,
+        marketValueUsd,
+        unrealizedPnlUsd,
+        unrealizedPnlPct,
+        entryTsMs: position.entry_ts_ms,
+        updatedTsMs: position.updated_ts_ms
+      };
+    });
+
+    livePortfolio.openPositionCount = positions.length;
+    livePortfolio.positions = positions;
+    livePortfolio.sellCanRealizeProfit = positions.some(position => Number(position.unrealizedPnlUsd) > 0);
+
+    const recentTrades = await env.DB
+      .prepare(`
+        SELECT
+          token_address,
+          ts_ms,
+          side,
+          quantity,
+          price_usd,
+          tx_hash,
+          status
+        FROM trades
+        WHERE mode='live'
+          AND status='CONFIRMED'
+          AND side IN ('BUY','SELL')
+        ORDER BY ts_ms DESC
+        LIMIT 10
+      `)
+      .all<{
+        token_address: string;
+        ts_ms: number;
+        side: string;
+        quantity: string | null;
+        price_usd: number | null;
+        tx_hash: string | null;
+        status: string;
+      }>();
+
+    livePortfolio.recentTrades = recentTrades.results || [];
+  } catch (error) {
+    livePortfolio.diagnostics = `Live portfolio reporting unavailable: ${String(error).slice(0, 500)}`;
+  }
+
+  return {
+    ...payload,
+    livePortfolio
+  };
+}
+
 async function maybeBootstrapBuy(env: Parameters<typeof worker.fetch>[1]): Promise<void> {
   if (env.TRADING_ENABLED !== "true") return;
   if (await env.CIEL_STATE.get(BOOTSTRAP_BUY_KEY) === "done") return;
@@ -197,7 +335,8 @@ export default {
       if (!response.ok) return response;
       try {
         const payload = await response.json() as Record<string, unknown>;
-        return new Response(JSON.stringify(sanitizeStatus(payload, d1)), {
+        const enriched = await enrichLiveStatus(env, payload);
+        return new Response(JSON.stringify(sanitizeStatus(enriched, d1)), {
           status: response.status,
           headers: { "content-type": "application/json" }
         });

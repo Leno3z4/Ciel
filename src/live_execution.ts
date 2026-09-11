@@ -27,6 +27,7 @@ import {
 } from "./live_position_guard";
 
 import type { Env } from "./index";
+import { notifyTelegram } from "./telegram";
 
 
 type LiveEnv = Env & {
@@ -904,6 +905,40 @@ async function executeLiveBuy(
     }
   );
 
+  try {
+    await env.CIEL_STATE.put(
+      "ciel_last_live_trade",
+      JSON.stringify({
+        side: "BUY",
+        token,
+        quantity: tokenDelta.toString(),
+        priceUsd,
+        amountMon: tradeSizeMon,
+        tsMs: now,
+        txHash
+      })
+    );
+  } catch (error) {
+    console.error(`Failed to persist last live BUY reporting state: ${String(error).slice(0, 500)}`);
+  }
+
+  try {
+    await notifyTelegram(
+      env,
+      [
+        "🟢 CIEL LIVE BUY CONFIRMED",
+        `Token: ${token}`,
+        `Bought: ${tokenDelta.toString()} tokens`,
+        `Spent: ${tradeSizeMon.toFixed(4)} MON`,
+        `Entry: $${priceUsd.toPrecision(8)}`,
+        `Time: ${new Date(now).toISOString()}`,
+        `TX: ${txHash}`
+      ].join("\n")
+    );
+  } catch (error) {
+    console.error(`Failed to send live BUY Telegram report: ${String(error).slice(0, 500)}`);
+  }
+
   await consumeLiveSignal(
     env,
     signal.id
@@ -1130,6 +1165,43 @@ async function executeLiveSell(
   const now =
     Date.now();
 
+  const entryPriceUsd =
+    Number(position.entry_price_usd || 0);
+
+  const soldQuantity =
+    Number(amountIn) / 1e18;
+
+  const entryValueUsd =
+    entryPriceUsd > 0
+      ? soldQuantity * entryPriceUsd
+      : 0;
+
+  const exitValueUsd =
+    exitPriceUsd > 0
+      ? soldQuantity * exitPriceUsd
+      : 0;
+
+  const realizedPnlUsd =
+    entryValueUsd > 0 &&
+    exitValueUsd > 0
+      ? exitValueUsd - entryValueUsd
+      : 0;
+
+  const realizedPnlPct =
+    entryValueUsd > 0
+      ? (
+          realizedPnlUsd /
+          entryValueUsd
+        ) * 100
+      : 0;
+
+  const exitLabel =
+    realizedPnlUsd > 0
+      ? "🟢 PROFITABLE SELL"
+      : realizedPnlUsd < 0
+        ? "🔻 LOSS-CUT SELL"
+        : "⚪ FLAT SELL";
+
   await env.DB
     .prepare(`
       INSERT INTO trades(
@@ -1157,6 +1229,43 @@ async function executeLiveSell(
       `live:${signal.id}`
     )
     .run();
+
+  try {
+    await env.CIEL_STATE.put(
+      "ciel_last_live_trade",
+      JSON.stringify({
+        side: "SELL",
+        token,
+        quantity: amountIn.toString(),
+        entryPriceUsd,
+        exitPriceUsd,
+        realizedPnlUsd,
+        realizedPnlPct,
+        tsMs: now,
+        txHash
+      })
+    );
+  } catch (error) {
+    console.error(`Failed to persist last live SELL reporting state: ${String(error).slice(0, 500)}`);
+  }
+
+  try {
+    await notifyTelegram(
+      env,
+      [
+        exitLabel,
+        `Token: ${token}`,
+        `Sold: ${amountIn.toString()} tokens`,
+        `Entry: ${entryPriceUsd > 0 ? `$${entryPriceUsd.toPrecision(8)}` : "n/a"}`,
+        `Exit: ${exitPriceUsd > 0 ? `$${exitPriceUsd.toPrecision(8)}` : "n/a"}`,
+        `Realized PnL: ${realizedPnlUsd >= 0 ? "+" : ""}$${realizedPnlUsd.toFixed(4)} (${realizedPnlPct >= 0 ? "+" : ""}${realizedPnlPct.toFixed(2)}%)`,
+        `Time: ${new Date(now).toISOString()}`,
+        `TX: ${txHash}`
+      ].join("\n")
+    );
+  } catch (error) {
+    console.error(`Failed to send live SELL Telegram report: ${String(error).slice(0, 500)}`);
+  }
 
   await env.DB
     .prepare(`
