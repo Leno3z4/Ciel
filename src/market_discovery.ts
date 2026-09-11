@@ -5,10 +5,11 @@ const MARKET_STATE_KEY = "ciel_market_state";
 const LEGACY_CACHE_KEY = "nadfun_market_ranking_cache";
 const LEGACY_MON_USD_KEY = "mon_usd";
 const API_BASE = "https://api.nadapp.net";
-const DISCOVERY_REFRESH_MS = 10 * 60 * 1000;
+const DISCOVERY_REFRESH_MS = 2 * 60 * 1000;
 const MARKET_LIMIT = 50;
 const FALLBACK_TOKEN_LIMIT = 8;
 const NADFUN_TOTAL_SUPPLY = 1_000_000_000;
+const FEED_HEALTH_KEY = "ciel_market_feed_health";
 
 type TokenRecord = {
   token_info?: Record<string, unknown>;
@@ -292,13 +293,32 @@ async function save(env: Env, tokens: TokenRecord[], source: string): Promise<nu
 
   if (!normalized.length) return 0;
   await env.CIEL_STATE.put(MARKET_STATE_KEY, JSON.stringify(state), { expirationTtl: 3600 });
+  await env.CIEL_STATE.put(FEED_HEALTH_KEY, JSON.stringify({
+    ok: true,
+    source,
+    fetchedAt,
+    count: normalized.length,
+    validCount: ranked.length,
+    topMarketCapUsd: ranked[0]?.marketCapUsd || 0,
+    topSymbol: ranked[0]?.symbol || null,
+    monUsd,
+    diagnostics
+  }), { expirationTtl: 3600 });
   await sendMarketPulse(env, state);
   return normalized.length;
 }
 
 async function fetchFeed(url: string): Promise<TokenRecord[]> {
   try {
-    const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "Ciel-NadFun/2.0" }, cf: { cacheTtl: 600 } });
+    const cacheBuster = `ciel_ts=${Date.now()}`;
+    const liveUrl = `${url}${url.includes("?") ? "&" : "?"}${cacheBuster}`;
+    const response = await fetch(liveUrl, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Ciel-NadFun/2.0",
+        "Cache-Control": "no-cache, no-store, max-age=0"
+      }
+    });
     if (!response.ok) return [];
     return extractTokens(decode(await response.text()));
   } catch {
