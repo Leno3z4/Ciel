@@ -16,6 +16,7 @@ const D1_ERROR_KEY = "ciel_d1_degraded_error";
 const D1_RECOVERY_PROBE_KEY = "ciel_d1_recovery_probe_utc_date";
 const TELEGRAM_DECISION_ALERT_KEY = "ciel_telegram_last_decision_alert_ms";
 const FEED_HEALTH_KEY = "ciel_market_feed_health";
+const LIVE_MARKET_MAX_AGE_MS = 3 * 60 * 1000;
 
 function utcDateKey(now = Date.now()): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -72,21 +73,6 @@ async function ensureSnapshotQueryIndex(env: Env): Promise<boolean> {
   }
 }
 
-async function snapshotDiagnostics(env: Env): Promise<{ total: number; markets: Array<{ token: string; symbol: string | null; samples: number; ageMinutes: number }> }> {
-  if (await isD1Degraded(env)) return { total: 0, markets: [] };
-  try {
-    const total = await env.DB.prepare("SELECT COUNT(*) as count FROM market_snapshots").first<{ count: number }>();
-    const rows = await env.DB.prepare(`SELECT s.token_address as token, t.symbol as symbol, COUNT(*) as samples, (MAX(s.ts_ms)-MIN(s.ts_ms))/60000.0 as ageMinutes
-      FROM market_snapshots s LEFT JOIN tokens t ON lower(t.address)=lower(s.token_address)
-      WHERE s.price_usd>0 GROUP BY s.token_address, t.symbol ORDER BY COUNT(*) DESC LIMIT 10`).all<{ token: string; symbol: string | null; samples: number; ageMinutes: number }>();
-    await clearD1Degraded(env);
-    return { total: Number(total?.count || 0), markets: rows.results || [] };
-  } catch (error) {
-    await markD1Degraded(env, error);
-    return { total: 0, markets: [] };
-  }
-}
-
 async function readFeedHealth(env: Env): Promise<Record<string, unknown>> {
   const raw = await env.CIEL_STATE.get(FEED_HEALTH_KEY);
   if (!raw) return {};
@@ -123,11 +109,15 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
     payload.d1Degraded = await isD1Degraded(env);
     if (payload.d1Degraded) payload.d1DegradedError = await env.CIEL_STATE.get(D1_ERROR_KEY);
     const feedHealth = await readFeedHealth(env);
+    const feedAgeSeconds = feedHealth.fetchedAt
+      ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000))
+      : null;
     payload.kvMarketFeed = {
       ok: feedHealth.ok === true,
       source: feedHealth.source || null,
       fetchedAt: Number(feedHealth.fetchedAt || 0),
-      ageSeconds: feedHealth.fetchedAt ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000)) : null,
+      ageSeconds: feedAgeSeconds,
+      fresh: feedHealth.ok === true && feedAgeSeconds !== null && feedAgeSeconds <= LIVE_MARKET_MAX_AGE_MS / 1000,
       count: Number(feedHealth.count || 0),
       validCount: Number(feedHealth.validCount || 0),
       topMarketCapUsd: Number(feedHealth.topMarketCapUsd || 0),
@@ -135,16 +125,25 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       monUsd: Number(feedHealth.monUsd || 0) || null,
       diagnostics: feedHealth.diagnostics || null
     };
-    if (payload.d1Degraded) {
-      payload.lastIndexerDiscoveryCount = Number(feedHealth.count || 0);
-      payload.lastIndexerValidAddressCount = Number(feedHealth.validCount || 0);
-      payload.lastIndexerTopMarketCapUsd = Number(feedHealth.topMarketCapUsd || 0);
-      payload.lastIndexerTopMarketCapSymbol = feedHealth.topSymbol || null;
-      payload.lastIndexerSkipReason = "d1-degraded-kv-discovery-active";
+    const legacyGeminiAttempt = Number(runtime.lastGeminiAttempt || 0);
+    if (runtime.lastGeminiError && legacyGeminiAttempt > 0) {
+      payload.lastGeminiErrorAgeSeconds = Math.max(0, Math.floor((Date.now() - legacyGeminiAttempt) / 1000));
+      payload.lastGeminiErrorIsHistorical = Date.now() - legacyGeminiAttempt > 30 * 60 * 1000;
     }
-    const snapshots = await snapshotDiagnostics(env);
-    payload.marketSnapshotTotalCount = snapshots.total;
-    payload.marketSnapshotHistory = snapshots.markets;
+    payload.geminiLive = {
+      cycleStatus: runtime.lastGeminiCycleStatus || null,
+      lastApiStatus: runtime.lastGeminiApiStatus || null,
+      lastApiAttemptAt: Number(runtime.lastGeminiApiAttemptAt || 0) || null,
+      lastApiSuccessAt: Number(runtime.lastGeminiApiSuccessAt || 0) || null,
+      lastApiFailureAt: Number(runtime.lastGeminiApiFailureAt || 0) || null,
+      lastApiKeyUsed: Number(runtime.lastGeminiApiKeyUsed || 0) || null,
+      lastApiPoolUsed: runtime.lastGeminiApiPoolUsed || null,
+      lastError: runtime.lastGeminiApiError || null,
+      liveDataAt: Number(runtime.lastGeminiLiveDataAt || 0) || null
+    };
+    payload.marketSnapshotTotalCount = null;
+    payload.marketSnapshotHistory = [];
+    payload.marketSnapshotDiagnostics = "D1 snapshot history is not queried from /status to avoid consuming the daily D1 row-read quota.";
     return new Response(JSON.stringify(payload), { status: response.status, headers: { "content-type": "application/json" } });
   } catch {
     return response;
@@ -191,13 +190,11 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const recoveryLine = runtime.lastKvPendingFlush ? `\n\nKV signal recovery\nLast flush: ${new Date(Number(runtime.lastKvPendingFlush)).toISOString()}\nQueued: ${Number(runtime.lastKvPendingQueued || 0)}\nDiscarded: ${Number(runtime.lastKvPendingDiscarded || 0)}` : "";
   const guardLine = runtime.lastLivePositionGuard ? `\n\nLIVE position guard\nLast run: ${new Date(Number(runtime.lastLivePositionGuard)).toISOString()}\nChecked: ${Number(runtime.lastLivePositionGuardChecked || 0)}\nEmergency exits: ${Number(runtime.lastLivePositionGuardExited || 0)}${runtime.lastLivePositionGuardWarning ? `\nWarning: ${String(runtime.lastLivePositionGuardWarning).slice(0, 400)}` : ""}` : "";
   const capText = topCap > 0 ? `$${topCap >= 1_000_000 ? (topCap / 1_000_000).toFixed(2) + "M" : (topCap / 1_000).toFixed(1) + "K"}` : "n/a";
-  const d1Degraded = await isD1Degraded(env);
-  const snapshots = d1Degraded ? { total: 0, markets: [] as Array<{ token: string; symbol: string | null; samples: number; ageMinutes: number }> } : await snapshotDiagnostics(env);
-  const topHistory = snapshots.markets.slice(0, 5).map((row, i) => `${i + 1}. ${row.symbol && row.symbol.trim() ? row.symbol.trim() : row.token.slice(0, 10)} — ${row.samples} snapshots / ${row.ageMinutes.toFixed(1)}m`).join("\n");
   const feedAge = feedHealth.fetchedAt ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000)) : null;
   const kvLine = feedHealth.ok === true ? `\n\nKV market feed\nSource: ${String(feedHealth.source || "unknown")}\nMarkets: ${discovered}\nValid: ${valid}\nAge: ${feedAge === null ? "n/a" : `${feedAge}s`}\nTop cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}` : "\n\n⚠️ KV market feed has no healthy cache yet.";
+  const d1Degraded = await isD1Degraded(env);
   const d1Line = d1Degraded ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV discovery + intelligence remain active." : "";
-  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${recoveryLine}${guardLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`);
+  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : "not queried in heartbeat"}${kvLine}${kvModelLine}${recoveryLine}${guardLine}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`);
 }
 
 const worker = {
@@ -232,6 +229,28 @@ const worker = {
     if (controller.cron === "*/3 * * * *") {
       ctx.waitUntil((async () => {
         try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery failed: ${String(error).slice(0, 500)}`); }
+        const feedHealth = await readFeedHealth(env);
+        const feedAgeMs = feedHealth.fetchedAt ? Date.now() - Number(feedHealth.fetchedAt) : Number.POSITIVE_INFINITY;
+        const freshLiveFeed = feedHealth.ok === true && feedAgeMs >= 0 && feedAgeMs <= LIVE_MARKET_MAX_AGE_MS;
+        if (!freshLiveFeed) {
+          const now = Date.now();
+          await env.CIEL_STATE.put("ciel_runtime_state", JSON.stringify({
+            ...(await (async () => {
+              const raw = await env.CIEL_STATE.get("ciel_runtime_state");
+              try { return raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch { return {}; }
+            })()),
+            lastKvIntelligenceRun: now,
+            kvModelActive: false,
+            lastGeminiCycleStartedAt: now,
+            lastGeminiCycleFinishedAt: now,
+            lastGeminiCycleStatus: "STALE_LIVE_MARKET_DATA",
+            lastGeminiLiveDataAt: Number(feedHealth.fetchedAt || 0) || null,
+            lastGeminiError: undefined,
+            lastGeminiApiError: undefined
+          }), { expirationTtl: 172800 });
+          console.error(`KV intelligence skipped because live market feed is stale: ageMs=${feedAgeMs}`);
+          return;
+        }
         try { await runKvIntelligenceCycle(env); } catch (error) { console.error(`KV intelligence cycle failed: ${String(error).slice(0, 1000)}`); }
         if (await isD1Degraded(env)) return;
         try { await flushPendingKvSignals(env); } catch (error) { console.error(`KV pending recovery failed: ${String(error).slice(0, 1000)}`); }
