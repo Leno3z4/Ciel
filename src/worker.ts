@@ -13,6 +13,7 @@ const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
 const SNAPSHOT_INDEX_KEY = "ciel_snapshot_query_index_v1";
 const D1_DEGRADED_KEY = "ciel_d1_degraded_utc_date";
 const D1_ERROR_KEY = "ciel_d1_degraded_error";
+const D1_RECOVERY_PROBE_KEY = "ciel_d1_recovery_probe_utc_date";
 const TELEGRAM_DECISION_ALERT_KEY = "ciel_telegram_last_decision_alert_ms";
 const FEED_HEALTH_KEY = "ciel_market_feed_health";
 
@@ -30,13 +31,31 @@ async function isD1Degraded(env: Env): Promise<boolean> {
 
 async function markD1Degraded(env: Env, error: unknown): Promise<void> {
   if (!isD1QuotaError(error)) return;
-  await env.CIEL_STATE.put(D1_DEGRADED_KEY, utcDateKey(), { expirationTtl: 172800 });
+  const today = utcDateKey();
+  await env.CIEL_STATE.put(D1_DEGRADED_KEY, today, { expirationTtl: 172800 });
   await env.CIEL_STATE.put(D1_ERROR_KEY, String(error).slice(0, 1000), { expirationTtl: 172800 });
 }
 
 async function clearD1Degraded(env: Env): Promise<void> {
   await env.CIEL_STATE.delete(D1_DEGRADED_KEY);
   await env.CIEL_STATE.delete(D1_ERROR_KEY);
+}
+
+async function recoverD1IfNewUtcDay(env: Env): Promise<boolean> {
+  const today = utcDateKey();
+  const lastProbeDate = await env.CIEL_STATE.get(D1_RECOVERY_PROBE_KEY);
+  if (lastProbeDate === today) return !(await isD1Degraded(env));
+
+  try {
+    await env.DB.prepare("SELECT 1 as ok").first<{ ok: number }>();
+    await clearD1Degraded(env);
+    await env.CIEL_STATE.put(D1_RECOVERY_PROBE_KEY, today, { expirationTtl: 172800 });
+    return true;
+  } catch (error) {
+    await env.CIEL_STATE.put(D1_RECOVERY_PROBE_KEY, today, { expirationTtl: 172800 });
+    if (isD1QuotaError(error)) await markD1Degraded(env, error);
+    return !(await isD1Degraded(env));
+  }
 }
 
 async function ensureSnapshotQueryIndex(env: Env): Promise<boolean> {
@@ -75,6 +94,7 @@ async function readFeedHealth(env: Env): Promise<Record<string, unknown>> {
 }
 
 async function statusWithDiagnostics(request: Request, env: Env): Promise<Response> {
+  await recoverD1IfNewUtcDay(env);
   const response = await base.fetch(request, env);
   const url = new URL(request.url);
   if (url.pathname !== "/status" || url.searchParams.get("telegramTest") === "1" || !response.ok) return response;
@@ -172,7 +192,7 @@ async function maybeSendHeartbeat(env: Env): Promise<void> {
   const feedAge = feedHealth.fetchedAt ? Math.max(0, Math.floor((Date.now() - Number(feedHealth.fetchedAt)) / 1000)) : null;
   const kvLine = feedHealth.ok === true ? `\n\nKV market feed\nSource: ${String(feedHealth.source || "unknown")}\nMarkets: ${discovered}\nValid: ${valid}\nAge: ${feedAge === null ? "n/a" : `${feedAge}s`}\nTop cap: ${capText}${topSymbol ? ` (${topSymbol})` : ""}` : "\n\n⚠️ KV market feed has no healthy cache yet.";
   const d1Line = d1Degraded ? "\n\n⚠️ D1 daily row-read limit reached. D1-dependent cycles are paused until the UTC reset; KV discovery + intelligence remain active." : "";
-  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid markets: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${recoveryLine}${guardLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`);
+  await notifyTelegram(env, `📊 Ciel market monitor heartbeat\nDiscovered: ${discovered}\nValid: ${valid}\nCandidates: ${candidates}\n≥$50K market cap: ${capEligible}\nSnapshots this cycle: ${snapshotsThisCycle}\nTotal stored snapshots: ${d1Degraded ? "paused" : snapshots.total}${kvLine}${kvModelLine}${recoveryLine}${guardLine}${topHistory ? `\n\nSnapshot history\n${topHistory}` : ""}${eligibilityLine}${decisionLine}${d1Line}\n\nCiel is monitoring NadFun markets; market cap is the primary signal.`);
 }
 
 const worker = {
@@ -181,6 +201,8 @@ const worker = {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    await recoverD1IfNewUtcDay(env);
+
     if (controller.cron === "* * * * *") {
       ctx.waitUntil((async () => {
         try { await runLivePositionGuard(env); }
