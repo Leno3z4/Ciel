@@ -10,6 +10,8 @@ const MARKET_LIMIT = 50;
 const FALLBACK_TOKEN_LIMIT = 8;
 const NADFUN_TOTAL_SUPPLY = 1_000_000_000;
 const FEED_HEALTH_KEY = "ciel_market_feed_health";
+const FEED_STATUS_KEY = "ciel_market_feed_status";
+const RUNTIME_KEY = "ciel_runtime_state";
 
 type TokenRecord = {
   token_info?: Record<string, unknown>;
@@ -270,6 +272,22 @@ async function readMarketState(env: Env): Promise<MarketState | null> {
   }
 }
 
+async function updateFeedStatus(env: Env, patch: Record<string, unknown>): Promise<void> {
+  const raw = await env.CIEL_STATE.get(FEED_STATUS_KEY);
+  let current: Record<string, unknown> = {};
+  try { current = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch {}
+  const next = { ...current, ...patch, updatedAt: Date.now() };
+  await env.CIEL_STATE.put(FEED_STATUS_KEY, JSON.stringify(next), { expirationTtl: 3600 });
+
+  const runtimeRaw = await env.CIEL_STATE.get(RUNTIME_KEY);
+  let runtime: Record<string, unknown> = {};
+  try { runtime = runtimeRaw ? JSON.parse(runtimeRaw) as Record<string, unknown> : {}; } catch {}
+  await env.CIEL_STATE.put(RUNTIME_KEY, JSON.stringify({
+    ...runtime,
+    ...Object.fromEntries(Object.entries(patch).map(([key, value]) => [`lastMarketFeed${key.charAt(0).toUpperCase()}${key.slice(1)}`, value]))
+  }), { expirationTtl: 172800 });
+}
+
 async function save(env: Env, tokens: TokenRecord[], source: string): Promise<number> {
   if (!tokens.length) return 0;
   let monUsd = estimateMonUsd(tokens);
@@ -304,11 +322,22 @@ async function save(env: Env, tokens: TokenRecord[], source: string): Promise<nu
     monUsd,
     diagnostics
   }), { expirationTtl: 3600 });
+  await updateFeedStatus(env, {
+    status: "SUCCESS",
+    source,
+    successAt: fetchedAt,
+    failureAt: null,
+    httpStatus: 200,
+    error: null,
+    count: normalized.length
+  });
   await sendMarketPulse(env, state);
   return normalized.length;
 }
 
-async function fetchFeed(url: string): Promise<TokenRecord[]> {
+async function fetchFeed(env: Env, url: string, source: string): Promise<TokenRecord[]> {
+  const attemptAt = Date.now();
+  await updateFeedStatus(env, { status: "REQUESTING", source, attemptAt });
   try {
     const cacheBuster = `ciel_ts=${Date.now()}`;
     const liveUrl = `${url}${url.includes("?") ? "&" : "?"}${cacheBuster}`;
@@ -319,19 +348,55 @@ async function fetchFeed(url: string): Promise<TokenRecord[]> {
         "Cache-Control": "no-cache, no-store, max-age=0"
       }
     });
-    if (!response.ok) return [];
-    return extractTokens(decode(await response.text()));
-  } catch {
+    const body = await response.text();
+    if (!response.ok) {
+      await updateFeedStatus(env, {
+        status: "HTTP_ERROR",
+        source,
+        failureAt: Date.now(),
+        httpStatus: response.status,
+        error: `NadFun ${source} returned HTTP ${response.status}: ${body.slice(0, 300)}`
+      });
+      return [];
+    }
+    const decoded = decode(body);
+    const tokens = extractTokens(decoded);
+    if (!tokens.length) {
+      await updateFeedStatus(env, {
+        status: "EMPTY_OR_DECODE_ERROR",
+        source,
+        failureAt: Date.now(),
+        httpStatus: response.status,
+        error: `NadFun ${source} returned a successful response but no token records were decoded`
+      });
+      return [];
+    }
+    await updateFeedStatus(env, {
+      status: "RECEIVED",
+      source,
+      httpStatus: response.status,
+      error: null,
+      count: tokens.length
+    });
+    return tokens;
+  } catch (error) {
+    await updateFeedStatus(env, {
+      status: "NETWORK_ERROR",
+      source,
+      failureAt: Date.now(),
+      httpStatus: null,
+      error: String(error).slice(0, 700)
+    });
     return [];
   }
 }
 
-async function fetchMarketCapFeed(): Promise<TokenRecord[]> {
-  return fetchFeed(`${API_BASE}/order/market_cap?page=1&limit=${MARKET_LIMIT}&is_nsfw=false&direction=DESC`);
+async function fetchMarketCapFeed(env: Env): Promise<TokenRecord[]> {
+  return fetchFeed(env, `${API_BASE}/order/market_cap?page=1&limit=${MARKET_LIMIT}&is_nsfw=false&direction=DESC`, "market-cap");
 }
 
-async function fetchCreationFeed(): Promise<TokenRecord[]> {
-  return fetchFeed(`${API_BASE}/order/creation_time?page=1&limit=${MARKET_LIMIT}&is_nsfw=false&direction=DESC`);
+async function fetchCreationFeed(env: Env): Promise<TokenRecord[]> {
+  return fetchFeed(env, `${API_BASE}/order/creation_time?page=1&limit=${MARKET_LIMIT}&is_nsfw=false&direction=DESC`, "creation-time");
 }
 
 async function fetchRecentEventTokens(): Promise<string[]> {
@@ -384,7 +449,8 @@ async function sendMarketPulse(env: Env, state: MarketState): Promise<void> {
     return `${index + 1}. ${item.symbol} — MC ${formatUsd(item.marketCapUsd)}${liquidityLine}${volume}${change}`;
   });
   if (!lines.length) return;
-  const stale = state.source === "cached-fallback" || state.source === "legacy-cache";
+  const ageMs = state.fetchedAt > 0 ? Date.now() - state.fetchedAt : Number.POSITIVE_INFINITY;
+  const stale = state.source === "cached-fallback" || state.source === "legacy-cache" || ageMs > DISCOVERY_REFRESH_MS;
   const status = stale ? "⚠️ STALE/CACHED" : "✅ LIVE FEED";
   const sourceLabel = state.source === "market-cap" ? "market-cap" : state.source === "creation-time" ? "creation-time fallback" : state.source;
   await notifyTelegram(env, `📡 CIEL MARKET INTELLIGENCE\n${status}\nSource: ${sourceLabel}\nMarkets received: ${state.tokens.length}${state.monUsd > 0 ? `\nMON/USD: $${state.monUsd.toFixed(4)}` : ""}\n\nTOP NAD.FUN MARKETS\n${lines.join("\n")}\n\nKV discovery is active; D1 availability does not stop this scanner.`);
@@ -393,7 +459,7 @@ async function sendMarketPulse(env: Env, state: MarketState): Promise<void> {
 async function sendCachedPulse(env: Env): Promise<void> {
   const state = await readMarketState(env);
   if (!state) return;
-  await sendMarketPulse(env, { ...state, source: "cached-fallback" });
+  await sendMarketPulse(env, state);
 }
 
 export async function getMarketState(env: Env): Promise<MarketState | null> {
@@ -408,10 +474,10 @@ export async function primeMarketDiscovery(env: Env): Promise<void> {
     return;
   }
 
-  const ranked = await fetchMarketCapFeed();
+  const ranked = await fetchMarketCapFeed(env);
   if (ranked.length && await save(env, ranked, "market-cap")) return;
 
-  const creation = await fetchCreationFeed();
+  const creation = await fetchCreationFeed(env);
   if (creation.length && await save(env, creation, "creation-time")) return;
 
   const recentTokens = await fetchRecentEventTokens();
@@ -424,5 +490,10 @@ export async function primeMarketDiscovery(env: Env): Promise<void> {
     if (fallback.length && await save(env, fallback, "recent-events")) return;
   }
 
+  await updateFeedStatus(env, {
+    status: "NO_FRESH_FEED",
+    failureAt: Date.now(),
+    error: "All live NadFun market discovery sources returned no usable token records; retaining the last successful market state without updating its fetchedAt"
+  });
   await sendCachedPulse(env);
 }

@@ -99,6 +99,7 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       "lastGeminiCycleStartedAt", "lastGeminiCycleFinishedAt", "lastGeminiCycleStatus", "lastGeminiCycleToken",
       "lastGeminiCycleSnapshotAt", "lastGeminiLiveDataAt", "lastGeminiDecisionAt", "lastGeminiDecisionAction",
       "lastGeminiDecisionConfidence", "lastGeminiDecisionPool", "lastGeminiStatusUpdateAt",
+      "lastMarketFeedAttemptAt", "lastMarketFeedSuccessAt", "lastMarketFeedFailureAt", "lastMarketFeedStatus", "lastMarketFeedHttpStatus", "lastMarketFeedError",
       "lastModelDecisionCandidate", "lastModelDecisionAction", "lastModelDecisionConfidence", "lastHoldingPaperPositions",
       "lastHoldingLivePositions", "lastHoldingCheckError", "lastKvIntelligenceRun", "lastKvIntelligenceAnalyzed",
       "lastKvIntelligenceCandidates", "kvModelActive", "lastKvPendingFlush", "lastKvPendingQueued", "lastKvPendingDiscarded",
@@ -130,6 +131,13 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       payload.lastGeminiErrorAgeSeconds = Math.max(0, Math.floor((Date.now() - legacyGeminiAttempt) / 1000));
       payload.lastGeminiErrorIsHistorical = Date.now() - legacyGeminiAttempt > 30 * 60 * 1000;
     }
+    if (legacyGeminiAttempt > 0 && Date.now() - legacyGeminiAttempt > 30 * 60 * 1000) payload.lastGeminiAttemptIsHistorical = true;
+    const legacyGeminiSuccess = Number(runtime.lastGeminiSuccess || 0);
+    if (legacyGeminiSuccess > 0 && Date.now() - legacyGeminiSuccess > 30 * 60 * 1000) payload.lastGeminiSuccessIsHistorical = true;
+    const lastMarketCycle = Number(payload.lastMarketCycle || 0);
+    if (lastMarketCycle > 0 && Date.now() - lastMarketCycle > 30 * 60 * 1000) payload.lastMarketCycleIsHistorical = true;
+    const lastHoldingCheck = Number(payload.lastHoldingCheck || 0);
+    if (lastHoldingCheck > 0 && Date.now() - lastHoldingCheck > 30 * 60 * 1000) payload.lastHoldingCheckIsHistorical = true;
     payload.geminiLive = {
       cycleStatus: runtime.lastGeminiCycleStatus || null,
       lastApiStatus: runtime.lastGeminiApiStatus || null,
@@ -140,6 +148,14 @@ async function statusWithDiagnostics(request: Request, env: Env): Promise<Respon
       lastApiPoolUsed: runtime.lastGeminiApiPoolUsed || null,
       lastError: runtime.lastGeminiApiError || null,
       liveDataAt: Number(runtime.lastGeminiLiveDataAt || 0) || null
+    };
+    payload.marketFeedLive = {
+      status: runtime.lastMarketFeedStatus || null,
+      attemptAt: Number(runtime.lastMarketFeedAttemptAt || 0) || null,
+      successAt: Number(runtime.lastMarketFeedSuccessAt || 0) || null,
+      failureAt: Number(runtime.lastMarketFeedFailureAt || 0) || null,
+      httpStatus: Number(runtime.lastMarketFeedHttpStatus || 0) || null,
+      error: runtime.lastMarketFeedError || null
     };
     payload.marketSnapshotTotalCount = null;
     payload.marketSnapshotHistory = [];
@@ -207,6 +223,10 @@ const worker = {
 
     if (controller.cron === "* * * * *") {
       ctx.waitUntil((async () => {
+        try { await primeMarketDiscovery(env); }
+        catch (error) { console.error(`Live market discovery failed: ${String(error).slice(0, 700)}`); }
+      })());
+      ctx.waitUntil((async () => {
         try { await runLivePositionGuard(env); }
         catch (error) { console.error(`Live position guard failed: ${String(error).slice(0, 1000)}`); }
       })());
@@ -228,10 +248,14 @@ const worker = {
 
     if (controller.cron === "*/3 * * * *") {
       ctx.waitUntil((async () => {
-        try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery failed: ${String(error).slice(0, 500)}`); }
         const feedHealth = await readFeedHealth(env);
         const feedAgeMs = feedHealth.fetchedAt ? Date.now() - Number(feedHealth.fetchedAt) : Number.POSITIVE_INFINITY;
-        const freshLiveFeed = feedHealth.ok === true && feedAgeMs >= 0 && feedAgeMs <= LIVE_MARKET_MAX_AGE_MS;
+        if (feedAgeMs > LIVE_MARKET_MAX_AGE_MS || !feedHealth.ok) {
+          try { await primeMarketDiscovery(env); } catch (error) { console.error(`Market discovery failed: ${String(error).slice(0, 500)}`); }
+        }
+        const refreshedFeed = await readFeedHealth(env);
+        const refreshedAgeMs = refreshedFeed.fetchedAt ? Date.now() - Number(refreshedFeed.fetchedAt) : Number.POSITIVE_INFINITY;
+        const freshLiveFeed = refreshedFeed.ok === true && refreshedAgeMs >= 0 && refreshedAgeMs <= LIVE_MARKET_MAX_AGE_MS;
         if (!freshLiveFeed) {
           const now = Date.now();
           await env.CIEL_STATE.put("ciel_runtime_state", JSON.stringify({
@@ -244,11 +268,11 @@ const worker = {
             lastGeminiCycleStartedAt: now,
             lastGeminiCycleFinishedAt: now,
             lastGeminiCycleStatus: "STALE_LIVE_MARKET_DATA",
-            lastGeminiLiveDataAt: Number(feedHealth.fetchedAt || 0) || null,
+            lastGeminiLiveDataAt: Number(refreshedFeed.fetchedAt || 0) || null,
             lastGeminiError: undefined,
             lastGeminiApiError: undefined
           }), { expirationTtl: 172800 });
-          console.error(`KV intelligence skipped because live market feed is stale: ageMs=${feedAgeMs}`);
+          console.error(`KV intelligence skipped because live market feed is stale: ageMs=${refreshedAgeMs}`);
           return;
         }
         try { await runKvIntelligenceCycle(env); } catch (error) { console.error(`KV intelligence cycle failed: ${String(error).slice(0, 1000)}`); }
