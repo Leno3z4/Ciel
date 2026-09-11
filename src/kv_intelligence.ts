@@ -116,6 +116,16 @@ async function writeRuntimeThrottled(env: Env, patch: Record<string, unknown>, f
   await env.CIEL_STATE.put(RUNTIME_KEY, JSON.stringify({ ...current, ...patch, lastKvRuntimeWrite: Date.now() }), { expirationTtl: 172800 });
 }
 
+async function writeGeminiLiveStatus(env: Env, patch: Record<string, unknown>): Promise<void> {
+  const current = await readRuntime(env);
+  const now = Date.now();
+  await env.CIEL_STATE.put(RUNTIME_KEY, JSON.stringify({
+    ...current,
+    ...patch,
+    lastGeminiStatusUpdateAt: now
+  }), { expirationTtl: 172800 });
+}
+
 function tokenAddress(item: Record<string, unknown>): string | null {
   const tokenInfo = item.token_info;
   const marketInfo = item.market_info;
@@ -217,6 +227,12 @@ async function callGeminiPool(
   if (!slots.length) throw new Error(`No Gemini keys configured for ${GEMINI_POOL_LABELS[pool]}`);
 
   const now = Date.now();
+  await writeGeminiLiveStatus(env, {
+    lastGeminiApiAttemptAt: now,
+    lastGeminiPoolAttempted: pool,
+    lastGeminiApiStatus: "REQUESTING"
+  });
+
   let cursor = cursorForPool(poolState, pool);
   let lastError: unknown = new Error(`No usable Gemini key in ${GEMINI_POOL_LABELS[pool]}`);
   let attempts = 0;
@@ -234,6 +250,13 @@ async function callGeminiPool(
       const role = pool === "DECISION" ? "regime" : "market";
       const decision = await askGemini(slot.key, env.GEMINI_MODEL, role, snapshot, baseline, score, pattern);
       if (!decision) throw new Error("Gemini returned no decision");
+      await writeGeminiLiveStatus(env, {
+        lastGeminiApiSuccessAt: Date.now(),
+        lastGeminiApiKeyUsed: slot.index,
+        lastGeminiApiPoolUsed: pool,
+        lastGeminiApiStatus: "SUCCESS",
+        lastGeminiApiError: undefined
+      });
       const slotPosition = slots.findIndex(entry => entry.index === slot.index);
       setCursorForPool(poolState, pool, slotPosition >= 0 ? (slotPosition + 1) % slots.length : 0);
       poolState.lastPoolCallAt[pool] = now;
@@ -247,15 +270,41 @@ async function callGeminiPool(
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  await writeGeminiLiveStatus(env, {
+    lastGeminiApiFailureAt: Date.now(),
+    lastGeminiApiStatus: /429|RESOURCE_EXHAUSTED|quota/i.test(message) ? "QUOTA_EXHAUSTED" : "ERROR",
+    lastGeminiApiError: message.slice(0, 700)
+  });
+  throw lastError instanceof Error ? lastError : new Error(message);
 }
 
 async function runKvDecision(env: Env, state: HotState, token: string, item: Record<string, unknown>, history: Snapshot[]): Promise<boolean> {
-  if (!meaningfulTrigger(history)) return false;
+  if (!meaningfulTrigger(history)) {
+    await writeGeminiLiveStatus(env, {
+      lastGeminiCycleStatus: "SKIPPED_NO_MEANINGFUL_TRIGGER",
+      lastGeminiCycleToken: token,
+      lastGeminiCycleSnapshotAt: history[0]?.tsMs || 0
+    });
+    return false;
+  }
   const key = token.toLowerCase();
   const market = state.markets[key];
   const now = Date.now();
-  if (market && market.decisionCooldownUntil > now) return false;
+  if (market && market.decisionCooldownUntil > now) {
+    await writeGeminiLiveStatus(env, {
+      lastGeminiCycleStatus: "SKIPPED_DECISION_COOLDOWN",
+      lastGeminiCycleToken: token,
+      lastGeminiCycleSnapshotAt: history[0]?.tsMs || 0
+    });
+    return false;
+  }
+
+  await writeGeminiLiveStatus(env, {
+    lastGeminiCycleStatus: "TRIGGERED",
+    lastGeminiCycleToken: token,
+    lastGeminiCycleSnapshotAt: history[0]?.tsMs || 0
+  });
 
   const baseline = buildBaseline(history);
   const pattern = buildPatternProfile(history);
@@ -276,6 +325,9 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
         lastGeminiPoolFailure: "ANALYST/FALLBACK",
         lastGeminiEmergencyFallbackUsed: false
       }, true);
+      await writeGeminiLiveStatus(env, {
+        lastGeminiCycleStatus: "ANALYST_FAILED"
+      });
       return false;
     }
   }
@@ -293,6 +345,9 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastGeminiPool: analystSourcePool,
     lastGeminiEmergencyFallbackUsed: analystSourcePool === "FALLBACK"
   }, true);
+  await writeGeminiLiveStatus(env, {
+    lastGeminiCycleStatus: analystPass ? "ANALYST_PASSED" : "ANALYST_WAIT"
+  });
 
   if (!analystPass) return true;
 
@@ -310,6 +365,9 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
         lastGeminiPoolFailure: "DECISION/FALLBACK",
         lastGeminiEmergencyFallbackUsed: analystSourcePool === "FALLBACK"
       }, true);
+      await writeGeminiLiveStatus(env, {
+        lastGeminiCycleStatus: "DECISION_FAILED"
+      });
       return false;
     }
   }
@@ -347,6 +405,13 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     lastGeminiDecisionPool: decisionSourcePool,
     lastGeminiFallbackKeyReserved: 7
   }, true);
+  await writeGeminiLiveStatus(env, {
+    lastGeminiCycleStatus: "DECISION_COMPLETE",
+    lastGeminiDecisionAt: decisionAt,
+    lastGeminiDecisionAction: decision.action === "HOLD" || decision.action === "IGNORE" ? "WAIT" : decision.action,
+    lastGeminiDecisionConfidence: decision.confidence,
+    lastGeminiDecisionPool: decisionSourcePool
+  });
 
   if (decision.action !== "BUY" && decision.action !== "SELL") return true;
 
@@ -375,8 +440,21 @@ Reason: ${decision.rationale}`);
 }
 
 export async function runKvIntelligenceCycle(env: Env): Promise<void> {
+  const cycleStartedAt = Date.now();
+  await writeGeminiLiveStatus(env, {
+    lastGeminiCycleStartedAt: cycleStartedAt,
+    lastGeminiCycleStatus: "SCANNING_LIVE_MARKET_DATA",
+    lastGeminiLiveDataAt: cycleStartedAt
+  });
+
   const marketState = await getMarketState(env);
-  if (!marketState || !marketState.tokens.length) return;
+  if (!marketState || !marketState.tokens.length) {
+    await writeGeminiLiveStatus(env, {
+      lastGeminiCycleFinishedAt: Date.now(),
+      lastGeminiCycleStatus: "NO_LIVE_MARKET_TOKENS"
+    });
+    return;
+  }
 
   const state = await readHotState(env);
   const now = Date.now();
@@ -417,6 +495,11 @@ export async function runKvIntelligenceCycle(env: Env): Promise<void> {
     lastKvIntelligenceCandidates: candidates.length,
     kvModelActive: analyzed > 0,
     lastModelDecisionKeyPool: TRADING_GEMINI_KEY_COUNT
+  }, true);
+  await writeGeminiLiveStatus(env, {
+    lastGeminiCycleFinishedAt: Date.now(),
+    lastGeminiCycleStatus: geminiTriggered ? "DECISION_EVALUATED" : "NO_GEMINI_TRIGGER",
+    lastGeminiLiveDataAt: now
   });
 }
 
