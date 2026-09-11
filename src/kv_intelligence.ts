@@ -14,6 +14,7 @@ const MIN_HISTORY_SAMPLES = 8;
 const MIN_MARKET_CAP_USD = 50_000;
 const MIN_LIQUIDITY_USD = 5_000;
 const KV_DECISION_COOLDOWN_MS = 30 * 60 * 1000;
+const GEMINI_EVALUATION_COOLDOWN_MS = 30 * 60 * 1000;
 const GEMINI_KEY_COOLDOWN_MS = 5 * 60 * 1000;
 const RUNTIME_WRITE_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_PENDING_AGE_MS = 30 * 60 * 1000;
@@ -35,6 +36,7 @@ interface HotState {
   geminiCursor: number;
   geminiKeyCooldowns: Record<string, number>;
   lastGeminiDecisionAt: number;
+  lastGeminiEvaluationAt: number;
 }
 
 interface GeminiPoolState {
@@ -46,7 +48,7 @@ interface GeminiPoolState {
 }
 
 function emptyHotState(): HotState {
-  return { version: 1, updatedTsMs: 0, markets: {}, geminiCursor: 0, geminiKeyCooldowns: {}, lastGeminiDecisionAt: 0 };
+  return { version: 1, updatedTsMs: 0, markets: {}, geminiCursor: 0, geminiKeyCooldowns: {}, lastGeminiDecisionAt: 0, lastGeminiEvaluationAt: 0 };
 }
 
 function emptyGeminiPoolState(): GeminiPoolState {
@@ -70,7 +72,8 @@ async function readHotState(env: Env): Promise<HotState> {
       markets: parsed.markets as Record<string, HotMarketState>,
       geminiCursor: Math.max(0, Math.floor(num(parsed.geminiCursor))),
       geminiKeyCooldowns: parsed.geminiKeyCooldowns || {},
-      lastGeminiDecisionAt: num(parsed.lastGeminiDecisionAt)
+      lastGeminiDecisionAt: num(parsed.lastGeminiDecisionAt),
+      lastGeminiEvaluationAt: num(parsed.lastGeminiEvaluationAt)
     };
   } catch {
     return emptyHotState();
@@ -190,12 +193,10 @@ function snapshotFor(item: Record<string, unknown>, token: string, now: number):
 
 function meaningfulTrigger(history: Snapshot[]): boolean {
   if (history.length < MIN_HISTORY_SAMPLES) return false;
-  const pattern = buildPatternProfile(history);
-  const behavior = pattern.priceBehavior;
-  const improving = pattern.currentMarketCapReturn30mPct >= 2 && pattern.volumeVsBaseline >= 1.15;
-  const enteringLow = behavior.currentZone === "LOW" && pattern.currentMarketCapReturn30mPct >= -5;
-  const strongTrend = pattern.currentMarketCapReturn30mPct >= 8 && pattern.volumeVsBaseline >= 1.25;
-  return (enteringLow && improving) || strongTrend;
+  const latest = history[0];
+  return latest.marketCapUsd >= MIN_MARKET_CAP_USD &&
+    latest.liquidityUsd >= MIN_LIQUIDITY_USD &&
+    latest.priceUsd > 0;
 }
 
 function cursorForPool(state: GeminiPoolState, pool: GeminiPool): number {
@@ -299,6 +300,17 @@ async function runKvDecision(env: Env, state: HotState, token: string, item: Rec
     });
     return false;
   }
+
+  if (state.lastGeminiEvaluationAt > 0 && now - state.lastGeminiEvaluationAt < GEMINI_EVALUATION_COOLDOWN_MS) {
+    await writeGeminiLiveStatus(env, {
+      lastGeminiCycleStatus: "SKIPPED_GEMINI_GLOBAL_COOLDOWN",
+      lastGeminiCycleToken: token,
+      lastGeminiCycleSnapshotAt: history[0]?.tsMs || 0
+    });
+    return false;
+  }
+
+  state.lastGeminiEvaluationAt = now;
 
   await writeGeminiLiveStatus(env, {
     lastGeminiCycleStatus: "TRIGGERED",
