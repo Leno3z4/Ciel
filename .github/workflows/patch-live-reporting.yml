@@ -1,0 +1,87 @@
+name: Patch live trade reporting
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, 'Patch live trade reporting')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply reporting-only patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          live = Path("src/live_execution.ts")
+          text = live.read_text()
+
+          old = 'import type { Env } from "./index";\n\n'
+          new = 'import type { Env } from "./index";\nimport { notifyTelegram } from "./telegram";\n\n'
+          if text.count(old) != 1:
+              raise SystemExit(f"live_execution import anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''  await setExecutionState(\n    env,\n    signal.id,\n    "CONFIRMED",\n    {\n      quantity:\n        tokenDelta.toString(),\n      price_usd:\n        priceUsd,\n      tx_hash:\n        txHash\n    }\n  );\n\n  await consumeLiveSignal(\n'''
+          new = '''  await setExecutionState(\n    env,\n    signal.id,\n    "CONFIRMED",\n    {\n      quantity:\n        tokenDelta.toString(),\n      price_usd:\n        priceUsd,\n      tx_hash:\n        txHash\n    }\n  );\n\n  try {\n    await env.CIEL_STATE.put(\n      "ciel_last_live_trade",\n      JSON.stringify({\n        side: "BUY",\n        token,\n        quantity: tokenDelta.toString(),\n        priceUsd,\n        amountMon: tradeSizeMon,\n        tsMs: now,\n        txHash\n      })\n    );\n  } catch (error) {\n    console.error(`Failed to persist last live BUY reporting state: ${String(error).slice(0, 500)}`);\n  }\n\n  try {\n    await notifyTelegram(\n      env,\n      [\n        "🟢 CIEL LIVE BUY CONFIRMED",\n        `Token: ${token}`,\n        `Bought: ${tokenDelta.toString()} tokens`,\n        `Spent: ${tradeSizeMon.toFixed(4)} MON`,\n        `Entry: $${priceUsd.toPrecision(8)}`,\n        `Time: ${new Date(now).toISOString()}`,\n        `TX: ${txHash}`\n      ].join("\\n")\n    );\n  } catch (error) {\n    console.error(`Failed to send live BUY Telegram report: ${String(error).slice(0, 500)}`);\n  }\n\n  await consumeLiveSignal(\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"live_execution BUY anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''  const now =\n    Date.now();\n\n  await env.DB\n    .prepare(`\n      INSERT INTO trades(\n        token_address,\n        ts_ms,\n        side,\n        quantity,\n        price_usd,\n        tx_hash,\n        mode,\n        status,\n        execution_key\n      )\n      VALUES(?,?,?,?,?,?,?,?,?)\n    `)\n'''
+          new = '''  const now =\n    Date.now();\n\n  const entryPriceUsd =\n    Number(position.entry_price_usd || 0);\n\n  const soldQuantity =\n    Number(amountIn) / 1e18;\n\n  const entryValueUsd =\n    entryPriceUsd > 0\n      ? soldQuantity * entryPriceUsd\n      : 0;\n\n  const exitValueUsd =\n    exitPriceUsd > 0\n      ? soldQuantity * exitPriceUsd\n      : 0;\n\n  const realizedPnlUsd =\n    entryValueUsd > 0 &&\n    exitValueUsd > 0\n      ? exitValueUsd - entryValueUsd\n      : 0;\n\n  const realizedPnlPct =\n    entryValueUsd > 0\n      ? (\n          realizedPnlUsd /\n          entryValueUsd\n        ) * 100\n      : 0;\n\n  const exitLabel =\n    realizedPnlUsd > 0\n      ? "🟢 PROFITABLE SELL"\n      : realizedPnlUsd < 0\n        ? "🔻 LOSS-CUT SELL"\n        : "⚪ FLAT SELL";\n\n  await env.DB\n    .prepare(`\n      INSERT INTO trades(\n        token_address,\n        ts_ms,\n        side,\n        quantity,\n        price_usd,\n        tx_hash,\n        mode,\n        status,\n        execution_key\n      )\n      VALUES(?,?,?,?,?,?,?,?,?)\n    `)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"live_execution SELL anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''  await env.DB\n    .prepare(`\n      DELETE FROM live_positions\n      WHERE token_address=?\n    `)\n'''
+          new = '''  try {\n    await env.CIEL_STATE.put(\n      "ciel_last_live_trade",\n      JSON.stringify({\n        side: "SELL",\n        token,\n        quantity: amountIn.toString(),\n        entryPriceUsd,\n        exitPriceUsd,\n        realizedPnlUsd,\n        realizedPnlPct,\n        tsMs: now,\n        txHash\n      })\n    );\n  } catch (error) {\n    console.error(`Failed to persist last live SELL reporting state: ${String(error).slice(0, 500)}`);\n  }\n\n  try {\n    await notifyTelegram(\n      env,\n      [\n        exitLabel,\n        `Token: ${token}`,\n        `Sold: ${amountIn.toString()} tokens`,\n        `Entry: ${entryPriceUsd > 0 ? `$${entryPriceUsd.toPrecision(8)}` : "n/a"}`,\n        `Exit: ${exitPriceUsd > 0 ? `$${exitPriceUsd.toPrecision(8)}` : "n/a"}`,\n        `Realized PnL: ${realizedPnlUsd >= 0 ? "+" : ""}$${realizedPnlUsd.toFixed(4)} (${realizedPnlPct >= 0 ? "+" : ""}${realizedPnlPct.toFixed(2)}%)`,\n        `Time: ${new Date(now).toISOString()}`,\n        `TX: ${txHash}`\n      ].join("\\n")\n    );\n  } catch (error) {\n    console.error(`Failed to send live SELL Telegram report: ${String(error).slice(0, 500)}`);\n  }\n\n  await env.DB\n    .prepare(`\n      DELETE FROM live_positions\n      WHERE token_address=?\n    `)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"live_execution SELL delete anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          live.write_text(text)
+
+          entry = Path("src/entry.ts")
+          text = entry.read_text()
+
+          old = '''function numberFromItem(item: Record<string, unknown>, keys: string[]): number {\n  const sources = [item.market_info, item.token_info, item];\n  for (const source of sources) {\n    if (!source || typeof source !== "object") continue;\n    const object = source as Record<string, unknown>;\n    for (const key of keys) {\n      const value = Number(object[key]);\n      if (Number.isFinite(value) && value > 0) return value;\n    }\n  }\n  return 0;\n}\n\n'''
+          new = '''function numberFromItem(item: Record<string, unknown>, keys: string[]): number {\n  const sources = [item.market_info, item.token_info, item];\n  for (const source of sources) {\n    if (!source || typeof source !== "object") continue;\n    const object = source as Record<string, unknown>;\n    for (const key of keys) {\n      const value = Number(object[key]);\n      if (Number.isFinite(value) && value > 0) return value;\n    }\n  }\n  return 0;\n}\n\nfunction tokenAddressFromItem(item: Record<string, unknown>): string | null {\n  const sources = [item.token_info, item.market_info, item];\n  for (const source of sources) {\n    if (!source || typeof source !== "object") continue;\n    const object = source as Record<string, unknown>;\n    for (const key of ["token_id", "token_address", "tokenAddress", "address", "mint", "id"]) {\n      const value = object[key];\n      if (typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value.trim())) return value.trim().toLowerCase();\n    }\n  }\n  return null;\n}\n\nasync function enrichLiveStatus(\n  env: Parameters<typeof worker.fetch>[1],\n  payload: Record<string, unknown>\n): Promise<Record<string, unknown>> {\n  const livePortfolio: Record<string, unknown> = {\n    openPositionCount: 0,\n    positions: [],\n    lastLiveTrade: null,\n    recentTrades: [],\n    sellCanRealizeProfit: false\n  };\n\n  const lastTradeRaw = await env.CIEL_STATE.get("ciel_last_live_trade");\n  if (lastTradeRaw) {\n    try {\n      livePortfolio.lastLiveTrade = JSON.parse(lastTradeRaw);\n    } catch {}\n  }\n\n  try {\n    const feed = await getMarketState(env);\n    const prices = new Map<string, number>();\n    for (const item of feed?.tokens || []) {\n      const token = tokenAddressFromItem(item);\n      const price = numberFromItem(item, ["price_usd", "priceUsd", "token_price_usd", "tokenPriceUsd"]);\n      if (token && price > 0) prices.set(token, price);\n    }\n\n    const positionRows = await env.DB\n      .prepare(`\n        SELECT\n          token_address,\n          quantity,\n          entry_price_usd,\n          entry_ts_ms,\n          last_price_usd,\n          updated_ts_ms\n        FROM live_positions\n        WHERE quantity <> '0'\n        ORDER BY updated_ts_ms DESC\n      `)\n      .all<{\n        token_address: string;\n        quantity: string;\n        entry_price_usd: number;\n        entry_ts_ms: number;\n        last_price_usd: number;\n        updated_ts_ms: number;\n      }>();\n\n    const positions = (positionRows.results || []).map((position) => {\n      const quantity = Number(position.quantity || 0);\n      const entryPriceUsd = Number(position.entry_price_usd || 0);\n      const currentPriceUsd =\n        prices.get(position.token_address.toLowerCase()) ||\n        Number(position.last_price_usd || 0);\n      const marketValueUsd =\n        currentPriceUsd > 0 ? quantity * currentPriceUsd : 0;\n      const costUsd =\n        entryPriceUsd > 0 ? quantity * entryPriceUsd : 0;\n      const unrealizedPnlUsd =\n        marketValueUsd > 0 && costUsd > 0\n          ? marketValueUsd - costUsd\n          : 0;\n      const unrealizedPnlPct =\n        costUsd > 0\n          ? (unrealizedPnlUsd / costUsd) * 100\n          : 0;\n\n      return {\n        token: position.token_address,\n        quantity: position.quantity,\n        entryPriceUsd,\n        currentPriceUsd,\n        costUsd,\n        marketValueUsd,\n        unrealizedPnlUsd,\n        unrealizedPnlPct,\n        entryTsMs: position.entry_ts_ms,\n        updatedTsMs: position.updated_ts_ms\n      };\n    });\n\n    livePortfolio.openPositionCount = positions.length;\n    livePortfolio.positions = positions;\n    livePortfolio.sellCanRealizeProfit = positions.some(position => Number(position.unrealizedPnlUsd) > 0);\n\n    const recentTrades = await env.DB\n      .prepare(`\n        SELECT\n          token_address,\n          ts_ms,\n          side,\n          quantity,\n          price_usd,\n          tx_hash,\n          status\n        FROM trades\n        WHERE mode='live'\n          AND status='CONFIRMED'\n          AND side IN ('BUY','SELL')\n        ORDER BY ts_ms DESC\n        LIMIT 10\n      `)\n      .all<{\n        token_address: string;\n        ts_ms: number;\n        side: string;\n        quantity: string | null;\n        price_usd: number | null;\n        tx_hash: string | null;\n        status: string;\n      }>();\n\n    livePortfolio.recentTrades = recentTrades.results || [];\n  } catch (error) {\n    livePortfolio.diagnostics = `Live portfolio reporting unavailable: ${String(error).slice(0, 500)}`;\n  }\n\n  return {\n    ...payload,\n    livePortfolio\n  };\n}\n\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"entry helper anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        const payload = await response.json() as Record<string, unknown>;\n        return new Response(JSON.stringify(sanitizeStatus(payload, d1)), {\n'''
+          new = '''        const payload = await response.json() as Record<string, unknown>;\n        const enriched = await enrichLiveStatus(env, payload);\n        return new Response(JSON.stringify(sanitizeStatus(enriched, d1)), {\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"entry status anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          entry.write_text(text)
+          PY
+
+      - name: Validate and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install
+          npm run typecheck
+          git diff --check
+          git status --short
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/live_execution.ts src/entry.ts .github/workflows/patch-live-reporting.yml
+          git commit -m "Patch live trade reporting"
+          git push origin HEAD:main
