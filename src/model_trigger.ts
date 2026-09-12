@@ -29,16 +29,16 @@ const MIN_HISTORY_SPAN_MS = 15 * 60 * 1000;
 const MIN_AVG_VOLUME_5M_USD = 1_000;
 const MIN_AVG_LIQUIDITY_USD = 5_000;
 const MAX_CANDIDATE_POOL = 20;
-const MAX_CANDIDATE_HISTORY_ROWS = 24;
+const MAX_CANDIDATE_HISTORY_ROWS = 96;
 const MAX_CANDIDATES = 5;
-const MAX_DECISIONS_PER_CYCLE = 1;
-const MODEL_COOLDOWN_MS = 30 * 60 * 1000;
-const MODEL_KEY_COOLDOWN_MS = 30 * 60 * 1000;
+const MAX_DECISIONS_PER_CYCLE = 2;
+const MODEL_COOLDOWN_MS = 10 * 60 * 1000;
+const MODEL_KEY_COOLDOWN_MS = 10 * 60 * 1000;
 const MODEL_COOLDOWN_PREFIX = "ciel_model_cooldown:";
 const MODEL_KEY_COOLDOWN_PREFIX = "ciel_gemini_key_cooldown:";
 const MODEL_KEY_CURSOR = "ciel_gemini_key_cursor";
 const GEMINI_GLOBAL_CALL_KEY = "ciel_gemini_last_global_call_ms";
-const GEMINI_GLOBAL_MIN_INTERVAL_MS = 15 * 60 * 1000;
+const GEMINI_GLOBAL_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const RUNTIME_KEY = "ciel_runtime_state";
 const DECISION_KEY_COUNT = 7;
 
@@ -62,10 +62,12 @@ function lifecycleRankingScore(pattern: ReturnType<typeof buildPatternProfile>):
 
 function candidateRankingScore(
   anomalyScore: number,
-  lifecycleScore: number
+  lifecycleScore: number,
+  rangeOpportunity: number
 ): number {
-  return (Math.max(0, Math.min(1, anomalyScore)) * 0.60) +
-    (Math.max(0, Math.min(1, lifecycleScore)) * 0.40);
+  return (Math.max(0, Math.min(1, anomalyScore)) * 0.50) +
+    (Math.max(0, Math.min(1, lifecycleScore)) * 0.30) +
+    (Math.max(0, Math.min(1, rangeOpportunity)) * 0.20);
 }
 
 function num(value: unknown): number {
@@ -141,7 +143,7 @@ async function selectPatternCandidates(env: ModelEnv): Promise<Candidate[]> {
     .slice(0, MAX_CANDIDATE_POOL);
 
   const candidates: Candidate[] = [];
-  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const item of pool) {
     const rows = await env.DB.prepare(`
       SELECT token_address as token, ts_ms as tsMs, market_cap_usd as marketCapUsd
@@ -258,25 +260,41 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
     return;
   }
 
-  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; lifecycleScore: number; rankScore: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
+  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; lifecycleScore: number; rangeOpportunity: number; rankScore: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
   for (const candidate of established) {
     const historyResult = await env.DB.prepare(`
       SELECT token_address as token, ts_ms as tsMs, price_usd as priceUsd, market_cap_usd as marketCapUsd,
         liquidity_usd as liquidityUsd, volume_5m_usd as volume5mUsd, buys_5m as buys5m, sells_5m as sells5m, holders
       FROM market_snapshots
       WHERE token_address=? AND price_usd>0
-      ORDER BY ts_ms DESC LIMIT 12
+      ORDER BY ts_ms DESC LIMIT 48
     `).bind(candidate.token).all<Snapshot>();
     const history = historyResult.results || [];
     if (history.length < MIN_HISTORY_SAMPLES) continue;
     const current = history[0];
     if (!(Number(current.marketCapUsd) >= MIN_MARKET_CAP_USD)) continue;
-    const baseline = buildBaseline(history);
+
+    const baselineHistory = history.slice(0, 12);
+    const baseline = buildBaseline(baselineHistory);
     const score = deviationScore(current, baseline);
     const pattern = buildPatternProfile(history);
     const lifecycleScore = lifecycleRankingScore(pattern);
-    const rankScore = candidateRankingScore(score, lifecycleScore);
-    ranked.push({ candidate, history, score, lifecycleScore, rankScore, pattern, baseline });
+
+    const rangePosition = pattern.priceBehavior.currentRangePositionPct;
+    const rangeExtremeness = Math.abs(rangePosition - 50) / 50;
+    const lowRebound = rangePosition <= 35 &&
+      pattern.currentMarketCapReturn30mPct > 0 &&
+      pattern.buyPressure >= 0.45;
+    const highExhaustion = rangePosition >= 65 &&
+      (pattern.distributionRisk >= 0.35 || pattern.currentMarketCapReturn30mPct < 0);
+    const rangeOpportunity = Math.max(0, Math.min(1,
+      rangeExtremeness * 0.70 +
+      (lowRebound ? 0.15 : 0) +
+      (highExhaustion ? 0.15 : 0)
+    ));
+
+    const rankScore = candidateRankingScore(score, lifecycleScore, rangeOpportunity);
+    ranked.push({ candidate, history, score, lifecycleScore, rangeOpportunity, rankScore, pattern, baseline });
   }
 
   ranked.sort((a, b) =>
