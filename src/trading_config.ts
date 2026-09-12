@@ -68,9 +68,9 @@ export const TRADING_CONFIG: Record<TradingMode, TradingConfig> = {
 
     maxPositions: 10,
 
-    minimumConfidence: 0.48,
+    minimumConfidence: 0.42,
 
-    maxPortfolioExposurePct: 60,
+    maxPortfolioExposurePct: 65,
 
     maxPositionPct: 25,
 
