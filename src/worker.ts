@@ -282,7 +282,6 @@ const worker = {
         try { await maybeSendDecisionAlert(env); } catch (error) { console.error(`Decision Telegram alert failed: ${String(error).slice(0, 800)}`); }
         try { await runLiveSignalCycle(env); } catch (error) { await markD1Degraded(env, error); console.error(`Live execution cycle failed: ${String(error).slice(0, 1000)}`); }
       })());
-      return;
     }
 
     if (controller.cron === "*/10 * * * *") {
