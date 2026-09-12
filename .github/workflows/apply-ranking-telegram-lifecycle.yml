@@ -48,7 +48,6 @@ jobs:
           if text.count(old) != 1:
               raise SystemExit(f'signal insert anchor count={text.count(old)}')
           text = text.replace(old, new, 1)
-
           model_trigger.write_text(text)
 
           reporting = Path('src/reporting.ts')
@@ -122,3 +121,5 @@ function patternHint(rationale: string | null | undefined): string {
           git add src/model_trigger.ts src/reporting.ts .github/workflows/apply-ranking-telegram-lifecycle.yml
           git commit -m "Wire lifecycle into candidate ranking and Telegram reports"
           git push origin HEAD:main
+
+# trigger
