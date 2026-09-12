@@ -19,19 +19,26 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-          import re
 
           path = Path("src/worker.ts")
           text = path.read_text(encoding="utf-8")
 
-          pattern = re.compile(
-              r'(    if \(controller\.cron === "\*/3 \* \* \* \*"\) \{.*?\n      \}\)\(\);\n)(      return;\n)(    \}\n\n    if \(controller\.cron === "\*/10 \* \* \* \*"\) \{)',
-              re.DOTALL,
-          )
+          marker = '''    if (controller.cron === "*/3 * * * *") {'''
+          start = text.find(marker)
+          if start < 0:
+              raise SystemExit("Could not find */3 cron block in src/worker.ts")
 
-          updated, count = pattern.subn(r'\1\3', text, count=1)
-          if count != 1:
-              raise SystemExit("Expected exactly one */3 cron return block in src/worker.ts")
+          next_block = text.find('    if (controller.cron === "*/10 * * * *") {', start)
+          if next_block < 0:
+              raise SystemExit("Could not find */10 cron block after */3 block")
+
+          block = text[start:next_block]
+          needle = '      return;\n    }\n\n'
+          if block.count(needle) != 1:
+              raise SystemExit(f"Expected exactly one */3 terminal return; found {block.count(needle)}")
+
+          block = block.replace(needle, '    }\n\n', 1)
+          updated = text[:start] + block + text[next_block:]
 
           if updated == text:
               raise SystemExit("No change made")
