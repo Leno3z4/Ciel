@@ -1,4 +1,5 @@
 import type { Env } from "./index";
+import { buildPatternProfile, type Snapshot } from "./model";
 
 type SendTelegram = (env: Env, text: string) => Promise<void>;
 
@@ -51,6 +52,19 @@ function label(row: { symbol?: string | null; name?: string | null; address?: st
 
 function signedPct(value: number): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function lifecycleReportLine(pattern: ReturnType<typeof buildPatternProfile>): string {
+  return [
+    pattern.lifecyclePhase,
+    pattern.trendStructure,
+    `W${pattern.currentWave}/${pattern.waveCount}`,
+    `BO ${Math.round(pattern.breakoutQuality * 100)}%`,
+    `RT ${Math.round(pattern.retracementQuality * 100)}%`,
+    `BF ${Math.round(pattern.blowOffRisk * 100)}%`,
+    `DIST ${Math.round(pattern.distributionRisk * 100)}%`,
+    `DEATH ${Math.round(pattern.deathRisk * 100)}%`
+  ].join(" · ");
 }
 
 export async function reportAfterNotification(env: Env, sourceText: string, send: SendTelegram): Promise<void> {
@@ -151,6 +165,36 @@ async function sendHourlyIntelligenceIfDue(env: Env, send: SendTelegram): Promis
   const anomalies = (signals.results ?? []).filter(s => Number(s.anomaly_score || 0) >= 0.45).slice(0, 6);
   const buys = (signals.results ?? []).filter(s => s.action === "BUY").slice(0, 5);
   const sells = (signals.results ?? []).filter(s => s.action === "SELL").slice(0, 5);
+
+  const signalTokens = [...new Set((signals.results ?? []).map(s => s.token_address).filter(Boolean))];
+  const lifecycleByToken = new Map<string, ReturnType<typeof buildPatternProfile>>();
+  if (signalTokens.length) {
+    const placeholders = signalTokens.map(() => "?").join(",");
+    const lifecycleRows = await env.DB.prepare(`
+      SELECT token_address as token, ts_ms as tsMs, price_usd as priceUsd, market_cap_usd as marketCapUsd,
+        liquidity_usd as liquidityUsd, volume_5m_usd as volume5mUsd, buys_5m as buys5m, sells_5m as sells5m, holders
+      FROM (
+        SELECT token_address, ts_ms, price_usd, market_cap_usd, liquidity_usd, volume_5m_usd, buys_5m, sells_5m, holders,
+          ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY ts_ms DESC) AS rn
+        FROM market_snapshots
+        WHERE token_address IN (${placeholders}) AND price_usd>0
+      )
+      WHERE rn <= 12
+      ORDER BY token, tsMs DESC
+    `).bind(...signalTokens).all<Snapshot>();
+
+    const grouped = new Map<string, Snapshot[]>();
+    for (const row of lifecycleRows.results || []) {
+      const keyToken = row.token.toLowerCase();
+      const bucket = grouped.get(keyToken) || [];
+      bucket.push(row);
+      grouped.set(keyToken, bucket);
+    }
+    for (const [token, history] of grouped) {
+      if (history.length >= 2) lifecycleByToken.set(token, buildPatternProfile(history));
+    }
+  }
+
   const positions = await env.DB.prepare(`SELECT p.token_address,p.quantity,p.entry_price_usd,p.last_price_usd,t.symbol,t.name,t.decimals FROM positions p LEFT JOIN tokens t ON t.address=p.token_address WHERE p.quantity <> '0' ORDER BY p.updated_ts_ms DESC LIMIT 8`).all<{ token_address: string; quantity: string; entry_price_usd: number; last_price_usd: number; symbol: string | null; name: string | null; decimals: number }>();
   const balance = Number(await env.CIEL_STATE.get("paper_balance_mon") || "100");
   const realized = Number(await env.CIEL_STATE.get("paper_realized_pnl_usd") || "0");
@@ -165,8 +209,16 @@ async function sendHourlyIntelligenceIfDue(env: Env, send: SendTelegram): Promis
     const pnl = (Number(p.last_price_usd || 0) - Number(p.entry_price_usd || 0)) * qty;
     return `• ${label(p)} | ${money(Number(p.last_price_usd || 0))} | uPnL ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`;
   });
-  const signalLines = (signals.results ?? []).slice(0, 6).map(s => `• ${s.action.padEnd(6)} ${label(s)} | ${(Number(s.confidence || 0) * 100).toFixed(0)}% | A ${Number(s.anomaly_score || 0).toFixed(2)} | ${s.model}`);
-  const anomalyLines = anomalies.length ? anomalies.map(s => `• ${label(s)} | ${s.action} | anomaly ${Number(s.anomaly_score || 0).toFixed(2)} | ${String(s.rationale || "").slice(0, 120)}`) : ["• No high-score anomalies in latest signals"];
+  const signalLines = (signals.results ?? []).slice(0, 6).map(s => {
+    const pattern = lifecycleByToken.get(s.token_address.toLowerCase());
+    const suffix = pattern ? lifecycleReportLine(pattern) : "pattern data unavailable";
+    return `• ${s.action.padEnd(6)} ${label(s)} | ${(Number(s.confidence || 0) * 100).toFixed(0)}% | A ${Number(s.anomaly_score || 0).toFixed(2)} | ${suffix}`;
+  });
+  const anomalyLines = anomalies.length ? anomalies.map(s => {
+    const pattern = lifecycleByToken.get(s.token_address.toLowerCase());
+    const suffix = pattern ? lifecycleReportLine(pattern) : "pattern data unavailable";
+    return `• ${label(s)} | ${s.action} | anomaly ${Number(s.anomaly_score || 0).toFixed(2)} | ${suffix}`;
+  }) : ["• No high-score anomalies in latest signals"];
   const topBuys = buys.length ? buys.map(s => `${label(s)} ${(Number(s.confidence || 0) * 100).toFixed(0)}%`).join(" | ") : "none";
   const topSells = sells.length ? sells.map(s => `${label(s)} ${(Number(s.confidence || 0) * 100).toFixed(0)}%`).join(" | ") : "none";
   const message = [
