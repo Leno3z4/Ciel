@@ -1,0 +1,91 @@
+name: Apply Gemini lifecycle wiring
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, 'Wire lifecycle intelligence into Gemini context')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch model context
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/model.ts')
+          text = path.read_text()
+
+          old = 'import { GoogleGenAI, Type } from "@google/genai";\n'
+          new = 'import { GoogleGenAI, Type } from "@google/genai";\nimport { analyzeMarketPattern } from "./pattern_engine";\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'import anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''  drawdownFromMarketCapPeakPct: number;\n  priceBehavior: PriceBehaviorProfile;\n  regimeHint: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";\n}'''
+          new = '''  drawdownFromMarketCapPeakPct: number;\n  priceBehavior: PriceBehaviorProfile;\n  regimeHint: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";\n  lifecyclePhase: string;\n  trendStructure: string;\n  waveCount: number;\n  currentWave: number;\n  firstExpansionMultiple: number;\n  retracementPct: number;\n  secondExpansionMultiple: number;\n  volumeExpansionRatio: number;\n  volumeDecayRatio: number;\n  liquidityChangeSincePeakPct: number;\n  breakoutQuality: number;\n  retracementQuality: number;\n  blowOffRisk: number;\n  distributionRisk: number;\n  deathRisk: number;\n}'''
+          if text.count(old) != 1:
+              raise SystemExit(f'PatternProfile anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0.5, priceVsMedian: 0,\n    drawdownFromMarketCapPeakPct: 0, priceBehavior: emptyPriceBehavior(), regimeHint: "UNKNOWN"\n  };'''
+          new = '''    volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0.5, priceVsMedian: 0,\n    drawdownFromMarketCapPeakPct: 0, priceBehavior: emptyPriceBehavior(), regimeHint: "UNKNOWN",\n    lifecyclePhase: "BASE", trendStructure: "UNKNOWN", waveCount: 0, currentWave: 0,\n    firstExpansionMultiple: 0, retracementPct: 0, secondExpansionMultiple: 0,\n    volumeExpansionRatio: 0, volumeDecayRatio: 0, liquidityChangeSincePeakPct: 0,\n    breakoutQuality: 0, retracementQuality: 0, blowOffRisk: 0, distributionRisk: 0, deathRisk: 0\n  };'''
+          if text.count(old) != 1:
+              raise SystemExit(f'empty PatternProfile anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''  else if (Math.abs(capReturn30) <= 5 && buyPressure >= 0.45) regimeHint = "ACCUMULATION";\n  return {'''
+          new = '''  else if (Math.abs(capReturn30) <= 5 && buyPressure >= 0.45) regimeHint = "ACCUMULATION";\n\n  const lifecycle = analyzeMarketPattern({\n    marketCapUsd: current.marketCapUsd,\n    previousMarketCapUsd: [...rows.slice(1)].reverse().map(row => row.marketCapUsd),\n    volumeUsd: current.volume5mUsd,\n    previousVolumeUsd: [...rows.slice(1)].reverse().map(row => row.volume5mUsd),\n    liquidityUsd: current.liquidityUsd,\n    previousLiquidityUsd: [...rows.slice(1)].reverse().map(row => row.liquidityUsd),\n    buys: current.buys5m,\n    sells: current.sells5m,\n    hourUtc: currentHour\n  });\n\n  return {'''
+          if text.count(old) != 1:
+              raise SystemExit(f'lifecycle insertion anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    drawdownFromMarketCapPeakPct: drawdown,\n    priceBehavior: buildPriceBehavior(rows),\n    regimeHint\n  };'''
+          new = '''    drawdownFromMarketCapPeakPct: drawdown,\n    priceBehavior: buildPriceBehavior(rows),\n    regimeHint,\n    lifecyclePhase: lifecycle.lifecyclePhase,\n    trendStructure: lifecycle.trendStructure,\n    waveCount: lifecycle.waveCount,\n    currentWave: lifecycle.currentWave,\n    firstExpansionMultiple: lifecycle.firstExpansionMultiple,\n    retracementPct: lifecycle.retracementPct,\n    secondExpansionMultiple: lifecycle.secondExpansionMultiple,\n    volumeExpansionRatio: lifecycle.volumeExpansionRatio,\n    volumeDecayRatio: lifecycle.volumeDecayRatio,\n    liquidityChangeSincePeakPct: lifecycle.liquidityChangeSincePeakPct,\n    breakoutQuality: lifecycle.breakoutQuality,\n    retracementQuality: lifecycle.retracementQuality,\n    blowOffRisk: lifecycle.blowOffRisk,\n    distributionRisk: lifecycle.distributionRisk,\n    deathRisk: lifecycle.deathRisk\n  };'''
+          if text.count(old) != 1:
+              raise SystemExit(f'PatternProfile return anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    current: {\n      marketCapUsd: Math.round(snapshot.marketCapUsd),\n      capReturn5mPct: Number(pattern.currentMarketCapReturn5mPct.toFixed(2)),\n      capReturn30mPct: Number(pattern.currentMarketCapReturn30mPct.toFixed(2)),\n      capReturn2hPct: Number(pattern.currentMarketCapReturn2hPct.toFixed(2)),\n      capVsMedian: Number(pattern.marketCapVsMedian.toFixed(3)),\n      capVsMean: Number(pattern.marketCapVsMean.toFixed(3)),\n      capVsSameHour: Number(pattern.sameHourMarketCapVsBaseline.toFixed(3)),\n      capPositionPct: Number(pattern.marketCapPositionPct.toFixed(1)),\n      drawdownPct: Number(pattern.drawdownFromMarketCapPeakPct.toFixed(2)),\n      regimeHint: pattern.regimeHint\n    },'''
+          new = '''    current: {\n      marketCapUsd: Math.round(snapshot.marketCapUsd),\n      capReturn5mPct: Number(pattern.currentMarketCapReturn5mPct.toFixed(2)),\n      capReturn30mPct: Number(pattern.currentMarketCapReturn30mPct.toFixed(2)),\n      capReturn2hPct: Number(pattern.currentMarketCapReturn2hPct.toFixed(2)),\n      capVsMedian: Number(pattern.marketCapVsMedian.toFixed(3)),\n      capVsMean: Number(pattern.marketCapVsMean.toFixed(3)),\n      capVsSameHour: Number(pattern.sameHourMarketCapVsBaseline.toFixed(3)),\n      capPositionPct: Number(pattern.marketCapPositionPct.toFixed(1)),\n      drawdownPct: Number(pattern.drawdownFromMarketCapPeakPct.toFixed(2)),\n      regimeHint: pattern.regimeHint,\n      lifecyclePhase: pattern.lifecyclePhase,\n      trendStructure: pattern.trendStructure\n    },'''
+          if text.count(old) != 1:
+              raise SystemExit(f'current packet anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    confirmation: {\n      buyPressure: Number(pattern.buyPressure.toFixed(3)),\n      priceVsMedian: Number(pattern.priceVsMedian.toFixed(3)),\n      sameHourSamples: pattern.sameHourSamples\n    },'''
+          new = '''    confirmation: {\n      buyPressure: Number(pattern.buyPressure.toFixed(3)),\n      priceVsMedian: Number(pattern.priceVsMedian.toFixed(3)),\n      sameHourSamples: pattern.sameHourSamples\n    },\n    lifecycle: {\n      phase: pattern.lifecyclePhase,\n      structure: pattern.trendStructure,\n      waveCount: pattern.waveCount,\n      currentWave: pattern.currentWave,\n      firstExpansionMultiple: Number(pattern.firstExpansionMultiple.toFixed(3)),\n      retracementPct: Number(pattern.retracementPct.toFixed(2)),\n      secondExpansionMultiple: Number(pattern.secondExpansionMultiple.toFixed(3)),\n      breakoutQuality: Number(pattern.breakoutQuality.toFixed(3)),\n      retracementQuality: Number(pattern.retracementQuality.toFixed(3)),\n      volumeExpansionRatio: Number(pattern.volumeExpansionRatio.toFixed(3)),\n      volumeDecayRatio: Number(pattern.volumeDecayRatio.toFixed(3)),\n      liquidityChangeSincePeakPct: Number(pattern.liquidityChangeSincePeakPct.toFixed(2)),\n      blowOffRisk: Number(pattern.blowOffRisk.toFixed(3)),\n      distributionRisk: Number(pattern.distributionRisk.toFixed(3)),\n      deathRisk: Number(pattern.deathRisk.toFixed(3))\n    },'''
+          if text.count(old) != 1:
+              raise SystemExit(f'lifecycle packet anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = 'MARKET CAP is the primary signal: use its multi-horizon movement, position in the token\'s own range, drawdown, same-hour behavior, regime, and the token-specific price-behavior timing profile.'
+          new = 'MARKET CAP is the primary signal: use its multi-horizon movement, position in the token\'s own range, drawdown, same-hour behavior, regime, lifecycle phase, wave/market structure, breakout quality, retracement quality, volume exhaustion, liquidity change, and the token-specific price-behavior timing profile.'
+          if text.count(old) != 1:
+              raise SystemExit(f'prompt anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Validate and commit
+        run: |
+          set -euo pipefail
+          npm install
+          npm run typecheck
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/workflows/apply-gemini-lifecycle-wiring.yml
+          git add src/model.ts .github/workflows/apply-gemini-lifecycle-wiring.yml
+          git commit -m "Wire lifecycle intelligence into Gemini context"
+          git push origin HEAD:main
