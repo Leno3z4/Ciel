@@ -70,3 +70,5 @@ A live transaction requires all of the following:
 5. Router quote/slippage bounds must be available immediately before execution.
 
 Adding a wallet secret alone does not enable live trading.
+
+<!-- lifecycle-to-Gemini wiring validation trigger -->
