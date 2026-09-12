@@ -1,4 +1,5 @@
 import { GoogleGenAI, Type } from "@google/genai";
+import { analyzeMarketPattern } from "./pattern_engine";
 
 export interface Snapshot {
   token: string;
@@ -67,6 +68,21 @@ export interface PatternProfile {
   drawdownFromMarketCapPeakPct: number;
   priceBehavior: PriceBehaviorProfile;
   regimeHint: "ACCUMULATION" | "TREND" | "DISTRIBUTION" | "PANIC" | "UNKNOWN";
+  lifecyclePhase: string;
+  trendStructure: string;
+  waveCount: number;
+  currentWave: number;
+  firstExpansionMultiple: number;
+  retracementPct: number;
+  secondExpansionMultiple: number;
+  volumeExpansionRatio: number;
+  volumeDecayRatio: number;
+  liquidityChangeSincePeakPct: number;
+  breakoutQuality: number;
+  retracementQuality: number;
+  blowOffRisk: number;
+  distributionRisk: number;
+  deathRisk: number;
 }
 
 export interface GeminiDecision {
@@ -233,7 +249,11 @@ export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
     currentMarketCapReturn5mPct: 0, currentMarketCapReturn30mPct: 0, currentMarketCapReturn2hPct: 0,
     marketCapVsMedian: 0, marketCapVsMean: 0, sameHourMarketCapVsBaseline: 0, marketCapPositionPct: 0,
     volumeVsBaseline: 0, liquidityVsBaseline: 0, buyPressure: 0.5, priceVsMedian: 0,
-    drawdownFromMarketCapPeakPct: 0, priceBehavior: emptyPriceBehavior(), regimeHint: "UNKNOWN"
+    drawdownFromMarketCapPeakPct: 0, priceBehavior: emptyPriceBehavior(), regimeHint: "UNKNOWN",
+    lifecyclePhase: "BASE", trendStructure: "UNKNOWN", waveCount: 0, currentWave: 0,
+    firstExpansionMultiple: 0, retracementPct: 0, secondExpansionMultiple: 0,
+    volumeExpansionRatio: 0, volumeDecayRatio: 0, liquidityChangeSincePeakPct: 0,
+    breakoutQuality: 0, retracementQuality: 0, blowOffRisk: 0, distributionRisk: 0, deathRisk: 0
   };
   const current = rows[0];
   const oldest = rows[rows.length - 1];
@@ -262,6 +282,19 @@ export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
   else if (drawdown >= 15 && capReturn30 < -5) regimeHint = "DISTRIBUTION";
   else if (capReturn30 > 8 && buyPressure >= 0.45) regimeHint = "TREND";
   else if (Math.abs(capReturn30) <= 5 && buyPressure >= 0.45) regimeHint = "ACCUMULATION";
+
+  const lifecycle = analyzeMarketPattern({
+    marketCapUsd: current.marketCapUsd,
+    previousMarketCapUsd: [...rows.slice(1)].reverse().map(row => row.marketCapUsd),
+    volumeUsd: current.volume5mUsd,
+    previousVolumeUsd: [...rows.slice(1)].reverse().map(row => row.volume5mUsd),
+    liquidityUsd: current.liquidityUsd,
+    previousLiquidityUsd: [...rows.slice(1)].reverse().map(row => row.liquidityUsd),
+    buys: current.buys5m,
+    sells: current.sells5m,
+    hourUtc: currentHour
+  });
+
   return {
     historySamples: rows.length,
     ageHours: Math.max(0, (Date.now() - oldest.tsMs) / 3600000),
@@ -281,7 +314,22 @@ export function buildPatternProfile(rows: Snapshot[]): PatternProfile {
     priceVsMedian: priceMedian > 0 ? current.priceUsd / priceMedian : 0,
     drawdownFromMarketCapPeakPct: drawdown,
     priceBehavior: buildPriceBehavior(rows),
-    regimeHint
+    regimeHint,
+    lifecyclePhase: lifecycle.lifecyclePhase,
+    trendStructure: lifecycle.trendStructure,
+    waveCount: lifecycle.waveCount,
+    currentWave: lifecycle.currentWave,
+    firstExpansionMultiple: lifecycle.firstExpansionMultiple,
+    retracementPct: lifecycle.retracementPct,
+    secondExpansionMultiple: lifecycle.secondExpansionMultiple,
+    volumeExpansionRatio: lifecycle.volumeExpansionRatio,
+    volumeDecayRatio: lifecycle.volumeDecayRatio,
+    liquidityChangeSincePeakPct: lifecycle.liquidityChangeSincePeakPct,
+    breakoutQuality: lifecycle.breakoutQuality,
+    retracementQuality: lifecycle.retracementQuality,
+    blowOffRisk: lifecycle.blowOffRisk,
+    distributionRisk: lifecycle.distributionRisk,
+    deathRisk: lifecycle.deathRisk
   };
 }
 
@@ -345,7 +393,9 @@ function compactDecisionPacket(snapshot: Snapshot, baseline: Baseline, pattern: 
       capVsSameHour: Number(pattern.sameHourMarketCapVsBaseline.toFixed(3)),
       capPositionPct: Number(pattern.marketCapPositionPct.toFixed(1)),
       drawdownPct: Number(pattern.drawdownFromMarketCapPeakPct.toFixed(2)),
-      regimeHint: pattern.regimeHint
+      regimeHint: pattern.regimeHint,
+      lifecyclePhase: pattern.lifecyclePhase,
+      trendStructure: pattern.trendStructure
     },
     liquidity: {
       usd: Math.round(snapshot.liquidityUsd),
@@ -357,6 +407,23 @@ function compactDecisionPacket(snapshot: Snapshot, baseline: Baseline, pattern: 
       buyPressure: Number(pattern.buyPressure.toFixed(3)),
       priceVsMedian: Number(pattern.priceVsMedian.toFixed(3)),
       sameHourSamples: pattern.sameHourSamples
+    },
+    lifecycle: {
+      phase: pattern.lifecyclePhase,
+      structure: pattern.trendStructure,
+      waveCount: pattern.waveCount,
+      currentWave: pattern.currentWave,
+      firstExpansionMultiple: Number(pattern.firstExpansionMultiple.toFixed(3)),
+      retracementPct: Number(pattern.retracementPct.toFixed(2)),
+      secondExpansionMultiple: Number(pattern.secondExpansionMultiple.toFixed(3)),
+      breakoutQuality: Number(pattern.breakoutQuality.toFixed(3)),
+      retracementQuality: Number(pattern.retracementQuality.toFixed(3)),
+      volumeExpansionRatio: Number(pattern.volumeExpansionRatio.toFixed(3)),
+      volumeDecayRatio: Number(pattern.volumeDecayRatio.toFixed(3)),
+      liquidityChangeSincePeakPct: Number(pattern.liquidityChangeSincePeakPct.toFixed(2)),
+      blowOffRisk: Number(pattern.blowOffRisk.toFixed(3)),
+      distributionRisk: Number(pattern.distributionRisk.toFixed(3)),
+      deathRisk: Number(pattern.deathRisk.toFixed(3))
     },
     priceBehavior: {
       observations12h: pattern.priceBehavior.observations12h,
@@ -402,7 +469,7 @@ export async function askGemini(apiKey: string | undefined, model: string, role:
   const packet = compactDecisionPacket(snapshot, baseline, effectivePattern, score);
   const ai = new GoogleGenAI({ apiKey });
   const prompt = `${role === "market" ? "You are Ciel's established-meme market decision engine." : "You are Ciel's established-meme regime/deviation decision engine."}
-Decide from a compact feature packet derived from Ciel's full local history. The full raw history is intentionally not sent to you. MARKET CAP is the primary signal: use its multi-horizon movement, position in the token's own range, drawdown, same-hour behavior, regime, and the token-specific price-behavior timing profile. The price-behavior profile contains 12h and 24h low/high levels, rolling average lows/highs, the token's current position in its own historical range, typical time spent near low/high zones, and current time spent in its current low/high zone. Use this as a timing confirmation layer, not a guarantee that history repeats. Prefer BUY only when the broader market evidence supports an entry and the price is attractively positioned relative to the token's own historical low/accumulation behavior. Prefer SELL for a held position when price is near the token's historical high zone and distribution, weakening momentum, or other deterioration confirms the exit. Do not chase a price merely because it is below an average, and do not assume a high will be revisited. Liquidity and 5m volume remain risk/quality confirmation. These are already-created established markets; do not chase novelty or new launches. Never invent missing data or claim certainty/profitability. Return only the requested JSON.
+Decide from a compact feature packet derived from Ciel's full local history. The full raw history is intentionally not sent to you. MARKET CAP is the primary signal: use its multi-horizon movement, position in the token's own range, drawdown, same-hour behavior, regime, lifecycle phase, wave/market structure, breakout quality, retracement quality, volume exhaustion, liquidity change, and the token-specific price-behavior timing profile. The price-behavior profile contains 12h and 24h low/high levels, rolling average lows/highs, the token's current position in its own historical range, typical time spent near low/high zones, and current time spent in its current low/high zone. Use this as a timing confirmation layer, not a guarantee that history repeats. Prefer BUY only when the broader market evidence supports an entry and the price is attractively positioned relative to the token's own historical low/accumulation behavior. Prefer SELL for a held position when price is near the token's historical high zone and distribution, weakening momentum, or other deterioration confirms the exit. Do not chase a price merely because it is below an average, and do not assume a high will be revisited. Liquidity and 5m volume remain risk/quality confirmation. These are already-created established markets; do not chase novelty or new launches. Never invent missing data or claim certainty/profitability. Return only the requested JSON.
 Decision packet: ${JSON.stringify(packet)}`;
   try {
     const response = await ai.models.generateContent({
