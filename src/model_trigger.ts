@@ -42,6 +42,32 @@ const GEMINI_GLOBAL_MIN_INTERVAL_MS = 15 * 60 * 1000;
 const RUNTIME_KEY = "ciel_runtime_state";
 const DECISION_KEY_COUNT = 7;
 
+function lifecycleRankingScore(pattern: ReturnType<typeof buildPatternProfile>): number {
+  const structureBonus =
+    pattern.trendStructure === "HH_HL" ? 1 :
+    pattern.trendStructure === "HH_LL" ? 0.65 :
+    pattern.trendStructure === "FLAT" ? 0.45 : 0.25;
+
+  const score =
+    (pattern.entryScore / 100) * 0.45 +
+    pattern.breakoutQuality * 0.15 +
+    pattern.retracementQuality * 0.15 +
+    structureBonus * 0.10 +
+    (1 - pattern.blowOffRisk) * 0.05 +
+    (1 - pattern.distributionRisk) * 0.05 +
+    (1 - pattern.deathRisk) * 0.05;
+
+  return Math.max(0, Math.min(1, score));
+}
+
+function candidateRankingScore(
+  anomalyScore: number,
+  lifecycleScore: number
+): number {
+  return (Math.max(0, Math.min(1, anomalyScore)) * 0.60) +
+    (Math.max(0, Math.min(1, lifecycleScore)) * 0.40);
+}
+
 function num(value: unknown): number {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
   if (typeof value !== "string") return 0;
@@ -232,7 +258,7 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
     return;
   }
 
-  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
+  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; lifecycleScore: number; rankScore: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
   for (const candidate of established) {
     const historyResult = await env.DB.prepare(`
       SELECT token_address as token, ts_ms as tsMs, price_usd as priceUsd, market_cap_usd as marketCapUsd,
@@ -248,10 +274,17 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
     const baseline = buildBaseline(history);
     const score = deviationScore(current, baseline);
     const pattern = buildPatternProfile(history);
-    ranked.push({ candidate, history, score, pattern, baseline });
+    const lifecycleScore = lifecycleRankingScore(pattern);
+    const rankScore = candidateRankingScore(score, lifecycleScore);
+    ranked.push({ candidate, history, score, lifecycleScore, rankScore, pattern, baseline });
   }
 
-  ranked.sort((a, b) => b.score - a.score || b.candidate.avgMarketCap - a.candidate.avgMarketCap);
+  ranked.sort((a, b) =>
+    b.rankScore - a.rankScore ||
+    b.lifecycleScore - a.lifecycleScore ||
+    b.score - a.score ||
+    b.candidate.avgMarketCap - a.candidate.avgMarketCap
+  );
   let analyzed = 0;
   let lastError: string | undefined;
 
