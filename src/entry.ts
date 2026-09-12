@@ -225,6 +225,28 @@ async function enrichLiveStatus(
       }>();
 
     livePortfolio.recentTrades = recentTrades.results || [];
+
+    if (!livePortfolio.lastLiveTrade && livePortfolio.recentTrades.length) {
+      const latest = livePortfolio.recentTrades[0] as {
+        token_address?: string;
+        ts_ms?: number;
+        side?: string;
+        quantity?: string | null;
+        price_usd?: number | null;
+        tx_hash?: string | null;
+        status?: string;
+      };
+      livePortfolio.lastLiveTrade = {
+        side: latest.side || null,
+        token: latest.token_address || null,
+        quantity: latest.quantity || null,
+        priceUsd: latest.price_usd ?? null,
+        tsMs: latest.ts_ms || null,
+        txHash: latest.tx_hash || null,
+        status: latest.status || null,
+        source: "live_trades_fallback"
+      };
+    }
   } catch (error) {
     livePortfolio.diagnostics = `Live portfolio reporting unavailable: ${String(error).slice(0, 500)}`;
   }
