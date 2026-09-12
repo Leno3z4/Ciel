@@ -1,0 +1,181 @@
+name: Apply lifecycle ranking and Telegram wiring
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, 'Wire lifecycle into candidate ranking and Telegram reports')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch lifecycle ranking and reporting
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          model_trigger = Path('src/model_trigger.ts')
+          text = model_trigger.read_text()
+
+          old = '''  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
+'''
+          new = '''  const ranked: Array<{ candidate: Candidate; history: Snapshot[]; score: number; rankingScore: number; pattern: ReturnType<typeof buildPatternProfile>; baseline: ReturnType<typeof buildBaseline> }> = [];
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'ranked type anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    const score = deviationScore(current, baseline);
+    const pattern = buildPatternProfile(history);
+    ranked.push({ candidate, history, score, pattern, baseline });
+'''
+          new = '''    const score = deviationScore(current, baseline);
+    const pattern = buildPatternProfile(history);
+    const structureBonus =
+      pattern.trendStructure === "HH_HL" ? 8 :
+      pattern.trendStructure === "HH_LL" ? 4 :
+      pattern.lifecyclePhase === "SECONDARY_EXPANSION" ? 6 : 0;
+    const rankingScore =
+      score * 20 +
+      pattern.entryScore * 0.60 +
+      pattern.retracementQuality * 10 +
+      pattern.breakoutQuality * 8 +
+      structureBonus -
+      pattern.blowOffRisk * 20 -
+      pattern.distributionRisk * 25 -
+      pattern.deathRisk * 35;
+    ranked.push({ candidate, history, score, rankingScore, pattern, baseline });
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'ranking score anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '  ranked.sort((a, b) => b.score - a.score || b.candidate.avgMarketCap - a.candidate.avgMarketCap);\n'
+          new = '''  ranked.sort((a, b) =>
+    b.rankingScore - a.rankingScore ||
+    b.score - a.score ||
+    b.candidate.avgMarketCap - a.candidate.avgMarketCap
+  );
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'ranking sort anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''      if (!result) {
+        lastError = `${candidate.token}: Gemini returned no decision`;
+        continue;
+      }
+
+      const analysis = result;
+'''
+          new = '''      if (!result) {
+        lastError = `${candidate.token}: Gemini returned no decision`;
+        continue;
+      }
+
+      const analysis = result;
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'analysis anchor count={text.count(old)}')
+
+          old = '''          await env.DB.prepare(`INSERT INTO signals(token_address,ts_ms,action,confidence,expected_low,expected_high,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?,?,?)`).bind(history[0].token, Date.now(), analysis.action, analysis.confidence, analysis.expectedLowUsd, analysis.expectedHighUsd, analysis.anomalyScore, "gemini-established-pattern", `${analysis.regime}: ${analysis.rationale}`).run();
+'''
+          new = '''          await env.DB.prepare(`INSERT INTO signals(token_address,ts_ms,action,confidence,expected_low,expected_high,anomaly_score,model,rationale) VALUES(?,?,?,?,?,?,?,?,?)`).bind(
+            history[0].token,
+            Date.now(),
+            analysis.action,
+            analysis.confidence,
+            analysis.expectedLowUsd,
+            analysis.expectedHighUsd,
+            analysis.anomalyScore,
+            `gemini-established-pattern/${pattern.lifecyclePhase}/${pattern.trendStructure}`,
+            `${analysis.regime}: lifecycle=${pattern.lifecyclePhase} | structure=${pattern.trendStructure} | wave=${pattern.currentWave}/${pattern.waveCount} | breakout=${Math.round(pattern.breakoutQuality * 100)}% | retrace=${Math.round(pattern.retracementQuality * 100)}% | blowoff=${Math.round(pattern.blowOffRisk * 100)}% | distribution=${Math.round(pattern.distributionRisk * 100)}% | death=${Math.round(pattern.deathRisk * 100)}% | ${analysis.rationale}`
+          ).run();
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'signal insert anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          model_trigger.write_text(text)
+
+          reporting = Path('src/reporting.ts')
+          text = reporting.read_text()
+
+          old = '''function signedPct(value: number): string {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+'''
+          new = '''function signedPct(value: number): string {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function patternHint(rationale: string | null | undefined): string {
+  const text = String(rationale || "");
+  const lifecycle = text.match(/lifecycle=([^|]+)/)?.[1]?.trim();
+  const structure = text.match(/structure=([^|]+)/)?.[1]?.trim();
+  const wave = text.match(/wave=([^|]+)/)?.[1]?.trim();
+  const breakout = text.match(/breakout=(\\d+)%/)?.[1];
+  const retrace = text.match(/retrace=(\\d+)%/)?.[1];
+  const blowoff = text.match(/blowoff=(\\d+)%/)?.[1];
+  const distribution = text.match(/distribution=(\\d+)%/)?.[1];
+  const death = text.match(/death=(\\d+)%/)?.[1];
+  const parts = [
+    lifecycle,
+    structure,
+    wave ? `wave ${wave}` : undefined,
+    breakout ? `BO ${breakout}%` : undefined,
+    retrace ? `RT ${retrace}%` : undefined,
+    blowoff ? `BF ${blowoff}%` : undefined,
+    distribution ? `DIST ${distribution}%` : undefined,
+    death ? `DEATH ${death}%` : undefined
+  ].filter(Boolean);
+  return parts.length ? parts.join(" · ") : "pattern data unavailable";
+}
+
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'report helper anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = 'const signalLines = (signals.results ?? []).slice(0, 6).map(s => `• ${s.action.padEnd(6)} ${label(s)} | ${(Number(s.confidence || 0) * 100).toFixed(0)}% | A ${Number(s.anomaly_score || 0).toFixed(2)} | ${s.model}`);'
+          new = 'const signalLines = (signals.results ?? []).slice(0, 6).map(s => `• ${s.action.padEnd(6)} ${label(s)} | ${(Number(s.confidence || 0) * 100).toFixed(0)}% | A ${Number(s.anomaly_score || 0).toFixed(2)} | ${patternHint(s.rationale)}`);'
+          if text.count(old) != 1:
+              raise SystemExit(f'signal lines anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = 'const anomalyLines = anomalies.length ? anomalies.map(s => `• ${label(s)} | ${s.action} | anomaly ${Number(s.anomaly_score || 0).toFixed(2)} | ${String(s.rationale || "").slice(0, 120)}`) : ["• No high-score anomalies in latest signals"];'
+          new = 'const anomalyLines = anomalies.length ? anomalies.map(s => `• ${label(s)} | ${s.action} | anomaly ${Number(s.anomaly_score || 0).toFixed(2)} | ${patternHint(s.rationale)}`) : ["• No high-score anomalies in latest signals"];'
+          if text.count(old) != 1:
+              raise SystemExit(f'anomaly lines anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          reporting.write_text(text)
+          PY
+
+      - name: Validate
+        run: |
+          set -euo pipefail
+          npm install
+          npm run typecheck
+          git diff --check
+
+      - name: Commit and remove patch workflow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/workflows/apply-ranking-telegram-lifecycle.yml
+          git add src/model_trigger.ts src/reporting.ts .github/workflows/apply-ranking-telegram-lifecycle.yml
+          git commit -m "Wire lifecycle into candidate ranking and Telegram reports"
+          git push origin HEAD:main
