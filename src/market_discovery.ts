@@ -453,6 +453,10 @@ async function sendMarketPulse(env: Env, state: MarketState): Promise<void> {
   const stale = state.source === "cached-fallback" || state.source === "legacy-cache" || ageMs > DISCOVERY_REFRESH_MS;
   const status = stale ? "⚠️ STALE/CACHED" : "✅ LIVE FEED";
   const sourceLabel = state.source === "market-cap" ? "market-cap" : state.source === "creation-time" ? "creation-time fallback" : state.source;
+  const reportNow = Date.now();
+  const lastReport = Number(await env.CIEL_STATE.get("ciel_market_intelligence_last_report_ms") || "0");
+  if (lastReport > 0 && reportNow - lastReport < 3 * 60 * 1000) return;
+  await env.CIEL_STATE.put("ciel_market_intelligence_last_report_ms", String(reportNow), { expirationTtl: 600 });
   await notifyTelegram(env, `📡 CIEL MARKET INTELLIGENCE\n${status}\nSource: ${sourceLabel}\nMarkets received: ${state.tokens.length}${state.monUsd > 0 ? `\nMON/USD: $${state.monUsd.toFixed(4)}` : ""}\n\nTOP NAD.FUN MARKETS\n${lines.join("\n")}\n\nKV discovery is active; D1 availability does not stop this scanner.`);
 }
 
