@@ -224,10 +224,11 @@ async function enrichLiveStatus(
         status: string;
       }>();
 
-    livePortfolio.recentTrades = recentTrades.results || [];
+    const recentLiveTrades = recentTrades.results || [];
+    livePortfolio.recentTrades = recentLiveTrades;
 
-    if (!livePortfolio.lastLiveTrade && livePortfolio.recentTrades.length) {
-      const latest = livePortfolio.recentTrades[0] as {
+    if (!livePortfolio.lastLiveTrade && recentLiveTrades.length) {
+      const latest = recentLiveTrades[0] as {
         token_address?: string;
         ts_ms?: number;
         side?: string;
