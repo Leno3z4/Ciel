@@ -1,0 +1,69 @@
+name: Patch historical low intelligence
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, 'Implement historical daily low intelligence') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Apply requested patch
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly 1 anchor, found {count}')
+              p.write_text(s.replace(old, new, 1))
+
+          replace_once('src/model.ts', '''  currentVsAvgLow24hPct: number;\n  currentVsAvgHigh24hPct: number;''', '''  currentVsAvgLow24hPct: number;\n  currentVsAvgHigh24hPct: number;\n  avgDailyLowUsd: number;\n  medianDailyLowUsd: number;\n  dailyLowSamples: number;\n  currentVsAvgDailyLowPct: number;''')
+
+          replace_once('src/model.ts', '''    currentVsAvgLow24hPct: 0,\n    currentVsAvgHigh24hPct: 0,''', '''    currentVsAvgLow24hPct: 0,\n    currentVsAvgHigh24hPct: 0,\n    avgDailyLowUsd: 0,\n    medianDailyLowUsd: 0,\n    dailyLowSamples: 0,\n    currentVsAvgDailyLowPct: 0,''')
+
+          replace_once('src/model.ts', '''      currentVsAvgLow24hPct: Number(pattern.priceBehavior.currentVsAvgLow24hPct.toFixed(2)),\n      currentVsAvgHigh24hPct: Number(pattern.priceBehavior.currentVsAvgHigh24hPct.toFixed(2)),\n      currentRangePositionPct:''', '''      currentVsAvgLow24hPct: Number(pattern.priceBehavior.currentVsAvgLow24hPct.toFixed(2)),\n      currentVsAvgHigh24hPct: Number(pattern.priceBehavior.currentVsAvgHigh24hPct.toFixed(2)),\n      avgDailyLowUsd: pattern.priceBehavior.avgDailyLowUsd,\n      medianDailyLowUsd: pattern.priceBehavior.medianDailyLowUsd,\n      dailyLowSamples: pattern.priceBehavior.dailyLowSamples,\n      currentVsAvgDailyLowPct: Number(pattern.priceBehavior.currentVsAvgDailyLowPct.toFixed(2)),\n      currentRangePositionPct:''')
+
+          replace_once('src/model_trigger.ts', '''const MAX_CANDIDATE_HISTORY_ROWS = 96;\nconst MAX_CANDIDATES = 5;''', '''const MAX_CANDIDATE_HISTORY_ROWS = 96;\nconst MAX_HISTORICAL_DAILY_LOW_DAYS = 7;\nconst MAX_CANDIDATES = 5;''')
+
+          replace_once('src/model_trigger.ts', '''    const history = historyResult.results || [];\n    if (history.length < MIN_HISTORY_SAMPLES) continue;\n    const current = history[0];''', '''    const history = historyResult.results || [];\n    if (history.length < MIN_HISTORY_SAMPLES) continue;\n    const dailyLowRows = await env.DB.prepare(`\n      SELECT\n        substr(datetime(ts_ms / 1000, 'unixepoch'), 1, 10) AS day,\n        MIN(price_usd) AS daily_low_usd\n      FROM market_snapshots\n      WHERE token_address=?\n        AND price_usd>0\n        AND ts_ms>=?\n      GROUP BY day\n      ORDER BY day DESC\n      LIMIT ?\n    `).bind(\n      candidate.token,\n      Date.now() - MAX_HISTORICAL_DAILY_LOW_DAYS * 24 * 60 * 60 * 1000,\n      MAX_HISTORICAL_DAILY_LOW_DAYS\n    ).all<{ day: string; daily_low_usd: number }>();\n    const dailyLows = (dailyLowRows.results || [])\n      .map(row => Number(row.daily_low_usd))\n      .filter(value => Number.isFinite(value) && value > 0);\n    const avgDailyLowUsd = dailyLows.length\n      ? dailyLows.reduce((sum, value) => sum + value, 0) / dailyLows.length\n      : 0;\n    const sortedDailyLows = [...dailyLows].sort((a, b) => a - b);\n    const medianDailyLowUsd = sortedDailyLows.length\n      ? sortedDailyLows[Math.floor(sortedDailyLows.length / 2)]\n      : 0;\n    const current = history[0];\n    const currentVsAvgDailyLowPct = avgDailyLowUsd > 0\n      ? ((current.priceUsd - avgDailyLowUsd) / avgDailyLowUsd) * 100\n      : 0;''')
+
+          replace_once('src/model_trigger.ts', '''    const pattern = buildPatternProfile(history);\n    const lifecycleScore = lifecycleRankingScore(pattern);\n\n    const rangePosition = pattern.priceBehavior.currentRangePositionPct;''', '''    const pattern = buildPatternProfile(history);\n    pattern.priceBehavior.avgDailyLowUsd = avgDailyLowUsd;\n    pattern.priceBehavior.medianDailyLowUsd = medianDailyLowUsd;\n    pattern.priceBehavior.dailyLowSamples = dailyLows.length;\n    pattern.priceBehavior.currentVsAvgDailyLowPct = currentVsAvgDailyLowPct;\n    const lifecycleScore = lifecycleRankingScore(pattern);\n\n    const rangePosition = pattern.priceBehavior.currentRangePositionPct;''')
+
+          replace_once('src/model_trigger.ts', '''    const lowRebound = rangePosition <= 35 &&\n      pattern.currentMarketCapReturn30mPct > 0 &&\n      pattern.buyPressure >= 0.45;\n    const highExhaustion =''', '''    const historicalLowOpportunity = avgDailyLowUsd > 0 &&\n      current.priceUsd <= avgDailyLowUsd * 1.05 &&\n      rangePosition <= 35 &&\n      pattern.buyPressure >= 0.35;\n    const safeLowSetup = historicalLowOpportunity &&\n      pattern.deathRisk < 0.75 &&\n      pattern.distributionRisk < 0.75 &&\n      feedLiquidityUsd(feed.get(candidate.token.toLowerCase()) || {}) >= MIN_AVG_LIQUIDITY_USD;\n    const highExhaustion =''')
+
+          replace_once('src/model_trigger.ts', '''      (lowRebound ? 0.15 : 0) +''', '''      (safeLowSetup ? 0.20 : 0) +''')
+
+          # Add deterministic historical-low context to Gemini's packet. The prompt already describes price behavior; this makes the new fields explicit.
+          replace_once('src/model.ts', '''      currentVsAvgDailyLowPct: Number(pattern.priceBehavior.currentVsAvgDailyLowPct.toFixed(2)),\n      currentRangePositionPct:''', '''      currentVsAvgDailyLowPct: Number(pattern.priceBehavior.currentVsAvgDailyLowPct.toFixed(2)),\n      currentRangePositionPct:''')
+
+          # Ensure only the requested intelligence files changed.
+          for path in ('src/model.ts', 'src/model_trigger.ts'):
+              if not Path(path).read_text().strip():
+                  raise SystemExit(f'{path} became empty')
+
+      - name: Typecheck and diff check
+        run: |
+          npm install
+          npm run typecheck
+          git diff --check
+          test "$(git diff --name-only)" = $'src/model.ts\nsrc/model_trigger.ts'
+
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/model.ts src/model_trigger.ts
+          git diff --cached --check
+          git commit -m 'Implement historical daily low intelligence'
+          git push origin main
