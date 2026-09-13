@@ -30,6 +30,7 @@ const MIN_AVG_VOLUME_5M_USD = 1_000;
 const MIN_AVG_LIQUIDITY_USD = 5_000;
 const MAX_CANDIDATE_POOL = 20;
 const MAX_CANDIDATE_HISTORY_ROWS = 96;
+const MAX_HISTORICAL_DAILY_LOW_DAYS = 7;
 const MAX_CANDIDATES = 5;
 const MAX_DECISIONS_PER_CYCLE = 2;
 const MODEL_COOLDOWN_MS = 10 * 60 * 1000;
@@ -270,25 +271,61 @@ export async function triggerEstablishedModelAnalysis(env: ModelEnv): Promise<vo
     `).bind(candidate.token).all<Snapshot>();
     const history = historyResult.results || [];
     if (history.length < MIN_HISTORY_SAMPLES) continue;
+    const dailyLowRows = await env.DB.prepare(`
+      SELECT
+        substr(datetime(ts_ms / 1000, 'unixepoch'), 1, 10) AS day,
+        MIN(price_usd) AS daily_low_usd
+      FROM market_snapshots
+      WHERE token_address=? AND price_usd>0 AND ts_ms>=?
+      GROUP BY day
+      ORDER BY day DESC
+      LIMIT ?
+    `).bind(
+      candidate.token,
+      Date.now() - MAX_HISTORICAL_DAILY_LOW_DAYS * 24 * 60 * 60 * 1000,
+      MAX_HISTORICAL_DAILY_LOW_DAYS
+    ).all<{ day: string; daily_low_usd: number }>();
+    const dailyLows = (dailyLowRows.results || [])
+      .map(row => Number(row.daily_low_usd))
+      .filter(value => Number.isFinite(value) && value > 0);
+    const avgDailyLowUsd = dailyLows.length
+      ? dailyLows.reduce((sum, value) => sum + value, 0) / dailyLows.length
+      : 0;
+    const sortedDailyLows = [...dailyLows].sort((a, b) => a - b);
+    const medianDailyLowUsd = sortedDailyLows.length
+      ? sortedDailyLows[Math.floor(sortedDailyLows.length / 2)]
+      : 0;
     const current = history[0];
+    const currentVsAvgDailyLowPct = avgDailyLowUsd > 0
+      ? ((current.priceUsd - avgDailyLowUsd) / avgDailyLowUsd) * 100
+      : 0;
     if (!(Number(current.marketCapUsd) >= MIN_MARKET_CAP_USD)) continue;
 
     const baselineHistory = history.slice(0, 12);
     const baseline = buildBaseline(baselineHistory);
     const score = deviationScore(current, baseline);
     const pattern = buildPatternProfile(history);
+    pattern.priceBehavior.avgDailyLowUsd = avgDailyLowUsd;
+    pattern.priceBehavior.medianDailyLowUsd = medianDailyLowUsd;
+    pattern.priceBehavior.dailyLowSamples = dailyLows.length;
+    pattern.priceBehavior.currentVsAvgDailyLowPct = currentVsAvgDailyLowPct;
     const lifecycleScore = lifecycleRankingScore(pattern);
 
     const rangePosition = pattern.priceBehavior.currentRangePositionPct;
     const rangeExtremeness = Math.abs(rangePosition - 50) / 50;
-    const lowRebound = rangePosition <= 35 &&
-      pattern.currentMarketCapReturn30mPct > 0 &&
-      pattern.buyPressure >= 0.45;
+    const historicalLowOpportunity = avgDailyLowUsd > 0 &&
+      current.priceUsd <= avgDailyLowUsd * 1.05 &&
+      rangePosition <= 35 &&
+      pattern.buyPressure >= 0.35;
+    const safeLowSetup = historicalLowOpportunity &&
+      pattern.deathRisk < 0.75 &&
+      pattern.distributionRisk < 0.75 &&
+      feedLiquidityUsd(feed.get(candidate.token.toLowerCase()) || {}) >= MIN_AVG_LIQUIDITY_USD;
     const highExhaustion = rangePosition >= 65 &&
       (pattern.distributionRisk >= 0.35 || pattern.currentMarketCapReturn30mPct < 0);
     const rangeOpportunity = Math.max(0, Math.min(1,
       rangeExtremeness * 0.70 +
-      (lowRebound ? 0.15 : 0) +
+      (safeLowSetup ? 0.20 : 0) +
       (highExhaustion ? 0.15 : 0)
     ));
 

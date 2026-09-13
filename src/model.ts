@@ -39,6 +39,10 @@ export interface PriceBehaviorProfile {
   highestPrice24h: number;
   currentVsAvgLow24hPct: number;
   currentVsAvgHigh24hPct: number;
+  avgDailyLowUsd: number;
+  medianDailyLowUsd: number;
+  dailyLowSamples: number;
+  currentVsAvgDailyLowPct: number;
   currentRangePositionPct: number;
   avgMinutesNearLow12h: number;
   avgMinutesNearHigh12h: number;
@@ -125,6 +129,10 @@ function emptyPriceBehavior(): PriceBehaviorProfile {
     highestPrice24h: 0,
     currentVsAvgLow24hPct: 0,
     currentVsAvgHigh24hPct: 0,
+    avgDailyLowUsd: 0,
+    medianDailyLowUsd: 0,
+    dailyLowSamples: 0,
+    currentVsAvgDailyLowPct: 0,
     currentRangePositionPct: 0,
     avgMinutesNearLow12h: 0,
     avgMinutesNearHigh12h: 0,
@@ -233,6 +241,10 @@ function buildPriceBehavior(rows: Snapshot[]): PriceBehaviorProfile {
     highestPrice24h: high24h,
     currentVsAvgLow24hPct: avgLow24h > 0 ? pctChange(current, avgLow24h) : 0,
     currentVsAvgHigh24hPct: avgHigh24h > 0 ? pctChange(current, avgHigh24h) : 0,
+    avgDailyLowUsd: 0,
+    medianDailyLowUsd: 0,
+    dailyLowSamples: 0,
+    currentVsAvgDailyLowPct: 0,
     currentRangePositionPct,
     avgMinutesNearLow12h: twelveHourTiming.lowMinutes,
     avgMinutesNearHigh12h: twelveHourTiming.highMinutes,
@@ -436,6 +448,10 @@ function compactDecisionPacket(snapshot: Snapshot, baseline: Baseline, pattern: 
       highestPrice24h: pattern.priceBehavior.highestPrice24h,
       currentVsAvgLow24hPct: Number(pattern.priceBehavior.currentVsAvgLow24hPct.toFixed(2)),
       currentVsAvgHigh24hPct: Number(pattern.priceBehavior.currentVsAvgHigh24hPct.toFixed(2)),
+      avgDailyLowUsd: pattern.priceBehavior.avgDailyLowUsd,
+      medianDailyLowUsd: pattern.priceBehavior.medianDailyLowUsd,
+      dailyLowSamples: pattern.priceBehavior.dailyLowSamples,
+      currentVsAvgDailyLowPct: Number(pattern.priceBehavior.currentVsAvgDailyLowPct.toFixed(2)),
       currentRangePositionPct: Number(pattern.priceBehavior.currentRangePositionPct.toFixed(1)),
       avgMinutesNearLow12h: Number(pattern.priceBehavior.avgMinutesNearLow12h.toFixed(1)),
       avgMinutesNearHigh12h: Number(pattern.priceBehavior.avgMinutesNearHigh12h.toFixed(1)),
