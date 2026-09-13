@@ -49,13 +49,12 @@ function lifecycleRankingScore(pattern: ReturnType<typeof buildPatternProfile>):
     pattern.trendStructure === "FLAT" ? 0.45 : 0.25;
 
   const score =
-    (pattern.entryScore / 100) * 0.45 +
-    pattern.breakoutQuality * 0.15 +
-    pattern.retracementQuality * 0.15 +
-    structureBonus * 0.10 +
-    (1 - pattern.blowOffRisk) * 0.05 +
-    (1 - pattern.distributionRisk) * 0.05 +
-    (1 - pattern.deathRisk) * 0.05;
+    pattern.breakoutQuality * 0.35 +
+    pattern.retracementQuality * 0.25 +
+    structureBonus * 0.15 +
+    (1 - pattern.blowOffRisk) * 0.10 +
+    (1 - pattern.distributionRisk) * 0.075 +
+    (1 - pattern.deathRisk) * 0.075;
 
   return Math.max(0, Math.min(1, score));
 }
