@@ -297,7 +297,7 @@ async function maybeBootstrapBuy(env: Parameters<typeof worker.fetch>[1]): Promi
       candidate.row.marketCapUsd >= BOOTSTRAP_MIN_MARKET_CAP_USD &&
       candidate.row.liquidityUsd >= BOOTSTRAP_MIN_LIQUIDITY_USD &&
       candidate.row.volume5mUsd > 0 &&
-      Number(candidate.row.percent || 0) > 0
+      Number.isFinite(Number(candidate.row.percent || 0))
     )
     .sort((a, b) => b.score - a.score);
 
